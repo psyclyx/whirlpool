@@ -59,6 +59,7 @@ pub const Model = struct {
 
     pub fn addOutput(self: *Model, output: Output) !void {
         if (output.active_tags.bits == 0) return error.EmptyActiveTags;
+        if (output.focused != null) return error.InvalidInitialOutputState;
         if (self.outputIndex(output.id) != null) return error.DuplicateOutput;
         try self.outputs.append(self.allocator, output);
     }
@@ -72,6 +73,9 @@ pub const Model = struct {
     }
 
     pub fn addWindow(self: *Model, window: Window) !void {
+        if (window.lifecycle != .announced or window.focus_serial != 0) {
+            return error.InvalidInitialWindowState;
+        }
         if (self.windowIndex(window.id) != null) return error.DuplicateWindow;
         if (window.output) |id| {
             if (self.outputIndex(id) == null) return error.UnknownOutput;
@@ -134,6 +138,20 @@ pub const Model = struct {
         window.output = destination;
         if (previous) |output_id| self.repairFocus(output_id);
         if (destination) |output_id| self.repairFocus(output_id);
+    }
+
+    pub fn setPlacement(self: *Model, id: WindowId, placement: Placement) !void {
+        const window = self.findWindow(id) orelse return error.UnknownWindow;
+        if (window.lifecycle != .managed) return error.InvalidLifecycle;
+        window.placement = placement;
+    }
+
+    pub fn getWindow(self: *const Model, id: WindowId) ?Window {
+        return if (self.findWindowConst(id)) |value| value.* else null;
+    }
+
+    pub fn getOutput(self: *const Model, id: OutputId) ?Output {
+        return if (self.findOutputConst(id)) |value| value.* else null;
     }
 
     pub fn isVisible(self: *const Model, id: WindowId) bool {
@@ -227,6 +245,16 @@ fn oid(value: u64) OutputId {
     return @enumFromInt(value);
 }
 
+fn addManagedWindow(
+    model: *Model,
+    id: WindowId,
+    output: ?OutputId,
+    tags: Tags,
+) !void {
+    try model.addWindow(.{ .id = id, .output = output, .tags = tags });
+    try model.manageWindow(id);
+}
+
 test "announced windows are inert until managed" {
     var model = Model.init(std.testing.allocator);
     defer model.deinit();
@@ -244,8 +272,8 @@ test "tag changes repair focus to the most recently focused visible window" {
     var model = Model.init(std.testing.allocator);
     defer model.deinit();
     try model.addOutput(.{ .id = oid(1), .active_tags = Tags.single(0) });
-    try model.addWindow(.{ .id = wid(10), .output = oid(1), .tags = Tags.single(0), .lifecycle = .managed });
-    try model.addWindow(.{ .id = wid(20), .output = oid(1), .tags = Tags.single(1), .lifecycle = .managed });
+    try addManagedWindow(&model, wid(10), oid(1), Tags.single(0));
+    try addManagedWindow(&model, wid(20), oid(1), Tags.single(1));
 
     try model.focus(wid(10));
     try model.setActiveTags(oid(1), Tags.single(1));
@@ -260,8 +288,8 @@ test "closing a focused window repairs focus before protocol destruction" {
     var model = Model.init(std.testing.allocator);
     defer model.deinit();
     try model.addOutput(.{ .id = oid(1), .active_tags = Tags.single(0) });
-    try model.addWindow(.{ .id = wid(10), .output = oid(1), .tags = Tags.single(0), .lifecycle = .managed });
-    try model.addWindow(.{ .id = wid(20), .output = oid(1), .tags = Tags.single(0), .lifecycle = .managed });
+    try addManagedWindow(&model, wid(10), oid(1), Tags.single(0));
+    try addManagedWindow(&model, wid(20), oid(1), Tags.single(0));
     try model.focus(wid(10));
     try model.focus(wid(20));
 
@@ -277,8 +305,8 @@ test "moving the focused window repairs both outputs" {
     defer model.deinit();
     try model.addOutput(.{ .id = oid(1), .active_tags = Tags.single(0) });
     try model.addOutput(.{ .id = oid(2), .active_tags = Tags.single(0) });
-    try model.addWindow(.{ .id = wid(10), .output = oid(1), .tags = Tags.single(0), .lifecycle = .managed });
-    try model.addWindow(.{ .id = wid(20), .output = oid(1), .tags = Tags.single(0), .lifecycle = .managed });
+    try addManagedWindow(&model, wid(10), oid(1), Tags.single(0));
+    try addManagedWindow(&model, wid(20), oid(1), Tags.single(0));
     try model.focus(wid(10));
 
     try model.moveWindow(wid(10), oid(2));
@@ -291,7 +319,7 @@ test "output removal orphans windows without dangling focus" {
     var model = Model.init(std.testing.allocator);
     defer model.deinit();
     try model.addOutput(.{ .id = oid(1), .active_tags = Tags.single(0) });
-    try model.addWindow(.{ .id = wid(10), .output = oid(1), .tags = Tags.single(0), .lifecycle = .managed });
+    try addManagedWindow(&model, wid(10), oid(1), Tags.single(0));
     try model.focus(wid(10));
 
     try model.removeOutput(oid(1));
@@ -315,4 +343,83 @@ test "invalid identities, lifecycles, outputs, and empty active tags are rejecte
     try std.testing.expectError(error.InvalidLifecycle, model.beginClose(wid(10)));
     try std.testing.expectError(error.EmptyActiveTags, model.setActiveTags(oid(1), .none));
     try model.validate();
+}
+
+test "initial state cannot bypass focus and lifecycle transitions" {
+    var model = Model.init(std.testing.allocator);
+    defer model.deinit();
+
+    try std.testing.expectError(error.InvalidInitialOutputState, model.addOutput(.{
+        .id = oid(1),
+        .active_tags = Tags.single(0),
+        .focused = wid(10),
+    }));
+    try model.addOutput(.{ .id = oid(1), .active_tags = Tags.single(0) });
+    try std.testing.expectError(error.InvalidInitialWindowState, model.addWindow(.{
+        .id = wid(10),
+        .output = oid(1),
+        .tags = Tags.single(0),
+        .lifecycle = .managed,
+    }));
+    try std.testing.expectError(error.InvalidInitialWindowState, model.addWindow(.{
+        .id = wid(10),
+        .output = oid(1),
+        .tags = Tags.single(0),
+        .focus_serial = 9,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), model.windows.items.len);
+    try model.validate();
+}
+
+test "placement changes require a managed window" {
+    var model = Model.init(std.testing.allocator);
+    defer model.deinit();
+    try model.addOutput(.{ .id = oid(1), .active_tags = Tags.single(0) });
+    try model.addWindow(.{ .id = wid(10), .output = oid(1), .tags = Tags.single(0) });
+
+    try std.testing.expectError(error.InvalidLifecycle, model.setPlacement(wid(10), .floating));
+    try model.manageWindow(wid(10));
+    try model.setPlacement(wid(10), .fullscreen);
+    try std.testing.expectEqual(Placement.fullscreen, model.getWindow(wid(10)).?.placement);
+    try model.validate();
+}
+
+test "long mixed transition sequences preserve every model invariant" {
+    var model = Model.init(std.testing.allocator);
+    defer model.deinit();
+    var state: u64 = 0x6f_63_65_61_6e;
+
+    for (0..10_000) |_| {
+        const value = nextPseudoRandom(&state);
+        const window_id = wid(1 + value % 12);
+        const output_id = oid(1 + (value >> 8) % 4);
+        const tags = Tags.single(@intCast((value >> 16) % 8));
+
+        switch ((value >> 24) % 11) {
+            0 => model.addOutput(.{ .id = output_id, .active_tags = tags }) catch {},
+            1 => model.removeOutput(output_id) catch {},
+            2 => model.addWindow(.{
+                .id = window_id,
+                .output = if (value & 1 == 0) output_id else null,
+                .tags = tags,
+            }) catch {},
+            3 => model.manageWindow(window_id) catch {},
+            4 => model.beginClose(window_id) catch {},
+            5 => model.removeWindow(window_id) catch {},
+            6 => model.focus(window_id) catch {},
+            7 => model.setActiveTags(output_id, tags) catch {},
+            8 => model.setWindowTags(window_id, if (value & 2 == 0) tags else .none) catch {},
+            9 => model.moveWindow(window_id, if (value & 4 == 0) output_id else null) catch {},
+            10 => model.setPlacement(window_id, @enumFromInt((value >> 32) % 3)) catch {},
+            else => unreachable,
+        }
+        try model.validate();
+    }
+}
+
+fn nextPseudoRandom(state: *u64) u64 {
+    state.* ^= state.* << 13;
+    state.* ^= state.* >> 7;
+    state.* ^= state.* << 17;
+    return state.*;
 }
