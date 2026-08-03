@@ -1,5 +1,6 @@
 const std = @import("std");
 const runtime = @import("whirlpool-runtime");
+const studio = @import("whirlpool-studio");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
@@ -22,9 +23,9 @@ pub fn main(init: std.process.Init) !void {
             plan.create_graphics_context,
             plan.bind_river_window_manager,
         }),
-        .studio => std.log.info("studio host selected (graphics={}, river={})", .{
-            plan.create_graphics_context,
-            plan.bind_river_window_manager,
-        }),
+        .studio => {
+            std.debug.assert(!plan.bind_river_window_manager);
+            try studio.run();
+        },
     }
 }

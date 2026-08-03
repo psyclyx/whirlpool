@@ -15,13 +15,13 @@ rather than a source transplant from either project.
   Wayland or EGL itself.
 - Platform adapters translate River/Wayland events into model operations.
   Rendering reads model and shell state but cannot mutate it implicitly.
-- `whirlpool studio` is the graphics iteration entry point. Its startup
-  contract creates a graphics context and ordinary preview surface without
-  binding River's window-management protocols.
+- `whirlpool studio` is the graphics iteration entry point. It creates an
+  ordinary xdg-shell preview surface and caller-owned EGL/OpenGL ES context
+  without importing or binding River's window-management protocols.
 
-The River and studio platform adapters and the current Snail renderer are the
-next implementation layer. The module boundaries and startup-plan tests are
-already arranged so studio mode cannot accidentally claim window management.
+The current Snail renderer and the River adapter are the next implementation
+layer. Studio already exercises configure/resize, frame callbacks, EGL swaps,
+and a small animated scissored scene on the same owned context Snail will use.
 
 ## Development
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Scanner = @import("wayland").Scanner;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -21,6 +22,30 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const scanner = Scanner.create(b, .{});
+    scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
+    scanner.generate("wl_compositor", 6);
+    scanner.generate("xdg_wm_base", 6);
+
+    const wayland = b.createModule(.{
+        .root_source_file = scanner.result,
+        .target = target,
+        .optimize = optimize,
+    });
+    wayland.linkSystemLibrary("wayland-client", .{});
+
+    const studio = b.addModule("whirlpool-studio", .{
+        .root_source_file = b.path("src/platform/studio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "wayland", .module = wayland }},
+    });
+    studio.linkSystemLibrary("wayland-client", .{});
+    studio.linkSystemLibrary("wayland-egl", .{});
+    studio.linkSystemLibrary("EGL", .{});
+    studio.linkSystemLibrary("GLESv2", .{});
+
     const exe = b.addExecutable(.{
         .name = "whirlpool",
         .root_module = b.createModule(.{
@@ -31,6 +56,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "whirlpool-model", .module = model },
                 .{ .name = "whirlpool-shell", .module = shell },
                 .{ .name = "whirlpool-runtime", .module = runtime },
+                .{ .name = "whirlpool-studio", .module = studio },
             },
         }),
     });
