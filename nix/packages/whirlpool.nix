@@ -1,12 +1,14 @@
 {
   callPackage,
+  harfbuzz,
   lib,
-  libGL,
   pkg-config,
   stdenv,
   wayland,
   wayland-protocols,
   wayland-scanner,
+  vulkan-headers,
+  vulkan-loader,
   zig_0_16,
 }:
 stdenv.mkDerivation (finalAttrs: {
@@ -31,9 +33,11 @@ stdenv.mkDerivation (finalAttrs: {
   ];
 
   buildInputs = [
-    libGL
+    harfbuzz
     wayland
     wayland-protocols
+    vulkan-headers
+    vulkan-loader
   ];
 
   zigBuildFlags = [

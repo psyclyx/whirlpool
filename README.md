@@ -12,16 +12,17 @@ rather than a source transplant from either project.
   sockets, rendering handles, or global state.
 - `whirlpool-shell` is the reusable part of the Shoal idea: host-independent
   shell surfaces and views. It is consumed by Whirlpool rather than owning
-  Wayland or EGL itself.
+  Wayland or graphics APIs itself.
 - Platform adapters translate River/Wayland events into model operations.
   Rendering reads model and shell state but cannot mutate it implicitly.
 - `whirlpool studio` is the graphics iteration entry point. It creates an
-  ordinary xdg-shell preview surface and caller-owned EGL/OpenGL ES context
+  ordinary xdg-shell preview surface and a caller-owned Vulkan context
   without importing or binding River's window-management protocols.
 
-The current Snail renderer and the River adapter are the next implementation
-layer. Studio already exercises configure/resize, frame callbacks, EGL swaps,
-and a small animated scissored scene on the same owned context Snail will use.
+Studio exercises configure/resize, frame callbacks, a Vulkan Wayland swapchain,
+and a current Snail 0.17 vector scene. Whirlpool owns the pixels and staging;
+the initial deterministic `snail-raster` path will be replaced by a persistent
+GPU atlas renderer without changing the shell or window-model boundaries.
 
 ## Development
 

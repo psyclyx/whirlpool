@@ -1,19 +1,23 @@
 {
   mkShell,
-  libGL,
+  harfbuzz,
   pkg-config,
   wayland,
   wayland-protocols,
   wayland-scanner,
+  vulkan-headers,
+  vulkan-loader,
   zig_0_16,
 }:
 mkShell {
   packages = [
-    libGL
+    harfbuzz
     pkg-config
     wayland
     wayland-protocols
     wayland-scanner
+    vulkan-headers
+    vulkan-loader
     zig_0_16
   ];
 }

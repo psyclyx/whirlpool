@@ -22,6 +22,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const snail_dep = b.dependency("snail", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const snail = snail_dep.module("snail");
+    const snail_raster = snail_dep.module("snail-raster");
+    const graphics = b.addModule("whirlpool-graphics", .{
+        .root_source_file = b.path("src/graphics/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "snail", .module = snail },
+            .{ .name = "snail-raster", .module = snail_raster },
+        },
+    });
+
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.generate("wl_compositor", 6);
@@ -41,10 +57,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{.{ .name = "wayland", .module = wayland }},
     });
+    studio.addImport("whirlpool-graphics", graphics);
     studio.linkSystemLibrary("wayland-client", .{});
-    studio.linkSystemLibrary("wayland-egl", .{});
-    studio.linkSystemLibrary("EGL", .{});
-    studio.linkSystemLibrary("GLESv2", .{});
+    studio.linkSystemLibrary("vulkan", .{});
 
     const exe = b.addExecutable(.{
         .name = "whirlpool",
@@ -68,7 +83,7 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run Whirlpool").dependOn(&run.step);
 
     const test_step = b.step("test", "Run all unit tests");
-    inline for (.{ model, shell, runtime }) |module| {
+    inline for (.{ model, shell, runtime, graphics }) |module| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
     }
 
