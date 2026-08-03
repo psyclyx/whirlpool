@@ -19,6 +19,8 @@ revision in `npins/sources.json`; the Nix build rejects any pin/vendor drift.
 - The replayable half of the River adapter translates normalized protocol and
   policy events into model operations and explicit focus effects without owning
   a socket. A separate state machine enforces v5 manage/render transactions.
+- `whirlpool-layout` computes deterministic master/stack and fullscreen
+  geometry into caller-owned storage, independently of River proxies.
   Rendering reads model and shell state but cannot mutate it implicitly.
 - `whirlpool studio` is the graphics iteration entry point. It creates an
   ordinary xdg-shell preview surface and a caller-owned Vulkan context
