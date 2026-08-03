@@ -14,7 +14,11 @@ let
   # can refer to one another. Directory discovery uses `prev.lib` to avoid
   # asking for an attribute of the fixpoint while its overlay keys are still
   # being formed.
-  overlay = final: prev: mkPackages final prev.lib;
+  overlay = final: prev:
+    (mkPackages final prev.lib)
+    // {
+      whirlpoolRiverSource = npins.river;
+    };
 in
   {
     nixpkgs ? npins.nixpkgs,

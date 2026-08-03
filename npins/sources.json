@@ -6,6 +6,20 @@
       "artifact": "nixexprs.tar.xz",
       "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1046984.104240a77242/nixexprs.tar.xz",
       "hash": "sha256-NqaCaIITVSDaBYdcWcfCyEu1erL7paTPEQbISQp9xwQ="
+    },
+    "river": {
+      "type": "Git",
+      "repository": {
+        "type": "Forgejo",
+        "server": "https://codeberg.org/",
+        "owner": "river",
+        "repo": "river"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "011620314585a82ac6de9851448c3d7e1269d86b",
+      "url": "https://codeberg.org/river/river/archive/011620314585a82ac6de9851448c3d7e1269d86b.tar.gz",
+      "hash": "sha256-BEDG/9Sf8zKLOGsloXsfUHL2PfkcxAZd61oGHYY9xQg="
     }
   },
   "version": 8

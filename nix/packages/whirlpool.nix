@@ -9,6 +9,7 @@
   wayland-scanner,
   vulkan-headers,
   vulkan-loader,
+  whirlpoolRiverSource,
   zig_0_16,
 }:
 stdenv.mkDerivation (finalAttrs: {
@@ -20,9 +21,16 @@ stdenv.mkDerivation (finalAttrs: {
     fileset = lib.fileset.unions [
       ../../build.zig
       ../../build.zig.zon
+      ../../protocol
       ../../src
     ];
   };
+
+  postPatch = ''
+    cmp \
+      ${whirlpoolRiverSource}/protocol/river-window-management-v1.xml \
+      protocol/river-window-management-v1.xml
+  '';
 
   deps = callPackage ../../build.zig.zon.nix { };
 

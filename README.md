@@ -4,6 +4,9 @@ Whirlpool is a new River window manager and graphical shell host. It is a
 rewrite informed by Tidepool and Shoal, built around current Zig and Snail
 rather than a source transplant from either project.
 
+River's v5 window-management protocol is vendored from the exact upstream
+revision in `npins/sources.json`; the Nix build rejects any pin/vendor drift.
+
 ## Direction
 
 - Whirlpool owns the River connection, window/output model, event loop, and

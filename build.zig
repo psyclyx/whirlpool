@@ -46,8 +46,10 @@ pub fn build(b: *std.Build) void {
 
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
+    scanner.addCustomProtocol(b.path("protocol/river-window-management-v1.xml"));
     scanner.generate("wl_compositor", 6);
     scanner.generate("xdg_wm_base", 6);
+    scanner.generate("river_window_manager_v1", 5);
 
     const wayland = b.createModule(.{
         .root_source_file = scanner.result,
