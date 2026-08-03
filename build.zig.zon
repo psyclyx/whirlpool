@@ -1,0 +1,13 @@
+.{
+    .name = .whirlpool,
+    .version = "0.1.0-dev",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xfb164896d71d0c8f,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
