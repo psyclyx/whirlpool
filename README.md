@@ -13,7 +13,8 @@ rather than a source transplant from either project.
 - `whirlpool-shell` is the reusable part of the Shoal idea: host-independent
   shell surfaces and views. It is consumed by Whirlpool rather than owning
   Wayland or graphics APIs itself.
-- Platform adapters translate River/Wayland events into model operations.
+- The replayable half of the River adapter translates protocol events into
+  model operations and explicit focus effects without owning a socket.
   Rendering reads model and shell state but cannot mutate it implicitly.
 - `whirlpool studio` is the graphics iteration entry point. It creates an
   ordinary xdg-shell preview surface and a caller-owned Vulkan context
@@ -48,8 +49,8 @@ Window behavior is tested at three layers:
 
 1. Pure model tests cover lifecycle, focus repair, tags, output removal, and
    cross-output moves with no compositor involved.
-2. Adapter contract tests will replay captured River event sequences into the
-   model and assert emitted protocol requests.
+2. Adapter contract tests replay River-shaped event sequences into the model
+   and assert the exact focus effects a concrete Wayland bridge must execute.
 3. End-to-end tests will run a nested compositor for protocol and rendering
    smoke coverage.
 

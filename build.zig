@@ -21,6 +21,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const river = b.addModule("whirlpool-river", .{
+        .root_source_file = b.path("src/river/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "whirlpool-model", .module = model }},
+    });
 
     const snail_dep = b.dependency("snail", .{
         .target = target,
@@ -83,7 +89,7 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run Whirlpool").dependOn(&run.step);
 
     const test_step = b.step("test", "Run all unit tests");
-    inline for (.{ model, shell, runtime, graphics }) |module| {
+    inline for (.{ model, shell, runtime, river, graphics }) |module| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
     }
 
