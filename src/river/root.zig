@@ -1,11 +1,14 @@
 //! Replayable core of the River protocol adapter.
 //!
-//! Concrete Wayland listeners turn protocol callbacks into `Event` values and
-//! execute the returned effects. This half deliberately owns no proxies or
-//! sockets, making captured event streams deterministic unit tests.
+//! A concrete Wayland bridge combines protocol callbacks with policy defaults,
+//! normalizes them into `Event` values, and executes the returned effects. This
+//! half deliberately owns no proxies or sockets, making captured event streams
+//! deterministic unit tests.
 
 const std = @import("std");
 const model = @import("whirlpool-model");
+
+pub const transaction = @import("transaction.zig");
 
 pub const Event = union(enum) {
     output_announced: struct {
