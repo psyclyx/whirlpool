@@ -4,6 +4,10 @@ Whirlpool is a new River window manager and graphical shell host. It is a
 rewrite informed by Tidepool and Shoal, built around current Zig and Snail
 rather than a source transplant from either project.
 
+The proposed Zig/Lua ownership and capability boundary is documented in
+[`docs/lua-architecture.md`](docs/lua-architecture.md). Runtime implementation
+is intentionally paused until that design is agreed.
+
 River's v5 window-management protocol is vendored from the exact upstream
 revision in `npins/sources.json`; the Nix build rejects any pin/vendor drift.
 
