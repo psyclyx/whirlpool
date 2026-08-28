@@ -86,8 +86,7 @@ const paint = DirtyFlags{ .paint = true };
 /// avoids reflection-driven behavior.
 pub fn metadata(value: Value) Metadata {
     return switch (value) {
-        .width, .height, .gap, .padding => .{ .supported_by = .every_node, .dirty = layout_and_paint },
-        .flex => .{ .supported_by = .spacer, .dirty = layout_and_paint },
+        .width, .height, .gap, .padding, .flex => .{ .supported_by = .every_node, .dirty = layout_and_paint },
         .fill, .radius => .{ .supported_by = .shape, .dirty = paint },
         .text => .{ .supported_by = .text, .dirty = layout_and_paint, .owns_bytes = true },
         .text_color, .font_size => .{ .supported_by = .text, .dirty = paint },

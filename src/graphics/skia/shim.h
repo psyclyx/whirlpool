@@ -15,7 +15,7 @@ void whirlpool_skia_destroy(WhirlpoolSkia *renderer);
 int whirlpool_skia_begin(WhirlpoolSkia *renderer, uint32_t width, uint32_t height);
 void whirlpool_skia_clear(WhirlpoolSkia *renderer, float r, float g, float b, float a);
 void whirlpool_skia_draw_rect(WhirlpoolSkia *renderer, float x, float y, float width,
-                              float height, float r, float g, float b, float a);
+                              float height, float radius, float r, float g, float b, float a);
 void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *text, size_t length,
                               float x, float baseline, float size,
                               float r, float g, float b, float a);

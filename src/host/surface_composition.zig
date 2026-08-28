@@ -22,6 +22,10 @@ pub const Composition = struct {
         const modules = [_]script.program_loader.Module{
             .{ .name = "surface", .source = source },
             .{ .name = "whirlpool.workspace", .source = lua_stdlib.workspace },
+            .{ .name = "whirlpool.theme", .source = lua_stdlib.theme },
+            .{ .name = "whirlpool.status", .source = lua_stdlib.status },
+            .{ .name = "whirlpool.shell", .source = lua_stdlib.shell },
+            .{ .name = "whirlpool.decorator", .source = lua_stdlib.decorator },
         };
         var program = try loader.load("surface", &modules);
         errdefer program.deinit();
@@ -82,4 +86,27 @@ test "surface composition exposes the workspace stdlib module" {
     var frame = try composition.snapshotAndLower(.{ .width = 100, .height = 20 });
     defer frame.deinit();
     try std.testing.expectEqual(@as(usize, 2), frame.node_count);
+}
+
+test "sample shell and decoration modules mount as distinct compositions" {
+    var shell = try Composition.init(std.testing.allocator,
+        \\return require("whirlpool.shell")
+    );
+    defer shell.deinit();
+    var shell_frame = try shell.snapshotAndLower(.{ .width = 800, .height = 600 });
+    defer shell_frame.deinit();
+    try std.testing.expect(shell_frame.node_count > 100);
+
+    var decoration = try Composition.init(std.testing.allocator,
+        \\return require("whirlpool.decorator")
+    );
+    defer decoration.deinit();
+    try decoration.update(.{
+        .service = "decoration",
+        .values = &.{ .{ .string = "Whirlpool" }, .{ .boolean = true } },
+    });
+    var frame = try decoration.snapshotAndLower(.{ .width = 800, .height = 28 });
+    defer frame.deinit();
+    try std.testing.expect(frame.node_count < 50);
+    try std.testing.expectEqual(@as(usize, 2), frame.operationCount());
 }

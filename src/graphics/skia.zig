@@ -12,7 +12,7 @@ extern fn whirlpool_skia_create(bgra: c_int) ?*Native;
 extern fn whirlpool_skia_destroy(renderer: *Native) void;
 extern fn whirlpool_skia_begin(renderer: *Native, width: u32, height: u32) c_int;
 extern fn whirlpool_skia_clear(renderer: *Native, r: f32, g: f32, b: f32, a: f32) void;
-extern fn whirlpool_skia_draw_rect(renderer: *Native, x: f32, y: f32, width: f32, height: f32, r: f32, g: f32, b: f32, a: f32) void;
+extern fn whirlpool_skia_draw_rect(renderer: *Native, x: f32, y: f32, width: f32, height: f32, radius: f32, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_text(renderer: *Native, text: [*]const u8, length: usize, x: f32, baseline: f32, size: f32, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_end(renderer: *Native, row_bytes: *usize) ?[*]const u8;
 
@@ -46,8 +46,8 @@ pub const Renderer = struct {
         whirlpool_skia_clear(self.native, clear[0], clear[1], clear[2], clear[3]);
     }
 
-    pub fn drawRect(self: *Renderer, rect: Rect, color: Color) void {
-        whirlpool_skia_draw_rect(self.native, rect.x, rect.y, rect.width, rect.height, color.r, color.g, color.b, color.a);
+    pub fn drawRect(self: *Renderer, rect: Rect, radius: f32, color: Color) void {
+        whirlpool_skia_draw_rect(self.native, rect.x, rect.y, rect.width, rect.height, radius, color.r, color.g, color.b, color.a);
     }
 
     pub fn drawText(self: *Renderer, text: []const u8, x: f32, baseline: f32, size: f32, color: Color) void {
@@ -59,7 +59,7 @@ pub const Renderer = struct {
     /// alive until this function returns.
     pub fn drawList(self: *Renderer, list: DrawList) void {
         for (list.ops) |op| switch (op) {
-            .rect => |rect| self.drawRect(rect.rect, rect.color),
+            .rect => |rect| self.drawRect(rect.rect, rect.radius, rect.color),
             .text => |item| self.drawText(item.text, item.x, item.baseline, item.size, item.color),
         };
     }
@@ -89,6 +89,7 @@ pub const DrawList = struct {
 pub const DrawOp = union(enum) {
     rect: struct {
         rect: Rect,
+        radius: f32 = 0,
         color: Color,
     },
     text: struct {

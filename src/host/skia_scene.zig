@@ -62,10 +62,12 @@ const Lowerer = struct {
             .height = if (properties.height) |value| try dimension(value) else offered.height,
         };
         const opacity = inherited_opacity * properties.opacity;
+        if (opacity == 0) return;
 
         switch (snapshot.kind) {
             .shape => if (box.width > 0 and box.height > 0) try self.ops.append(self.allocator, .{ .rect = .{
                 .rect = .{ .x = box.x, .y = box.y, .width = box.width, .height = box.height },
+                .radius = properties.radius,
                 .color = colorWithOpacity(properties.fill, opacity),
             } }),
             .text => if (properties.text.len != 0) {

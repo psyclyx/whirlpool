@@ -80,12 +80,16 @@ extern "C" void whirlpool_skia_clear(WhirlpoolSkia *renderer,
 
 extern "C" void whirlpool_skia_draw_rect(WhirlpoolSkia *renderer,
                                           float x, float y, float width, float height,
-                                          float r, float g, float b, float a) {
+                                          float radius, float r, float g, float b, float a) {
     if (!renderer || !renderer->canvas) return;
     SkPaint paint;
     paint.setAntiAlias(true);
     paint.setColor4f(SkColor4f{r, g, b, a}, nullptr);
-    renderer->canvas->drawRect(SkRect::MakeXYWH(x, y, width, height), paint);
+    const SkRect rect = SkRect::MakeXYWH(x, y, width, height);
+    if (radius > 0)
+        renderer->canvas->drawRoundRect(rect, radius, radius, paint);
+    else
+        renderer->canvas->drawRect(rect, paint);
 }
 
 extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *text,
