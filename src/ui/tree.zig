@@ -60,6 +60,7 @@ pub const Scene = struct {
     first_root: ?NodeHandle = null,
     last_root: ?NodeHandle = null,
 
+    /// Initialize an empty retained scene.
     pub fn init(allocator: Allocator) Scene {
         return .{
             .allocator = allocator,
@@ -68,7 +69,9 @@ pub const Scene = struct {
         };
     }
 
+    /// Destroy every mount and retained node owned by this scene.
     pub fn deinit(self: *Scene) void {
+        self.assertValid();
         while (self.liveMountCount() != 0) {
             var candidate: ?MountHandle = null;
             for (self.mounts.slots.items, 0..) |mount_slot, index| {
@@ -92,21 +95,29 @@ pub const Scene = struct {
 
         self.mounts.deinit();
         self.nodes.deinit();
+        self.* = undefined;
     }
 
+    /// Create a root mount context.
     pub fn mount(self: *Scene) !MountContext {
+        self.assertValid();
         const id = try self.allocateMount(null, null);
+        self.assertValid();
+        std.debug.assert(self.lookupMount(id) != null);
         return .{ .scene = self, .id = id };
     }
 
+    /// Return the number of retained live nodes.
     pub fn liveNodeCount(self: *const Scene) usize {
         return self.nodes.liveCount();
     }
 
+    /// Return the number of live mount owners.
     pub fn liveMountCount(self: *const Scene) usize {
         return self.mounts.liveCount();
     }
 
+    /// Snapshot one live node without copying its property storage.
     pub fn node(self: *const Scene, handle: NodeHandle) ?NodeSnapshot {
         const stored = self.lookupNode(handle) orelse return null;
         return .{
@@ -121,6 +132,7 @@ pub const Scene = struct {
     /// Copy the direct children in retained order. Passing null returns the
     /// scene roots. The returned handle array belongs to the caller.
     pub fn childrenAlloc(self: *const Scene, allocator: Allocator, parent: ?NodeHandle) (NodeError || Allocator.Error)![]NodeHandle {
+        self.assertValid();
         if (parent) |parent_handle| _ = self.lookupNode(parent_handle) orelse return error.StaleNode;
 
         const first = if (parent) |parent_handle|
@@ -142,17 +154,22 @@ pub const Scene = struct {
             written += 1;
             current = (self.lookupNode(handle) orelse unreachable).next_sibling;
         }
+        std.debug.assert(written == count);
         return result;
     }
 
+    /// Return one node's dirty flags.
     pub fn dirtyFlags(self: *const Scene, handle: NodeHandle) NodeError!DirtyFlags {
         return (self.lookupNode(handle) orelse return error.StaleNode).dirty;
     }
 
+    /// Clear dirty flags on every live node.
     pub fn clearDirty(self: *Scene) void {
+        self.assertValid();
         for (self.nodes.slots.items) |*slot| {
             if (slot.state == .alive) slot.value.dirty = .{};
         }
+        self.assertValid();
     }
 
     /// Return stable, caller-owned snapshots for the currently dirty nodes.
@@ -180,15 +197,19 @@ pub const Scene = struct {
             snapshots[written] = try self.copySnapshot(allocator, handle);
             written += 1;
         }
+        std.debug.assert(written == count);
         return snapshots;
     }
 
+    /// Release snapshots returned by snapshotDirtyAlloc.
     pub fn freeSnapshots(allocator: Allocator, snapshots: []NodeSnapshot) void {
         for (snapshots) |snapshot| freeSnapshotText(allocator, snapshot);
         allocator.free(snapshots);
     }
 
+    /// Validate a property against a live node without mutating it.
     pub fn validateProperty(self: *const Scene, handle: NodeHandle, value: PropertyValue) NodeError!void {
+        self.assertValid();
         const stored = self.lookupNode(handle) orelse return error.StaleNode;
         try properties.validate(stored.kind, value);
     }
@@ -196,6 +217,7 @@ pub const Scene = struct {
     /// Apply one already-validated property. SceneDelta performs the
     /// transaction-level validation and allocation before calling this.
     pub fn applyProperty(self: *Scene, handle: NodeHandle, value: PropertyValue, owned_text: ?[]u8) NodeError!void {
+        self.assertValid();
         const stored = self.lookupNodeMut(handle) orelse return error.StaleNode;
         try properties.validate(stored.kind, value);
         switch (value) {
@@ -207,12 +229,14 @@ pub const Scene = struct {
             else => {},
         }
         self.commitProperty(handle, value, owned_text);
+        self.assertValid();
     }
 
     /// Commit a property after the caller has validated the node and prepared
     /// all fallible allocations. Keeping this phase infallible is what makes a
     /// SceneDelta's mutation phase atomic.
     pub fn commitProperty(self: *Scene, handle: NodeHandle, value: PropertyValue, owned_text: ?[]u8) void {
+        self.assertValid();
         const stored = self.lookupNodeMut(handle) orelse unreachable;
         stored.properties.commit(self.allocator, value, owned_text);
 
@@ -220,6 +244,7 @@ pub const Scene = struct {
         stored.dirty.layout = stored.dirty.layout or dirty.layout;
         stored.dirty.paint = stored.dirty.paint or dirty.paint;
         if (dirty.layout) self.markLayoutAncestors(stored.parent);
+        self.assertValid();
     }
 
     fn markLayoutAncestors(self: *Scene, start: ?NodeHandle) void {
@@ -282,6 +307,7 @@ pub const Scene = struct {
 
     fn destroyNode(self: *Scene, handle: NodeHandle) void {
         const stored = self.lookupNode(handle) orelse return;
+        const owner = stored.owner;
         self.destroyAnchoredMounts(handle);
 
         var child = stored.first_child;
@@ -294,6 +320,7 @@ pub const Scene = struct {
         const parent = stored.parent;
         self.detachNode(handle);
         if (parent) |parent_handle| self.markLayoutAncestors(parent_handle);
+        if (self.lookupMountMut(owner)) |mount_value| removeOwnedNode(mount_value, handle);
         self.releaseNodeSlot(handle);
     }
 
@@ -424,21 +451,84 @@ pub const Scene = struct {
         }
         return count;
     }
+
+    fn assertValid(self: *const Scene) void {
+        if (!std.debug.runtime_safety) return;
+        std.debug.assert((self.first_root == null) == (self.last_root == null));
+
+        for (self.mounts.slots.items, 0..) |slot, index| {
+            if (slot.state != .alive) continue;
+            const id = MountHandle{ .slot = @intCast(index), .generation = slot.generation };
+            const mount_value = &slot.value;
+            if (mount_value.parent) |parent| {
+                const parent_value = self.lookupMount(parent) orelse unreachable;
+                std.debug.assert(handleOccurrences(MountHandle, parent_value.children.items, id) == 1);
+            }
+            if (mount_value.anchor) |anchor| std.debug.assert(self.lookupNode(anchor) != null);
+            for (mount_value.children.items) |child| {
+                const child_value = self.lookupMount(child) orelse unreachable;
+                std.debug.assert(child_value.parent != null and child_value.parent.?.eql(id));
+            }
+            for (mount_value.owned_nodes.items) |handle| {
+                const node_value = self.lookupNode(handle) orelse unreachable;
+                std.debug.assert(node_value.owner.eql(id));
+            }
+        }
+
+        for (self.nodes.slots.items, 0..) |slot, index| {
+            if (slot.state != .alive) continue;
+            const handle = NodeHandle{ .slot = @intCast(index), .generation = slot.generation };
+            const node_value = &slot.value;
+            const owner = self.lookupMount(node_value.owner) orelse unreachable;
+            std.debug.assert(handleOccurrences(NodeHandle, owner.owned_nodes.items, handle) == 1);
+            std.debug.assert((node_value.first_child == null) == (node_value.last_child == null));
+            if (node_value.parent) |parent_handle| {
+                const parent = self.lookupNode(parent_handle) orelse unreachable;
+                std.debug.assert(nodeInChain(self, parent.first_child, handle));
+            } else {
+                std.debug.assert(nodeInChain(self, self.first_root, handle));
+            }
+            if (node_value.previous_sibling) |previous| {
+                const sibling = self.lookupNode(previous) orelse unreachable;
+                std.debug.assert(sibling.next_sibling != null and sibling.next_sibling.?.eql(handle));
+            }
+            if (node_value.next_sibling) |next| {
+                const sibling = self.lookupNode(next) orelse unreachable;
+                std.debug.assert(sibling.previous_sibling != null and sibling.previous_sibling.?.eql(handle));
+            }
+            var child = node_value.first_child;
+            var child_count: usize = 0;
+            while (child) |child_handle| {
+                const child_value = self.lookupNode(child_handle) orelse unreachable;
+                std.debug.assert(child_value.parent != null and child_value.parent.?.eql(handle));
+                child_count += 1;
+                std.debug.assert(child_count <= self.nodes.liveCount());
+                child = child_value.next_sibling;
+            }
+        }
+    }
 };
 
 pub const MountContext = struct {
     scene: *Scene,
     id: MountHandle,
 
+    /// Report whether this mount identity is still live.
     pub fn isAlive(self: *const MountContext) bool {
+        self.scene.assertValid();
         return self.scene.lookupMount(self.id) != null;
     }
 
+    /// Destroy this mount, its child mounts, and all nodes it owns.
     pub fn deinit(self: *MountContext) void {
+        self.scene.assertValid();
         self.scene.destroyMount(self.id);
+        self.scene.assertValid();
     }
 
+    /// Create a child mount optionally anchored under an owned node.
     pub fn child(self: *MountContext, anchor: ?NodeHandle) !MountContext {
+        self.scene.assertValid();
         _ = try self.scene.liveMount(self.id);
         if (anchor) |handle| {
             const node = self.scene.lookupNode(handle) orelse return error.StaleNode;
@@ -449,10 +539,13 @@ pub const MountContext = struct {
         errdefer self.scene.releaseMountSlot(child_id);
         const mount = try self.scene.liveMount(self.id);
         try mount.children.append(self.scene.allocator, child_id);
+        self.scene.assertValid();
         return .{ .scene = self.scene, .id = child_id };
     }
 
+    /// Create a node owned by this mount and attach it in retained order.
     pub fn create(self: *MountContext, kind: NodeKind, parent: ?NodeHandle) !NodeHandle {
+        self.scene.assertValid();
         const mount = try self.scene.liveMount(self.id);
         const actual_parent = parent orelse mount.anchor;
         if (actual_parent) |parent_handle| {
@@ -468,13 +561,17 @@ pub const MountContext = struct {
         });
         errdefer self.scene.releaseNodeSlot(handle);
         try mount.owned_nodes.append(self.scene.allocator, handle);
+        errdefer std.debug.assert(mount.owned_nodes.pop().?.eql(handle));
         try self.scene.attachNode(handle, actual_parent);
         const stored = self.scene.lookupNodeMut(handle) orelse unreachable;
         stored.dirty = .{ .layout = true, .paint = true };
         if (actual_parent) |parent_handle| self.scene.markLayoutAncestors(parent_handle);
+        self.scene.assertValid();
+        std.debug.assert(self.scene.lookupNode(handle) != null);
         return handle;
     }
 
+    /// Create a spacer node with its flex property initialized.
     pub fn spacer(self: *MountContext, parent: ?NodeHandle, flex: u32) !NodeHandle {
         const handle = try self.create(.spacer, parent);
         const node = self.scene.lookupNodeMut(handle) orelse unreachable;
@@ -482,6 +579,7 @@ pub const MountContext = struct {
         return handle;
     }
 
+    /// Create a shape node with a validated fill color.
     pub fn shape(self: *MountContext, parent: ?NodeHandle, fill: Color) !NodeHandle {
         if (!properties.validColor(fill)) return error.InvalidValue;
         const handle = try self.create(.shape, parent);
@@ -490,6 +588,7 @@ pub const MountContext = struct {
         return handle;
     }
 
+    /// Create a text node with owned UTF-8 bytes.
     pub fn text(self: *MountContext, parent: ?NodeHandle, value: []const u8) !NodeHandle {
         const handle = try self.create(.text, parent);
         errdefer self.remove(handle) catch unreachable;
@@ -499,15 +598,21 @@ pub const MountContext = struct {
         return handle;
     }
 
+    /// Remove one node owned by this mount.
     pub fn remove(self: *MountContext, handle: NodeHandle) NodeError!void {
+        self.scene.assertValid();
         const mount = try self.scene.liveMount(self.id);
         const node = self.scene.lookupNode(handle) orelse return error.StaleNode;
         if (!node.owner.eql(self.id)) return error.InvalidParent;
         _ = mount;
         self.scene.destroyNode(handle);
+        self.scene.assertValid();
+        std.debug.assert(self.scene.lookupNode(handle) == null);
     }
 
+    /// Return the number of this mount's nodes that remain live.
     pub fn ownedNodeCount(self: *const MountContext) usize {
+        self.scene.assertValid();
         return self.scene.liveNodeCountForMount(self.id);
     }
 };
@@ -518,6 +623,35 @@ fn isDirty(flags: DirtyFlags) bool {
 
 fn freeSnapshotText(allocator: Allocator, snapshot: NodeSnapshot) void {
     if (snapshot.properties.text.len != 0) allocator.free(snapshot.properties.text);
+}
+
+fn removeOwnedNode(mount: *Mount, target: NodeHandle) void {
+    for (mount.owned_nodes.items, 0..) |handle, index| {
+        if (!handle.eql(target)) continue;
+        _ = mount.owned_nodes.orderedRemove(index);
+        return;
+    }
+    unreachable;
+}
+
+fn handleOccurrences(comptime Handle: type, values: []const Handle, target: Handle) usize {
+    var count: usize = 0;
+    for (values) |value| if (value.eql(target)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn nodeInChain(scene: *const Scene, first: ?NodeHandle, target: NodeHandle) bool {
+    var count: usize = 0;
+    var current = first;
+    while (current) |handle| {
+        if (handle.eql(target)) return true;
+        count += 1;
+        std.debug.assert(count <= scene.nodes.liveCount());
+        current = (scene.lookupNode(handle) orelse unreachable).next_sibling;
+    }
+    return false;
 }
 
 test "mounts retain the six native node kinds and preserve parent order" {
