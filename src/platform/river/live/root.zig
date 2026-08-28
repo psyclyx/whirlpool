@@ -201,6 +201,7 @@ pub const Manager = struct {
         resolve: *const fn (?*anyopaque, *wayland.client.river.OutputV1) ?ShellPosition,
     ) void {
         for (self.output_shell_roles.items) |role| {
+            if (role.retirement_requested) continue;
             if (resolve(context, role.output)) |position| role.node.setPosition(position.x, position.y);
             role.node.placeTop();
         }

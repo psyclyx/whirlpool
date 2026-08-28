@@ -87,6 +87,7 @@ const RolePresenter = struct {
     worker_error: ?anyerror = null,
     closing: bool = false,
     retiring: bool = false,
+    detached: bool = false,
     status: Registry.PresenterState = .waiting_for_buffer,
     ready_slot: ?usize = null,
     generation: u64 = 0,
@@ -297,14 +298,26 @@ const RolePresenter = struct {
 
     fn beginRetire(self: *RolePresenter) void {
         var abandoned: ?OwnedUpdate = null;
+        var detach = false;
         self.lock();
         self.retiring = true;
+        if (!self.detached) {
+            self.detached = true;
+            detach = true;
+        }
         abandoned = self.pending;
         self.pending = null;
         if (self.worker_active and self.status == .waiting_for_buffer)
             self.status = .submitted;
         self.unlock();
         if (abandoned) |*request| request.deinit();
+        // A compositor may retain the surface's current DMA-BUF indefinitely
+        // until it is replaced. Detach exactly once so retirement can observe
+        // wl_buffer.release without destroying a still-borrowed surface.
+        if (detach) {
+            self.surface.attach(null, 0, 0);
+            self.surface.commit();
+        }
     }
 
     fn state(raw: *anyopaque) Registry.PresenterState {

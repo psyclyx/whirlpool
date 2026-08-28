@@ -193,38 +193,19 @@ pub const Runtime = struct {
     }
 
     fn reconcileShells(self: *Runtime) !void {
+        // Detect geometry changes before advancing retirements. A replacement
+        // is created below in this same safe point whenever the old presenter
+        // is already release-safe.
         for (self.manager.outputs.items) |output| {
             const output_id = try self.adapter.objects.outputId(output);
-            // Output identity arrives before its dimensions. Creating the role
-            // in that interval would force presentation to guess a buffer size
-            // and permanently place the bar against the guessed viewport.
             const extent = (try self.adapter.objects.outputSize(output_id)) orelse continue;
-            if (self.findShell(output)) |record| {
+            if (self.findActiveShell(output)) |record| {
                 if (record.state == .active and shellExtentChanged(record.extent, extent)) {
                     const role_index = self.managerShellIndex(record.role) orelse
                         return error.RoleOwnershipLost;
                     try self.manager.requestOutputShellRoleRetirement(role_index);
                 }
-                continue;
             }
-
-            const index = try self.manager.createOutputShellRole(self.compositor, output);
-            const role = self.manager.output_shell_roles.items[index];
-            self.shells.append(self.allocator, .{
-                .output = output,
-                .output_id = output_id,
-                .extent = extent,
-                .role = role.shell_surface,
-                .surface = role.surface,
-            }) catch |err| {
-                self.rollbackShell(index);
-                return err;
-            };
-            if (self.hooks.shell_created) |hook| hook(self.hooks.context, output_id, role.shell_surface, role.surface) catch |err| {
-                _ = self.shells.pop();
-                self.rollbackShell(index);
-                return err;
-            };
         }
 
         var index: usize = 0;
@@ -243,10 +224,36 @@ pub const Runtime = struct {
             }
 
             self.shells.items[index].state = .retiring;
-            if (!try self.advanceShellRetirement(index)) {
-                index += 1;
-                continue;
-            }
+            if (!try self.advanceShellRetirement(index)) index += 1;
+        }
+
+        for (self.manager.outputs.items) |output| {
+            // Create the replacement while the retiring role still owns its
+            // protocol objects. Besides minimizing the uncovered interval,
+            // this prevents a compositor from mistaking an allocator-reused
+            // shell identity for an unchanged render-list entry.
+            if (self.findActiveShell(output) != null) continue;
+            const output_id = try self.adapter.objects.outputId(output);
+            // Output identity arrives before its dimensions. Creating the role
+            // in that interval would force presentation to guess a buffer size.
+            const extent = (try self.adapter.objects.outputSize(output_id)) orelse continue;
+            const role_index = try self.manager.createOutputShellRole(self.compositor, output);
+            const role = self.manager.output_shell_roles.items[role_index];
+            self.shells.append(self.allocator, .{
+                .output = output,
+                .output_id = output_id,
+                .extent = extent,
+                .role = role.shell_surface,
+                .surface = role.surface,
+            }) catch |err| {
+                self.rollbackShell(role_index);
+                return err;
+            };
+            if (self.hooks.shell_created) |hook| hook(self.hooks.context, output_id, role.shell_surface, role.surface) catch |err| {
+                _ = self.shells.pop();
+                self.rollbackShell(role_index);
+                return err;
+            };
         }
     }
 
@@ -342,8 +349,9 @@ pub const Runtime = struct {
         self.manager.finishDecorationRoleRetirement(index) catch {};
     }
 
-    fn findShell(self: *const Runtime, output: *wayland.client.river.OutputV1) ?*const ShellRecord {
-        for (self.shells.items) |*shell| if (shell.output == output) return shell;
+    fn findActiveShell(self: *const Runtime, output: *wayland.client.river.OutputV1) ?*const ShellRecord {
+        for (self.shells.items) |*shell|
+            if (shell.output == output and shell.state == .active) return shell;
         return null;
     }
 
