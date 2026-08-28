@@ -43,6 +43,60 @@ pub const Wake = struct {
 };
 
 const OwnedUpdate = script.program_loader.OwnedUpdate;
+const max_update_services = 8;
+
+const UpdateSet = struct {
+    items: [max_update_services]?OwnedUpdate = [_]?OwnedUpdate{null} ** max_update_services,
+
+    fn equivalent(self: *const UpdateSet, source: script.program_loader.Update) bool {
+        for (&self.items) |*item| if (item.*) |*update|
+            if (std.mem.eql(u8, update.value.service, source.service)) return update.eql(source);
+        return false;
+    }
+
+    fn canPut(self: *const UpdateSet, service: []const u8) bool {
+        for (&self.items) |*item| if (item.*) |*update| {
+            if (std.mem.eql(u8, update.value.service, service)) return true;
+        } else return true;
+        return false;
+    }
+
+    fn put(self: *UpdateSet, update: OwnedUpdate) ?OwnedUpdate {
+        var free: ?usize = null;
+        for (&self.items, 0..) |*item, index| {
+            if (item.*) |*current| {
+                if (std.mem.eql(u8, current.value.service, update.value.service)) {
+                    const replaced = item.*;
+                    item.* = update;
+                    return replaced;
+                }
+            } else if (free == null) free = index;
+        }
+        self.items[free orelse unreachable] = update;
+        return null;
+    }
+
+    fn take(self: *UpdateSet) UpdateSet {
+        const result = self.*;
+        self.* = .{};
+        return result;
+    }
+
+    fn isEmpty(self: *const UpdateSet) bool {
+        for (self.items) |item| if (item != null) return false;
+        return true;
+    }
+
+    fn apply(self: *UpdateSet, composition: *host.surface_composition.Composition) !void {
+        for (&self.items) |*item| if (item.*) |*update|
+            try composition.update(update.value);
+    }
+
+    fn deinit(self: *UpdateSet) void {
+        for (&self.items) |*item| if (item.*) |*update| update.deinit();
+        self.* = .{};
+    }
+};
 
 const SlotState = enum { free, rendering, ready, prepared, armed, submitted };
 
@@ -74,15 +128,16 @@ const RolePresenter = struct {
     role: SurfaceRole,
     surface: *wayland.client.wl.Surface,
     extent: Extent,
-    composition: host.surface_composition.Composition,
+    composition: ?host.surface_composition.Composition = null,
     slots: [slot_count]Slot = undefined,
     initialized_slots: usize = 0,
     buffers_adopted: bool = false,
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     thread: ?std.Thread = null,
-    pending: ?OwnedUpdate = null,
-    accepted: ?OwnedUpdate = null,
+    pending: UpdateSet = .{},
+    desired: UpdateSet = .{},
+    desired_revision: u64 = 0,
     worker_active: bool = false,
     worker_error: ?anyerror = null,
     closing: bool = false,
@@ -94,18 +149,16 @@ const RolePresenter = struct {
     token: u64 = 0,
 
     fn init(self: *RolePresenter) !void {
-        const descriptor = switch (self.role) {
-            .shell => self.owner.surface,
-            .decoration => self.owner.decoration_surface orelse self.owner.surface,
-        };
-        self.composition = try host.surface_composition.Composition.init(self.owner.allocator, descriptor.content);
-        errdefer self.composition.deinit();
         const role_name = switch (self.role) {
             .shell => "shell",
             .decoration => "decoration",
         };
         const values = [_]script.program_loader.Value{.{ .string = role_name }};
-        try self.composition.update(.{ .service = "surface-role", .values = &values });
+        try self.enqueue(.{ .service = "surface-role", .values = &values });
+        errdefer {
+            self.pending.deinit();
+            self.desired.deinit();
+        }
         self.thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, workerMain, .{self});
     }
 
@@ -143,54 +196,65 @@ const RolePresenter = struct {
 
     fn enqueue(self: *RolePresenter, source: script.program_loader.Update) !void {
         self.lock();
-        if (self.accepted) |*accepted| if (accepted.eql(source)) {
+        if (self.desired.equivalent(source)) {
             self.unlock();
             return;
-        };
+        }
         self.unlock();
 
         var request = try OwnedUpdate.clone(self.owner.allocator, source);
-        var accepted = OwnedUpdate.clone(self.owner.allocator, source) catch |err| {
+        var desired = OwnedUpdate.clone(self.owner.allocator, source) catch |err| {
             request.deinit();
             return err;
         };
         var replaced: ?OwnedUpdate = null;
-        var replaced_accepted: ?OwnedUpdate = null;
+        var replaced_desired: ?OwnedUpdate = null;
         self.lock();
         if (self.closing or self.retiring) {
             self.unlock();
             request.deinit();
-            accepted.deinit();
+            desired.deinit();
             return error.SurfaceRoleRetiring;
         }
-        replaced = self.pending;
-        replaced_accepted = self.accepted;
-        self.pending = request;
-        self.accepted = accepted;
+        if (!self.pending.canPut(source.service) or !self.desired.canPut(source.service)) {
+            self.unlock();
+            request.deinit();
+            desired.deinit();
+            return error.SurfaceServiceLimitExceeded;
+        }
+        replaced = self.pending.put(request);
+        replaced_desired = self.desired.put(desired);
+        self.desired_revision +%= 1;
+        if (self.desired_revision == 0) self.desired_revision = 1;
         self.changed.signal(self.owner.io);
         self.unlock();
         if (replaced) |*old| old.deinit();
-        if (replaced_accepted) |*old| old.deinit();
+        if (replaced_desired) |*old| old.deinit();
     }
 
     fn workerMain(self: *RolePresenter) void {
+        const descriptor = switch (self.role) {
+            .shell => self.owner.surface,
+            .decoration => self.owner.decoration_surface orelse {
+                self.failWorker(error.MissingDecorationSurface);
+                return;
+            },
+        };
+        self.composition = host.surface_composition.Composition.init(
+            self.owner.allocator,
+            descriptor.content,
+        ) catch |err| {
+            self.failWorker(err);
+            return;
+        };
         self.allocateSlots() catch |err| {
-            self.lock();
-            const closing = self.closing;
-            if (!closing) self.worker_error = err;
-            self.changed.broadcast(self.owner.io);
-            self.unlock();
-            if (!closing) self.owner.notifyWake();
+            self.failWorker(err);
             return;
         };
         self.owner.gpu_mutex.lockUncancelable(self.owner.io);
         var renderer = graphics.skia.GpuRenderer.init(self.owner.context.skiaContext()) catch |err| {
             self.owner.gpu_mutex.unlock(self.owner.io);
-            self.lock();
-            self.worker_error = err;
-            self.changed.broadcast(self.owner.io);
-            self.unlock();
-            self.owner.notifyWake();
+            self.failWorker(err);
             return;
         };
         self.owner.gpu_mutex.unlock(self.owner.io);
@@ -203,20 +267,20 @@ const RolePresenter = struct {
                 self.unlock();
                 return;
             }
-            var request = self.pending.?;
-            self.pending = null;
+            var requests = self.pending.take();
+            const revision = self.desired_revision;
             const slot_index = self.freeSlot() orelse unreachable;
             self.slots[slot_index].state = .rendering;
             self.worker_active = true;
             self.unlock();
 
-            const rendered = self.render(&renderer, slot_index, request.value);
-            request.deinit();
+            const rendered = self.render(&renderer, slot_index, &requests);
+            requests.deinit();
 
             self.lock();
             self.worker_active = false;
             if (rendered) |_| {
-                if (self.closing or self.retiring) {
+                if (self.closing or self.retiring or revision != self.desired_revision) {
                     self.slots[slot_index].state = .free;
                 } else {
                     self.slots[slot_index].state = .ready;
@@ -225,6 +289,7 @@ const RolePresenter = struct {
                 }
             } else |err| {
                 self.slots[slot_index].state = .free;
+                if (revision == self.desired_revision) self.desired.deinit();
                 std.log.err("DMA-BUF surface worker failed: {s}", .{@errorName(err)});
             }
             if (self.retiring and self.status == .submitted and !self.hasSubmitted())
@@ -278,9 +343,10 @@ const RolePresenter = struct {
         self.unlock();
     }
 
-    fn render(self: *RolePresenter, renderer: *graphics.skia.GpuRenderer, slot_index: usize, update: script.program_loader.Update) !void {
-        try self.composition.update(update);
-        var frame = try self.composition.snapshotAndLower(.{
+    fn render(self: *RolePresenter, renderer: *graphics.skia.GpuRenderer, slot_index: usize, updates: *UpdateSet) !void {
+        const composition = &(self.composition orelse return error.CompositionUnavailable);
+        try updates.apply(composition);
+        var frame = try composition.snapshotAndLower(.{
             .width = self.extent.width,
             .height = self.extent.height,
         });
@@ -297,7 +363,7 @@ const RolePresenter = struct {
     }
 
     fn beginRetire(self: *RolePresenter) void {
-        var abandoned: ?OwnedUpdate = null;
+        var abandoned: UpdateSet = .{};
         var detach = false;
         self.lock();
         self.retiring = true;
@@ -305,12 +371,11 @@ const RolePresenter = struct {
             self.detached = true;
             detach = true;
         }
-        abandoned = self.pending;
-        self.pending = null;
+        abandoned = self.pending.take();
         if (self.worker_active and self.status == .waiting_for_buffer)
             self.status = .submitted;
         self.unlock();
-        if (abandoned) |*request| request.deinit();
+        abandoned.deinit();
         // A compositor may retain the surface's current DMA-BUF indefinitely
         // until it is replaced. Detach exactly once so retirement can observe
         // wl_buffer.release without destroying a still-borrowed surface.
@@ -399,24 +464,22 @@ const RolePresenter = struct {
         const self = from(raw);
         const owner = self.owner;
         if (owner.created_product == self) owner.created_product = null;
-        var abandoned: ?OwnedUpdate = null;
-        var accepted: ?OwnedUpdate = null;
+        var abandoned: UpdateSet = .{};
+        var desired: UpdateSet = .{};
         self.lock();
         self.closing = true;
-        abandoned = self.pending;
-        self.pending = null;
-        accepted = self.accepted;
-        self.accepted = null;
+        abandoned = self.pending.take();
+        desired = self.desired.take();
         self.changed.broadcast(owner.io);
         self.unlock();
-        if (abandoned) |*request| request.deinit();
-        if (accepted) |*request| request.deinit();
+        abandoned.deinit();
+        desired.deinit();
         if (self.thread) |thread| thread.join();
         while (self.initialized_slots > 0) {
             self.initialized_slots -= 1;
             self.slots[self.initialized_slots].deinit(owner.abandoning);
         }
-        self.composition.deinit();
+        if (self.composition) |*composition| composition.deinit();
         self.status = .destroyed;
         owner.allocator.destroy(self);
     }
@@ -430,7 +493,7 @@ const RolePresenter = struct {
         return false;
     }
     fn canRender(self: *RolePresenter) bool {
-        if (self.pending == null or self.ready_slot != null) return false;
+        if (self.pending.isEmpty() or self.ready_slot != null) return false;
         if (self.status == .prepared or self.status == .armed) return false;
         return self.freeSlot() != null;
     }
@@ -453,6 +516,14 @@ const RolePresenter = struct {
     }
     fn unlock(self: *RolePresenter) void {
         self.mutex.unlock(self.owner.io);
+    }
+    fn failWorker(self: *RolePresenter, err: anyerror) void {
+        self.lock();
+        const closing = self.closing;
+        if (!closing) self.worker_error = err;
+        self.changed.broadcast(self.owner.io);
+        self.unlock();
+        if (!closing) self.owner.notifyWake();
     }
     fn from(raw: *anyopaque) *RolePresenter {
         return @ptrCast(@alignCast(raw));
@@ -629,7 +700,7 @@ fn createRoleProduct(raw: ?*anyopaque, info: Registry.CreateInfo) !Registry.Pres
     const owner: *Runtime = @ptrCast(@alignCast(raw orelse return error.MissingRuntime));
     const product = try owner.allocator.create(RolePresenter);
     errdefer owner.allocator.destroy(product);
-    product.* = .{ .owner = owner, .role = info.role, .surface = info.surface, .extent = info.extent, .composition = undefined };
+    product.* = .{ .owner = owner, .role = info.role, .surface = info.surface, .extent = info.extent };
     try product.init();
     owner.created_product = product;
     return .{ .context = product, .vtable = &RolePresenter.vtable };
