@@ -217,6 +217,33 @@ pub const Adapter = struct {
         return host.decoration_selection.SelectionSet.fromWorld(self.allocator, &self.world, self.objects.output_order.items, @ptrCast(@constCast(self)), resolveSelectionOutput, resolveSelectionWindow);
     }
 
+    /// Match Tidepool's decoration policy: clients that advertise any SSD
+    /// support are asked to suppress their client-side chrome. River retains
+    /// this state, so emit only transitions and wait for the hint before
+    /// choosing a mode.
+    pub fn appendServerDecorationRequests(self: *const Adapter, operations: *std.ArrayList(types.ManageOperation)) !void {
+        for (self.objects.window_order.items) |window| {
+            const record = self.objects.windows.get(window) orelse continue;
+            const hint = record.decoration_hint orelse continue;
+            const wants_ssd = hint != .only_supports_csd;
+            if (record.decoration_ssd_applied == wants_ssd) continue;
+            if (wants_ssd) {
+                try operations.append(self.allocator, .{ .use_ssd = window });
+            } else if (record.decoration_ssd_applied != null) {
+                try operations.append(self.allocator, .{ .use_csd = window });
+            }
+        }
+    }
+
+    /// Call only after the manage transport accepted every decoration request.
+    pub fn commitServerDecorationRequests(self: *Adapter) void {
+        for (self.objects.window_order.items) |window| {
+            const record = self.objects.windows.getPtr(window) orelse continue;
+            const hint = record.decoration_hint orelse continue;
+            record.decoration_ssd_applied = hint != .only_supports_csd;
+        }
+    }
+
     pub fn isPoisoned(self: *const Adapter) bool {
         return self.poisoned;
     }
@@ -583,6 +610,31 @@ test "created River proxy kinds have typed binding and teardown seams" {
     try std.testing.expectEqual(@as(usize, 0), adapter.objects.counts().shell_surfaces);
     try std.testing.expectEqual(@as(usize, 0), adapter.objects.counts().decorations);
     try std.testing.expectEqual(@as(usize, 0), adapter.objects.counts().pointer_bindings);
+}
+
+test "server decoration requests are emitted only for policy transitions" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+
+    const window = try adapter.objects.bindWindow(fakeRef(0xf000), fakeRef(0xf001));
+    const record = adapter.objects.windows.getPtr(window).?;
+    record.decoration_hint = .prefers_ssd;
+
+    var operations = std.ArrayList(types.ManageOperation).empty;
+    defer operations.deinit(std.testing.allocator);
+    try adapter.appendServerDecorationRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 1), operations.items.len);
+    try std.testing.expectEqual(window, operations.items[0].use_ssd);
+
+    adapter.commitServerDecorationRequests();
+    operations.clearRetainingCapacity();
+    try adapter.appendServerDecorationRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 0), operations.items.len);
+
+    record.decoration_hint = .only_supports_csd;
+    try adapter.appendServerDecorationRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 1), operations.items.len);
+    try std.testing.expectEqual(window, operations.items[0].use_csd);
 }
 
 test "fake River facts reconcile a WM world and compose one immutable frame epoch" {

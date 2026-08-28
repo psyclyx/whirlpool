@@ -15,12 +15,13 @@ pub fn onWindow(self: anytype, window: *wayland.client.river.WindowV1, event: wa
     switch (event) {
         .closed => _ = try self.closeWindowRef(proxy),
         .dimensions_hint,
-        .decoration_hint,
         .unreliable_pid,
         .presentation_hint,
         .identifier,
         .capture_sessions,
         => {},
+        .decoration_hint => |value| self.objects.windows.getPtr(id).?.decoration_hint =
+            @enumFromInt(@as(u32, @intCast(@intFromEnum(value.hint)))),
         .app_id => |value| try self.objects.setWindowAppId(id, if (value.app_id) |text| std.mem.span(text) else ""),
         .title => |value| try self.objects.setWindowTitle(id, if (value.title) |text| std.mem.span(text) else ""),
         .dimensions => |value| try self.stageRenderFact(.{ .window_dimensions = .{

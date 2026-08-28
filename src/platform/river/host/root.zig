@@ -327,7 +327,9 @@ pub const Runtime = struct {
         var operations = std.ArrayList(types.ManageOperation).empty;
         defer operations.deinit(self.allocator);
         for (cycle.frames.frames()) |frame| try operations.appendSlice(self.allocator, frame.plans.river_manage.operations.items);
+        try self.adapter.appendServerDecorationRequests(&operations);
         try plans.applyManageTransport(transport.manage(Runtime, self), .{ .operations = operations.items });
+        self.adapter.commitServerDecorationRequests();
 
         if (self.frames) |*previous| previous.deinit();
         self.frames = cycle.frames;

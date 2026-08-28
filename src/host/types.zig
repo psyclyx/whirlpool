@@ -71,9 +71,10 @@ pub const WindowBorders = struct {
 };
 
 pub const DecorationHint = enum(u32) {
-    none = 0,
-    client = 1,
-    server = 2,
+    only_supports_csd = 0,
+    prefers_csd = 1,
+    prefers_ssd = 2,
+    no_preference = 3,
     _,
 };
 
