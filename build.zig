@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
     });
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
+    scanner.addSystemProtocol("unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocol/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/river-window-management-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/river-xkb-bindings-v1.xml"));
@@ -62,6 +63,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_output", 4);
     scanner.generate("wl_seat", 9);
     scanner.generate("xdg_wm_base", 6);
+    scanner.generate("zwp_linux_dmabuf_v1", 3);
     scanner.generate("zwlr_layer_shell_v1", 4);
     scanner.generate("river_window_manager_v1", 5);
     scanner.generate("river_xkb_bindings_v1", 1);
@@ -100,6 +102,18 @@ pub fn build(b: *std.Build) void {
         },
     });
     wayland_layer_shell.linkSystemLibrary("wayland-client", .{});
+
+    const wayland_dmabuf = b.addModule("whirlpool-wayland-dmabuf", .{
+        .root_source_file = b.path("src/platform/wayland/dmabuf/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "wayland", .module = wayland },
+            .{ .name = "whirlpool-wayland-client", .module = wayland_client },
+        },
+    });
+    wayland_dmabuf.linkSystemLibrary("wayland-client", .{});
 
     const river_keybindings = b.addModule("whirlpool-river-keybindings", .{
         .root_source_file = b.path("src/platform/river/keybindings/root.zig"),
@@ -392,6 +406,7 @@ pub fn build(b: *std.Build) void {
         wayland_client,
         wayland_event_loop,
         wayland_layer_shell,
+        wayland_dmabuf,
         wayland_surface_presenter,
         wayland_layer_shell_runtime,
         wayland_runtime,
