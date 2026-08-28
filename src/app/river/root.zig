@@ -52,6 +52,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     defer session.deinit();
     session.setPollInterval(16);
     var after_dispatch = AfterDispatch{
+        .client = client,
         .runtime = &host_runtime,
         .roles = &roles,
         .services = &services,
@@ -79,6 +80,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
 }
 
 const AfterDispatch = struct {
+    client: *wayland_client.Client,
     runtime: *river_host_runtime.Runtime,
     roles: *river_role_lifecycle.Runtime,
     services: *configured.Services,
@@ -88,6 +90,13 @@ const AfterDispatch = struct {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         try self.services.drainActions(self.runtime);
         try self.runtime.afterDispatch();
+        // River transaction requests are latency-critical. Flush them before
+        // any shell work so a slow renderer can never delay manage_dirty,
+        // manage_finish, or render_finish reaching the compositor.
+        self.client.flush() catch |err| switch (err) {
+            error.WouldBlock => {},
+            else => return err,
+        };
         try self.presentation.pollReleases();
         try self.roles.reconcile();
         try self.presentation.present();
