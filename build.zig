@@ -305,6 +305,11 @@ pub fn build(b: *std.Build) void {
     // Application modules are intentionally narrow composition roots. Keeping
     // their imports explicit prevents startup code from reaching through to a
     // lower layer merely because the executable happens to know about it.
+    const app_status = b.addModule("whirlpool-app-status", .{
+        .root_source_file = b.path("src/app/status/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const app_river_configured = b.addModule("whirlpool-app-river-configured", .{
         .root_source_file = b.path("src/app/river/configured/root.zig"),
         .target = target,
@@ -332,6 +337,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "whirlpool-river-host-runtime", .module = river_host_runtime },
             .{ .name = "whirlpool-river-role-lifecycle", .module = river_role_lifecycle },
             .{ .name = "whirlpool-river-presenter-runtime", .module = river_presenter_runtime },
+            .{ .name = "whirlpool-app-status", .module = app_status },
         },
     });
     const app_river = b.addModule("whirlpool-app-river", .{
@@ -359,6 +365,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "whirlpool-wayland-client", .module = wayland_client },
             .{ .name = "whirlpool-wayland-runtime", .module = wayland_runtime },
             .{ .name = "whirlpool-wayland-layer-shell-runtime", .module = wayland_layer_shell_runtime },
+            .{ .name = "whirlpool-app-status", .module = app_status },
         },
     });
 

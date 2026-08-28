@@ -9,11 +9,14 @@ const wayland_client = @import("whirlpool-wayland-client");
 const river_host_runtime = @import("whirlpool-river-host-runtime");
 const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
 const river_presenter_runtime = @import("whirlpool-river-presenter-runtime");
+const status_app = @import("whirlpool-app-status");
 
 /// Owns the optional graphics runtime and its River role callback context.
 pub const Bridge = struct {
     allocator: std.mem.Allocator = undefined,
     graphics: ?*river_presenter_runtime.Runtime = null,
+    status: ?*status_app.Service = null,
+    status_revision: u64 = 0,
     context: Context = undefined,
     input_seats: std.ArrayList(*InputSeat) = .empty,
     generation: u64 = 1,
@@ -39,6 +42,11 @@ pub const Bridge = struct {
             self.graphics.?.deinit() catch {};
             self.graphics = null;
         }
+        self.status = try status_app.Service.init(allocator, io);
+        errdefer {
+            self.status.?.deinit();
+            self.status = null;
+        }
         try runtime.setSurfaceHooks(self.graphics.?.surfaceHooks());
         self.context = .{ .runtime = runtime, .roles = undefined, .graphics = self.graphics.? };
         try self.bindInputSeats(client);
@@ -54,9 +62,11 @@ pub const Bridge = struct {
 
     pub fn setWake(self: *Bridge, wake: river_presenter_runtime.Wake) void {
         if (self.graphics) |graphics| graphics.setWake(wake);
+        if (self.status) |status| status.setWake(.{ .context = wake.context, .run = wake.run });
     }
 
     pub fn clearWake(self: *Bridge) void {
+        if (self.status) |status| status.clearWake();
         if (self.graphics) |graphics| graphics.clearWake();
     }
 
@@ -69,7 +79,12 @@ pub const Bridge = struct {
     /// Update shell services and present all retained roles once per dispatch.
     pub fn present(self: *Bridge) !void {
         if (self.graphics == null) return;
+        if (self.status.?.latestAfter(self.status_revision)) |latest| {
+            self.status_revision = latest.revision;
+            self.context.status = latest.value;
+        }
         try self.context.roles.forEachShell(&self.context, Context.updateShellServices);
+        try self.context.roles.forEachShell(&self.context, Context.updateStatusServices);
         try self.context.roles.forEachDecoration(&self.context, Context.updateDecorationServices);
         try self.collectReady();
     }
@@ -89,6 +104,7 @@ pub const Bridge = struct {
     pub fn deinit(self: *Bridge) !void {
         for (self.input_seats.items) |seat| seat.deinit();
         self.input_seats.deinit(self.allocator);
+        if (self.status) |status| status.deinit();
         if (self.graphics) |graphics| try graphics.deinit();
         self.* = undefined;
     }
@@ -97,6 +113,8 @@ pub const Bridge = struct {
     pub fn abandon(self: *Bridge) void {
         for (self.input_seats.items) |seat| seat.abandon();
         self.input_seats.deinit(self.allocator);
+        if (self.status) |status| status.deinit();
+        self.status = null;
         if (self.graphics) |graphics| graphics.abandon();
         self.graphics = null;
     }
@@ -184,6 +202,7 @@ pub const Context = struct {
     runtime: *river_host_runtime.Runtime,
     roles: *river_role_lifecycle.Runtime,
     graphics: *river_presenter_runtime.Runtime,
+    status: status_app.Snapshot = .{},
 
     pub fn hooks(self: *Context) river_role_lifecycle.Hooks {
         return .{
@@ -295,6 +314,38 @@ pub const Context = struct {
             .service = "desktop",
             .values = &values,
         });
+    }
+
+    pub fn updateStatusServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
+        const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
+        var cpu_history: [status_app.history_len]script.program_loader.Value = undefined;
+        var rx_history: [status_app.history_len]script.program_loader.Value = undefined;
+        var tx_history: [status_app.history_len]script.program_loader.Value = undefined;
+        for (0..status_app.history_len) |index| {
+            cpu_history[index] = .{ .number = self.status.cpu_history[index] };
+            rx_history[index] = .{ .number = self.status.network_rx_history[index] };
+            tx_history[index] = .{ .number = self.status.network_tx_history[index] };
+        }
+        const values = [_]script.program_loader.Value{
+            .{ .string = &self.status.time },
+            .{ .string = &self.status.dow },
+            .{ .string = &self.status.date },
+            .{ .number = @floatFromInt(self.status.cpu_percent) },
+            .{ .array = &cpu_history },
+            .{ .number = @floatFromInt(self.status.memory_percent) },
+            .{ .number = @floatFromInt(self.status.disk_percent) },
+            .{ .number = self.status.network_rx },
+            .{ .number = self.status.network_tx },
+            .{ .array = &rx_history },
+            .{ .array = &tx_history },
+            .{ .number = @floatFromInt(self.status.audio_percent) },
+            .{ .boolean = self.status.audio_muted },
+            .{ .boolean = self.status.audio_visible },
+            .{ .boolean = self.status.battery_present },
+            .{ .number = @floatFromInt(self.status.battery_percent) },
+            .{ .boolean = self.status.battery_charging },
+        };
+        try self.graphics.update(.{ .shell = shell_id }, .{ .service = "status", .values = &values });
     }
 
     pub fn updateDecorationServices(raw: ?*anyopaque, window_id: host.types.WindowId, decoration_id: host.types.DecorationId) !void {

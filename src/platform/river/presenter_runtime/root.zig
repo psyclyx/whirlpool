@@ -226,6 +226,16 @@ const RolePresenter = struct {
         replaced_desired = self.desired.put(desired);
         self.desired_revision +%= 1;
         if (self.desired_revision == 0) self.desired_revision = 1;
+        // A completed but unclaimed frame represents the previous revision.
+        // Recycle it immediately so fresh policy state never queues behind a
+        // status-only frame waiting for a River transaction.
+        if (self.status == .ready) {
+            if (self.ready_slot) |index| {
+                self.slots[index].state = .free;
+                self.ready_slot = null;
+                self.status = .waiting_for_buffer;
+            }
+        }
         self.changed.signal(self.owner.io);
         self.unlock();
         if (replaced) |*old| old.deinit();

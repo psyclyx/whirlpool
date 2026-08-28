@@ -13,6 +13,7 @@ const river_policy = @import("whirlpool-river-policy-runtime");
 pub const Services = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    commands: std.Io.Group = .init,
     config: ?script.config.Config = null,
     policy: ?river_policy.Runtime = null,
     layout: ?river_layout.Runtime = null,
@@ -43,6 +44,7 @@ pub const Services = struct {
 
     /// Release configured services in reverse dependency order.
     pub fn deinit(self: *Services) void {
+        self.commands.cancel(self.io);
         if (self.keybindings) |*value| value.deinit();
         if (self.layout) |*value| value.deinit();
         if (self.policy) |*value| value.deinit();
@@ -112,17 +114,47 @@ pub const Services = struct {
         if (argv.len == 0) return error.InvalidConfiguredSpawn;
         const self: *Services = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         std.debug.assert(argv[0].len > 0);
-        const child = try std.process.spawn(self.io, .{ .argv = argv });
-        const thread = std.Thread.spawn(.{}, reap, .{ child, self.io }) catch |err| {
-            var owned = child;
-            owned.kill(self.io);
-            return err;
-        };
-        thread.detach();
+        const request = try SpawnRequest.init(self.allocator, argv);
+        errdefer request.deinit();
+        try self.commands.concurrent(self.io, spawnAndReap, .{ self, request });
     }
 
-    fn reap(child: std.process.Child, io: std.Io) void {
-        var owned = child;
-        _ = owned.wait(io) catch |err| std.log.warn("configured command wait failed: {s}", .{@errorName(err)});
+    fn spawnAndReap(self: *Services, request: *SpawnRequest) std.Io.Cancelable!void {
+        defer request.deinit();
+        var child = std.process.spawn(self.io, .{ .argv = request.argv }) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            std.log.warn("configured command failed to start: {s}", .{@errorName(err)});
+            return;
+        };
+        _ = child.wait(self.io) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            std.log.warn("configured command wait failed: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+};
+
+const SpawnRequest = struct {
+    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    argv: []const []const u8,
+
+    fn init(allocator: std.mem.Allocator, source: []const []const u8) !*SpawnRequest {
+        const self = try allocator.create(SpawnRequest);
+        errdefer allocator.destroy(self);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const owned = try arena.allocator().alloc([]const u8, source.len);
+        for (source, owned) |argument, *destination|
+            destination.* = try arena.allocator().dupe(u8, argument);
+        self.* = .{ .allocator = allocator, .arena = arena, .argv = owned };
+        return self;
+    }
+
+    fn deinit(self: *SpawnRequest) void {
+        const allocator = self.allocator;
+        self.arena.deinit();
+        self.* = undefined;
+        allocator.destroy(self);
     }
 };

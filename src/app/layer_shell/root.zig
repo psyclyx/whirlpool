@@ -6,6 +6,7 @@ const script = @import("whirlpool-script");
 const wayland_client = @import("whirlpool-wayland-client");
 const wayland_runtime = @import("whirlpool-wayland-runtime");
 const layer_shell_runtime = @import("whirlpool-wayland-layer-shell-runtime");
+const status_app = @import("whirlpool-app-status");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !void {
     const path = config_path orelse return error.MissingConfig;
@@ -31,13 +32,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     var session: wayland_runtime.Session = undefined;
     try session.init(client);
     defer session.deinit();
+    const status = try status_app.Service.init(allocator, io);
+    defer status.deinit();
     var layer_live = true;
     // This CLI owns the whole client connection. On any process-exit path,
     // stop its worker and drop local proxies before wl_display disconnects.
     defer if (layer_live) layer.abandon();
     session.setPollInterval(1000);
     layer.setWake(.{ .context = @ptrCast(&session), .run = wakeSession });
-    var after_dispatch = AfterDispatch{ .runtime = &layer, .session = &session };
+    status.setWake(.{ .context = @ptrCast(&session), .run = wakeSession });
+    defer status.clearWake();
+    var after_dispatch = AfterDispatch{ .runtime = &layer, .session = &session, .status = status };
     session.setAfterDispatch(.{ .context = @ptrCast(&after_dispatch), .run = AfterDispatch.run });
     std.log.info("Portable layer-shell host connected", .{});
     session.run() catch |err| switch (err) {
@@ -58,10 +63,42 @@ fn wakeSession(raw: ?*anyopaque) void {
 const AfterDispatch = struct {
     runtime: *layer_shell_runtime.Runtime,
     session: *wayland_runtime.Session,
+    status: *status_app.Service,
+    status_revision: u64 = 0,
 
     fn run(raw: ?*anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-        try self.runtime.update(.{ .service = "tick" });
+        if (self.status.latestAfter(self.status_revision)) |latest| {
+            self.status_revision = latest.revision;
+            var cpu_history: [status_app.history_len]script.program_loader.Value = undefined;
+            var rx_history: [status_app.history_len]script.program_loader.Value = undefined;
+            var tx_history: [status_app.history_len]script.program_loader.Value = undefined;
+            for (0..status_app.history_len) |index| {
+                cpu_history[index] = .{ .number = latest.value.cpu_history[index] };
+                rx_history[index] = .{ .number = latest.value.network_rx_history[index] };
+                tx_history[index] = .{ .number = latest.value.network_tx_history[index] };
+            }
+            const values = [_]script.program_loader.Value{
+                .{ .string = &latest.value.time },
+                .{ .string = &latest.value.dow },
+                .{ .string = &latest.value.date },
+                .{ .number = @floatFromInt(latest.value.cpu_percent) },
+                .{ .array = &cpu_history },
+                .{ .number = @floatFromInt(latest.value.memory_percent) },
+                .{ .number = @floatFromInt(latest.value.disk_percent) },
+                .{ .number = latest.value.network_rx },
+                .{ .number = latest.value.network_tx },
+                .{ .array = &rx_history },
+                .{ .array = &tx_history },
+                .{ .number = @floatFromInt(latest.value.audio_percent) },
+                .{ .boolean = latest.value.audio_muted },
+                .{ .boolean = latest.value.audio_visible },
+                .{ .boolean = latest.value.battery_present },
+                .{ .number = @floatFromInt(latest.value.battery_percent) },
+                .{ .boolean = latest.value.battery_charging },
+            };
+            try self.runtime.update(.{ .service = "status", .values = &values });
+        }
         _ = self.runtime.presentIfReady() catch |err| switch (err) {
             error.NotReady => return,
             error.SurfaceClosed => {

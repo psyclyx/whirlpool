@@ -17,6 +17,11 @@ pub const Composition = struct {
     pub fn init(allocator: std.mem.Allocator, source: []const u8) !Composition {
         var vm = try script.program_loader.Vm.init(true);
         errdefer vm.deinit();
+        // Surface programs are policy callbacks, not data providers. Removing
+        // these libraries makes accidental file/process/timer I/O impossible
+        // in the controller lane; application services must supply values.
+        vm.removeGlobal("io");
+        vm.removeGlobal("os");
 
         const loader = script.program_loader.Loader.init(allocator, .{});
         const modules = [_]script.program_loader.Module{
@@ -65,6 +70,18 @@ test "surface composition mounts retained Lua source" {
     var frame = try composition.snapshotAndLower(.{ .width = 100, .height = 20 });
     defer frame.deinit();
     try std.testing.expectEqual(@as(usize, 2), frame.node_count);
+}
+
+test "surface composition cannot perform file or process I/O" {
+    var composition = try Composition.init(std.testing.allocator,
+        \\assert(io == nil)
+        \\assert(os == nil)
+        \\return function(root)
+        \\  root:text({ text = string.format("%s", "pure") })
+        \\  return { update = function() end }
+        \\end
+    );
+    defer composition.deinit();
 }
 
 test "surface composition exposes the workspace stdlib module" {

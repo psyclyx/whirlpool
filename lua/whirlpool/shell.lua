@@ -1,6 +1,6 @@
 -- Tidepool/Shoal behavior expressed as an ordinary Whirlpool retained tree.
--- The host provides desktop snapshots; widget policy and system polling live
--- here and remain identical for River shell and portable layer-shell roles.
+-- The host provides desktop and asynchronously acquired status snapshots;
+-- retained-tree policy remains identical for River and layer-shell roles.
 
 local theme = require("whirlpool.theme")
 local Status = require("whirlpool.status")
@@ -44,7 +44,6 @@ local function sparkline(parent, color)
 end
 
 local function build(parent)
-  local status = Status.new()
   local state = {
     role = "shell",
     selected = 1,
@@ -190,43 +189,51 @@ local function build(parent)
     app_label:set("text", show_title and state.app_id ~= state.title and state.app_id or "")
   end
 
-  local function update_status()
-    local now = status:update()
-    update_cpu_spark(status.cpu.history)
-    rx_label:set("text", "rx " .. Status.format_rate(status.network.rx))
-    tx_label:set("text", "tx " .. Status.format_rate(status.network.tx))
+  local function update_status(values)
+    local cpu_history = type(values[5]) == "table" and values[5] or {}
+    local rx_history = type(values[10]) == "table" and values[10] or {}
+    local tx_history = type(values[11]) == "table" and values[11] or {}
+    local audio_percent = tonumber(values[12]) or 0
+    local audio_muted = values[13] == true
+    local battery_present = values[15] == true
+    local battery_percent = tonumber(values[16]) or 0
+    local battery_charging = values[17] == true
+
+    update_cpu_spark(cpu_history)
+    rx_label:set("text", "rx " .. Status.format_rate(values[8]))
+    tx_label:set("text", "tx " .. Status.format_rate(values[9]))
     for index = 1, SPARK_COUNT do
-      rx_bars[index]:set("height", math.max(2, math.floor(17 * (status.network.rx_history[index] or 0) + 0.5)))
-      tx_bars[index]:set("height", math.max(2, math.floor(17 * (status.network.tx_history[index] or 0) + 0.5)))
+      rx_bars[index]:set("height", math.max(2, math.floor(17 * (rx_history[index] or 0) + 0.5)))
+      tx_bars[index]:set("height", math.max(2, math.floor(17 * (tx_history[index] or 0) + 0.5)))
     end
-    local audio_color = status.audio.muted and theme.red or (status.audio.percent >= 100 and theme.yellow or theme.purple)
-    update_audio(status.audio.percent, audio_color)
-    audio_label:set("text", status.audio.muted and "X" or "A")
+    local audio_color = audio_muted and theme.red or (audio_percent >= 100 and theme.yellow or theme.purple)
+    update_audio(audio_percent, audio_color)
+    audio_label:set("text", audio_muted and "X" or "A")
     audio_label:set("text_color", audio_color)
-    update_memory(status.memory.percent)
-    update_disk(status.disk.percent)
-    if status.battery.present then
-      local battery_color = status.battery.charging and theme.green
-        or (status.battery.percent < 15 and theme.red or (status.battery.percent < 50 and theme.orange or theme.accent))
+    update_memory(tonumber(values[6]) or 0)
+    update_disk(tonumber(values[7]) or 0)
+    if battery_present then
+      local battery_color = battery_charging and theme.green
+        or (battery_percent < 15 and theme.red or (battery_percent < 50 and theme.orange or theme.accent))
       battery_panel:set("width", 44)
       battery_panel:set("opacity", 1)
-      update_battery(status.battery.percent, battery_color)
-      battery_label:set("text", status.battery.charging and "+" or "B")
+      update_battery(battery_percent, battery_color)
+      battery_label:set("text", battery_charging and "+" or "B")
       battery_label:set("text_color", battery_color)
     else
       battery_panel:set("width", 1)
       battery_panel:set("opacity", 0)
     end
-    time_label:set("text", status.clock.time)
-    dow_label:set("text", status.clock.dow)
-    date_label:set("text", status.clock.date)
+    time_label:set("text", tostring(values[1] or "--:--"))
+    dow_label:set("text", tostring(values[2] or "---"))
+    date_label:set("text", tostring(values[3] or "----------"))
 
-    local visible = state.role == "shell" and Status.audio_visible(status, now)
+    local visible = state.role == "shell" and values[14] == true
     osd_layer:set("opacity", visible and 0.96 or 0)
     if visible then
-      osd_fill:set("width", math.max(2, math.floor(2.8 * math.min(100, status.audio.percent))))
-      osd_fill:set("fill", status.audio.muted and theme.red or audio_color)
-      osd_value:set("text", status.audio.muted and (tostring(status.audio.percent) .. " (muted)") or (tostring(status.audio.percent) .. "%"))
+      osd_fill:set("width", math.max(2, math.floor(2.8 * math.min(100, audio_percent))))
+      osd_fill:set("fill", audio_muted and theme.red or audio_color)
+      osd_value:set("text", audio_muted and (tostring(audio_percent) .. " (muted)") or (tostring(audio_percent) .. "%"))
     end
   end
 
@@ -236,8 +243,9 @@ local function build(parent)
         state.role = tostring(values[1] or "shell")
       elseif service == "desktop" then
         update_desktop(values)
+      elseif service == "status" then
+        update_status(values)
       end
-      if state.role == "shell" then update_status() end
     end,
   }
 end

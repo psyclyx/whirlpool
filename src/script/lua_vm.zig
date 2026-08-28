@@ -354,6 +354,11 @@ pub const Vm = struct {
         _ = self.api.get_global(self.state, name.ptr);
     }
 
+    pub fn removeGlobal(self: *Vm, name: [:0]const u8) void {
+        self.api.push_nil(self.state);
+        self.api.set_global(self.state, name.ptr);
+    }
+
     pub fn setField(self: *Vm, index: c_int, name: [:0]const u8) void {
         self.api.set_field(self.state, index, name.ptr);
     }
