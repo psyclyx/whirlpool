@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
     wayland.linkSystemLibrary("wayland-client", .{});
 
     const wayland_client = b.addModule("whirlpool-wayland-client", .{
-        .root_source_file = b.path("src/platform/wayland/client.zig"),
+        .root_source_file = b.path("src/platform/wayland/client/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -82,8 +82,14 @@ pub fn build(b: *std.Build) void {
     });
     wayland_client.linkSystemLibrary("wayland-client", .{});
 
+    const wayland_event_loop = b.addModule("whirlpool-wayland-event-loop", .{
+        .root_source_file = b.path("src/platform/wayland/event_loop/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const wayland_layer_shell = b.addModule("whirlpool-wayland-layer-shell", .{
-        .root_source_file = b.path("src/platform/wayland/layer/shell.zig"),
+        .root_source_file = b.path("src/platform/wayland/layer_shell/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -95,7 +101,7 @@ pub fn build(b: *std.Build) void {
     wayland_layer_shell.linkSystemLibrary("wayland-client", .{});
 
     const river_keybindings = b.addModule("whirlpool-river-keybindings", .{
-        .root_source_file = b.path("src/platform/river/keybindings.zig"),
+        .root_source_file = b.path("src/platform/river/keybindings/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -107,7 +113,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const wayland_wsi = b.addModule("whirlpool-wayland-wsi", .{
-        .root_source_file = b.path("src/graphics/wayland/wsi.zig"),
+        .root_source_file = b.path("src/graphics/wayland/wsi/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -125,7 +131,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const wayland_surface_presenter = b.addModule("whirlpool-wayland-surface-presenter", .{
-        .root_source_file = b.path("src/platform/wayland/surface/presenter.zig"),
+        .root_source_file = b.path("src/platform/wayland/surface_presenter/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -138,8 +144,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "whirlpool-wayland-wsi", .module = wayland_wsi },
         },
     });
-    const wayland_layer_runtime = b.addModule("whirlpool-wayland-layer-runtime", .{
-        .root_source_file = b.path("src/platform/wayland/layer/runtime.zig"),
+    const wayland_layer_shell_runtime = b.addModule("whirlpool-wayland-layer-shell-runtime", .{
+        .root_source_file = b.path("src/platform/wayland/layer_shell/runtime/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -152,22 +158,23 @@ pub fn build(b: *std.Build) void {
             .{ .name = "whirlpool-script", .module = script },
         },
     });
-    wayland_layer_runtime.linkSystemLibrary("wayland-client", .{});
+    wayland_layer_shell_runtime.linkSystemLibrary("wayland-client", .{});
 
     const wayland_runtime = b.addModule("whirlpool-wayland-runtime", .{
-        .root_source_file = b.path("src/platform/wayland/runtime.zig"),
+        .root_source_file = b.path("src/platform/wayland/runtime/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
             .{ .name = "wayland", .module = wayland },
             .{ .name = "whirlpool-wayland-client", .module = wayland_client },
+            .{ .name = "whirlpool-wayland-event-loop", .module = wayland_event_loop },
         },
     });
     wayland_runtime.linkSystemLibrary("wayland-client", .{});
 
     const river_layer_shell = b.addModule("whirlpool-river-layer-shell", .{
-        .root_source_file = b.path("src/platform/river/layer/shell.zig"),
+        .root_source_file = b.path("src/platform/river/layer_shell/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -191,7 +198,7 @@ pub fn build(b: *std.Build) void {
     });
     river_live.linkSystemLibrary("wayland-client", .{});
     const river_live_plans = b.addModule("whirlpool-river-live-plans", .{
-        .root_source_file = b.path("src/platform/river/live/plans.zig"),
+        .root_source_file = b.path("src/platform/river/live/plans/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -216,7 +223,7 @@ pub fn build(b: *std.Build) void {
     });
     river_live_world.linkSystemLibrary("wayland-client", .{});
     const river_layout_runtime = b.addModule("whirlpool-river-layout-runtime", .{
-        .root_source_file = b.path("src/platform/river/layout/runtime.zig"),
+        .root_source_file = b.path("src/platform/river/layout_runtime/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -226,7 +233,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const river_policy_runtime = b.addModule("whirlpool-river-policy-runtime", .{
-        .root_source_file = b.path("src/platform/river/policy/runtime.zig"),
+        .root_source_file = b.path("src/platform/river/policy_runtime/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -252,7 +259,7 @@ pub fn build(b: *std.Build) void {
     });
     river_host_runtime.linkSystemLibrary("wayland-client", .{});
     const river_role_lifecycle = b.addModule("whirlpool-river-role-lifecycle", .{
-        .root_source_file = b.path("src/platform/river/role/lifecycle.zig"),
+        .root_source_file = b.path("src/platform/river/role_lifecycle/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -265,12 +272,12 @@ pub fn build(b: *std.Build) void {
     });
     river_role_lifecycle.linkSystemLibrary("wayland-client", .{});
     const river_presentation = b.addModule("whirlpool-river-presentation", .{
-        .root_source_file = b.path("src/platform/river/presentation.zig"),
+        .root_source_file = b.path("src/platform/river/presentation/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     const river_presenter_runtime = b.addModule("whirlpool-river-presenter-runtime", .{
-        .root_source_file = b.path("src/platform/river/presenter/runtime.zig"),
+        .root_source_file = b.path("src/platform/river/presenter_runtime/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -290,7 +297,7 @@ pub fn build(b: *std.Build) void {
     // their imports explicit prevents startup code from reaching through to a
     // lower layer merely because the executable happens to know about it.
     const app_river_configured = b.addModule("whirlpool-app-river-configured", .{
-        .root_source_file = b.path("src/app/river/configured.zig"),
+        .root_source_file = b.path("src/app/river/configured/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -304,7 +311,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const app_river_presentation = b.addModule("whirlpool-app-river-presentation", .{
-        .root_source_file = b.path("src/app/river/presentation.zig"),
+        .root_source_file = b.path("src/app/river/presentation/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -318,7 +325,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const app_river = b.addModule("whirlpool-app-river", .{
-        .root_source_file = b.path("src/app/river.zig"),
+        .root_source_file = b.path("src/app/river/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -333,7 +340,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const app_layer_shell = b.addModule("whirlpool-app-layer-shell", .{
-        .root_source_file = b.path("src/app/layer/shell.zig"),
+        .root_source_file = b.path("src/app/layer_shell/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -341,7 +348,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "whirlpool-script", .module = script },
             .{ .name = "whirlpool-wayland-client", .module = wayland_client },
             .{ .name = "whirlpool-wayland-runtime", .module = wayland_runtime },
-            .{ .name = "whirlpool-wayland-layer-runtime", .module = wayland_layer_runtime },
+            .{ .name = "whirlpool-wayland-layer-shell-runtime", .module = wayland_layer_shell_runtime },
         },
     });
 
@@ -380,9 +387,10 @@ pub fn build(b: *std.Build) void {
         host,
         script,
         wayland_client,
+        wayland_event_loop,
         wayland_layer_shell,
         wayland_surface_presenter,
-        wayland_layer_runtime,
+        wayland_layer_shell_runtime,
         wayland_runtime,
         river_layer_shell,
         river_live,
@@ -409,20 +417,12 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/script/lua/vm.zig"),
+            .root_source_file = b.path("src/script/lua_vm.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/platform/wayland/event/loop.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    })).step);
-
     const check = b.step("check", "Compile Whirlpool without installing it");
     check.dependOn(&exe.step);
 }

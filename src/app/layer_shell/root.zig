@@ -5,7 +5,7 @@ const wayland = @import("wayland");
 const script = @import("whirlpool-script");
 const wayland_client = @import("whirlpool-wayland-client");
 const wayland_runtime = @import("whirlpool-wayland-runtime");
-const wayland_layer_runtime = @import("whirlpool-wayland-layer-runtime");
+const layer_shell_runtime = @import("whirlpool-wayland-layer-shell-runtime");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !void {
     const path = config_path orelse return error.MissingConfig;
@@ -19,7 +19,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     const compositor = try bindCompositor(client);
     defer compositor.destroy();
 
-    var layer = try wayland_layer_runtime.Runtime.init(allocator, client, compositor, .{
+    var layer = try layer_shell_runtime.Runtime.init(allocator, client, compositor, .{
         .height = 40,
         .anchor = .{ .top = true, .left = true, .right = true },
         .exclusive_zone = 40,
@@ -40,7 +40,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
 }
 
 const AfterDispatch = struct {
-    runtime: *wayland_layer_runtime.Runtime,
+    runtime: *layer_shell_runtime.Runtime,
     session: *wayland_runtime.Session,
 
     fn run(raw: ?*anyopaque) anyerror!void {

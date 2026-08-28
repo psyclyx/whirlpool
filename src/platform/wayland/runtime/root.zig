@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const client_api = @import("whirlpool-wayland-client");
-const event_loop = @import("event/loop.zig");
+const event_loop = @import("whirlpool-wayland-event-loop");
 
 pub const AfterDispatch = struct {
     context: ?*anyopaque = null,

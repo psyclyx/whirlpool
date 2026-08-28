@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const wm = @import("whirlpool-wm");
-const lua_vm = @import("../lua/vm.zig");
+const lua_vm = @import("../lua_vm.zig");
 
 pub const MaxBindings: usize = 512;
 pub const MaxArguments: usize = 16;

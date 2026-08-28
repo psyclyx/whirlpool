@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const wm = @import("whirlpool-wm");
-const bridge = @import("wm/bridge.zig");
+const bridge = @import("wm_bridge.zig");
 const types = @import("types.zig");
 
 pub const FramePlans = struct {

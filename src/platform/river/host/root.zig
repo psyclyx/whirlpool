@@ -15,7 +15,7 @@ const world = @import("whirlpool-river-live-world");
 const configured_actions = @import("actions.zig");
 const listeners = @import("listeners.zig");
 const policy = @import("policy.zig");
-const SurfaceQueue = @import("surface/queue.zig").Queue;
+const SurfaceQueue = @import("surface_queue.zig").Queue;
 const transport = @import("transport/root.zig");
 
 const types = host.types;

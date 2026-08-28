@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const wm = @import("whirlpool-wm");
-const types = @import("../types.zig");
+const types = @import("types.zig");
 
 pub const Selection = struct {
     output: types.OutputId,

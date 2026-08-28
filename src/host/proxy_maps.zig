@@ -1,7 +1,7 @@
 //! Bidirectional maps between concrete Wayland proxy identities and River IDs.
 
 const std = @import("std");
-const types = @import("../types.zig");
+const types = @import("types.zig");
 
 pub fn ProxyMap(comptime IdType: type) type {
     return struct {

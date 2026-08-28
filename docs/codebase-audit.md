@@ -23,6 +23,12 @@ than through forwarding methods.
   keep the concrete dependency mapping visible at the call site.
 - Enforce architectural seams with `build.zig` modules when code crosses a
   package boundary. Relative imports remain appropriate inside one owner.
+- Name every named `build.zig` module entry point `root.zig` and place it in a
+  directory named for the module. Reserve `main.zig` for executable entry
+  points and descriptive filenames for ordinary implementation files.
+- Use `/` only for ownership or layering. Keep words joined with `_` when they
+  form one technical noun (`layer_shell`, `event_loop`, `surface_presenter`);
+  never manufacture a namespace by splitting a compound name.
 
 ## Completed structural changes
 
@@ -62,10 +68,10 @@ than through forwarding methods.
 | File | Disposition |
 | --- | --- |
 | `src/main.zig` | Cohesive argument parsing and application-mode dispatch. |
-| `src/app/river.zig` | Cohesive River application startup, disconnect order, and post-dispatch orchestration. |
-| `src/app/layer/shell.zig` | Cohesive portable layer-shell startup and post-dispatch loop. |
-| `src/app/river/presentation.zig` | Cohesive River role-to-presenter lifetime bridge. |
-| `src/app/river/configured.zig` | Owns config-derived policy, layout, and keybinding services borrowed by River startup. |
+| `src/app/river/root.zig` | Cohesive River application startup, disconnect order, and post-dispatch orchestration. |
+| `src/app/layer_shell/root.zig` | Cohesive portable layer-shell startup and post-dispatch loop. |
+| `src/app/river/presentation/root.zig` | Cohesive River role-to-presenter lifetime bridge. |
+| `src/app/river/configured/root.zig` | Owns config-derived policy, layout, and keybinding services borrowed by River startup. |
 | `build.zig` | Dependency authority. Application composition roots have narrow imports; module tests use one comptime tuple without hiding dependencies. |
 | `src/runtime/root.zig` | Cohesive CLI/runtime export root. |
 | `src/runtime/ipc.zig` | Cohesive typed IPC vocabulary and parser. |
@@ -107,11 +113,11 @@ than through forwarding methods.
 | `src/script/root.zig` | Thin public export and intent vocabulary. |
 | `src/script/config.zig` | Owns assembled configuration plus layout/surface loading. Surface parsing can move to `config/surfaces.zig` if that schema grows. |
 | `src/script/config/bindings.zig` | Cohesive binding/action schema, key decoding, ownership, and duplicate validation. |
-| `src/script/lua/vm.zig` | Sole dynamic Lua ABI owner and protected VM operations. Instruction-hook routing is the only remaining thread-local seam and should be replaced if concurrent VMs become supported. |
+| `src/script/lua_vm.zig` | Sole dynamic Lua ABI owner and protected VM operations. Instruction-hook routing is the only remaining thread-local seam and should be replaced if concurrent VMs become supported. |
 | `src/script/program/loader.zig` | Validates, copies, and owns explicitly supplied modules and the selected entry. |
 | `src/script/program/contract.zig` | Data-only retained-program limits, values, node operations, updates, and sink contract. |
 | `src/script/program/bridge.zig` | Bounded Lua callback execution; operation limits are checked before host mutation. |
-| `src/script/wm/bridge.zig` | Cohesive conversion from script intents to semantic WM commands. |
+| `src/script/wm_bridge.zig` | Cohesive conversion from script intents to semantic WM commands. |
 | `lua/root.zig` | Lua package source aggregation only. |
 | `lua/whirlpool/init.lua` | Public Lua constructors and action vocabulary. |
 | `lua/whirlpool/workspace.lua` | Cohesive workspace service convention. |
@@ -137,16 +143,16 @@ than through forwarding methods.
 | --- | --- |
 | `src/host/root.zig` | Thin host package export root. |
 | `src/host/types.zig` | Canonical platform-neutral River facts and operations. |
-| `src/host/proxy/maps.zig` | Cohesive bidirectional proxy/identity maps. |
-| `src/host/staged/facts.zig` | Generic owned fact batches and staging. |
+| `src/host/proxy_maps.zig` | Cohesive bidirectional proxy/identity maps. |
+| `src/host/staged_facts.zig` | Generic owned fact batches and staging. |
 | `src/host/phase.zig` | Cohesive callback/phase guard. |
-| `src/host/wm/bridge.zig` | Cohesive WM-plan to host-plan identity translation. |
+| `src/host/wm_bridge.zig` | Cohesive WM-plan to host-plan identity translation. |
 | `src/host/composition.zig` | Cohesive frame-plan composition. |
-| `src/host/surface/composition.zig` | Cohesive surface transaction abstraction. |
-| `src/host/river/coordinator.zig` | Cohesive render ordering and finish guarantee; synchronized surface commits now begin only after role preflight. |
+| `src/host/surface_composition.zig` | Cohesive surface transaction abstraction. |
+| `src/host/river_coordinator.zig` | Cohesive render ordering and finish guarantee; synchronized surface commits now begin only after role preflight. |
 | `src/host/lua/composition.zig` | Owns retained scene batching, node identities, and snapshot/lowering orchestration. |
 | `src/host/lua/properties.zig` | Stateless script-value to UI-delta property decoding. |
-| `src/host/skia/scene.zig` | Cohesive retained-scene to draw-list lowering. |
+| `src/host/skia_scene.zig` | Cohesive retained-scene to draw-list lowering. |
 
 ### River platform
 
@@ -158,10 +164,10 @@ than through forwarding methods.
 | `src/platform/river/live/world/root.zig` | Owns staging and manage/render cycle orchestration. Frame construction can move next if more plan providers appear. |
 | `src/platform/river/live/world/events.zig` | Cohesive child-event to host-fact decoding. |
 | `src/platform/river/live/world/reconcile.zig` | Cohesive mandatory River lifecycle reconciliation into the WM kernel. |
-| `src/platform/river/live/plans.zig` | Cohesive host-operation to generated-request encoder. |
+| `src/platform/river/live/plans/root.zig` | Cohesive host-operation to generated-request encoder. |
 | `src/platform/river/host/root.zig` | Owns transaction scheduling and delegates pending surface ownership to `SurfaceQueue`. |
 | `src/platform/river/host/listeners.zig` | Cohesive callback-depth and fact-staging edge. |
-| `src/platform/river/host/surface/queue.zig` | Cohesive bounded submission ownership, cancellation, discard, and completion. |
+| `src/platform/river/host/surface_queue.zig` | Cohesive bounded submission ownership, cancellation, discard, and completion. |
 | `src/platform/river/host/actions.zig` | Cohesive configured-action lowering and spawn seam. |
 | `src/platform/river/host/policy.zig` | Collects input, configured, and Lua policy intents into one atomic WM batch. |
 | `src/platform/river/host/transport/root.zig` | Small composition root selecting live or injected transport edges. |
@@ -169,30 +175,29 @@ than through forwarding methods.
 | `src/platform/river/host/transport/resolver.zig` | Typed host-identity to River-proxy resolution; one comptime callback generator removes mechanical wrappers. |
 | `src/platform/river/host/transport/surface.zig` | Synchronized surface preflight, commit, discard, and render emission. |
 | `src/platform/river/live/world/input.zig` | Cohesive bounded input intent queue. |
-| `src/platform/river/keybindings.zig` | Cohesive XKB binding lifetime. Per-seat protocol state should stay here if protocol version support expands. |
-| `src/platform/river/layer/shell.zig` | Cohesive River layer-shell manager adapter. |
-| `src/host/decoration/selection.zig` | Cohesive decoration selection diff. |
-| `src/platform/river/role/lifecycle.zig` | Cohesive shell/decoration role ownership and retirement. |
-| `src/platform/river/policy/runtime.zig` | Cohesive bounded Lua WM policy runtime. |
-| `src/platform/river/layout/runtime.zig` | Runtime type is small; free functions encode/decode layout tables. Split codecs only if the schema gains another version. |
-| `src/platform/river/presentation.zig` | Cohesive generic presenter registry and strict retirement state machine; much of its size is direct state-transition testing. |
-| `src/platform/river/presenter/runtime.zig` | Cohesive concrete Skia/WSI presenter aggregate. |
+| `src/platform/river/keybindings/root.zig` | Cohesive XKB binding lifetime. Per-seat protocol state should stay here if protocol version support expands. |
+| `src/platform/river/layer_shell/root.zig` | Cohesive River layer-shell manager adapter. |
+| `src/host/decoration_selection.zig` | Cohesive decoration selection diff. |
+| `src/platform/river/role_lifecycle/root.zig` | Cohesive shell/decoration role ownership and retirement. |
+| `src/platform/river/policy_runtime/root.zig` | Cohesive bounded Lua WM policy runtime. |
+| `src/platform/river/layout_runtime/root.zig` | Runtime type is small; free functions encode/decode layout tables. Split codecs only if the schema gains another version. |
+| `src/platform/river/presentation/root.zig` | Cohesive generic presenter registry and strict retirement state machine; much of its size is direct state-transition testing. |
+| `src/platform/river/presenter_runtime/root.zig` | Cohesive concrete Skia/WSI presenter aggregate. |
 
 ### Wayland and graphics platform
 
 | File | Disposition |
 | --- | --- |
-| `src/platform/wayland/root.zig` | Thin export root. |
-| `src/platform/wayland/client.zig` | Cohesive registry/client ownership. |
-| `src/platform/wayland/runtime.zig` | Cohesive session wrapper with a real wake pipe. |
-| `src/platform/wayland/event/loop.zig` | Poll/wake and callback scheduling are related but separable; extract the poll backend if another transport is added. |
-| `src/platform/wayland/layer/shell.zig` | Cohesive generated layer-shell role owner. |
-| `src/platform/wayland/layer/runtime.zig` | Cohesive portable layer-shell application runtime. |
-| `src/platform/wayland/surface/presenter.zig` | Cohesive Skia-to-WSI presenter state machine. |
+| `src/platform/wayland/client/root.zig` | Cohesive registry/client ownership. |
+| `src/platform/wayland/runtime/root.zig` | Cohesive session wrapper with a real wake pipe. |
+| `src/platform/wayland/event_loop/root.zig` | Lower-level poll/wake and callback scheduling contract imported explicitly by the concrete Wayland runtime. |
+| `src/platform/wayland/layer_shell/root.zig` | Cohesive generated layer-shell role owner. |
+| `src/platform/wayland/layer_shell/runtime/root.zig` | Cohesive portable layer-shell application runtime. |
+| `src/platform/wayland/surface_presenter/root.zig` | Cohesive Skia-to-WSI presenter state machine. |
 | `src/graphics/root.zig` | Thin graphics export root. |
 | `src/graphics/skia.zig` | Cohesive draw-list/frame wrapper around the local C++ shim. |
 | `src/graphics/skia/shim.h`, `src/graphics/skia/shim.cpp` | Minimal C ABI and Skia implementation; unused external-Vulkan ownership paths were removed. |
-| `src/graphics/wayland/wsi.zig` | Thin public WSI root exporting the two resource owners. |
+| `src/graphics/wayland/wsi/root.zig` | Public WSI boundary exporting the two resource owners. |
 | `src/graphics/wayland/wsi/api.zig` | Private Vulkan ABI, extension vocabulary, result conversion, and image barrier. |
 | `src/graphics/wayland/wsi/context.zig` | Display-wide Vulkan instance, device selection, and queue lifetime. |
 | `src/graphics/wayland/wsi/staging.zig` | Host-visible mapped transfer-buffer lifetime and row copy. |
@@ -209,10 +214,10 @@ they are compiled into typed edges and should not accumulate Whirlpool policy.
 - `ui/tree.zig` contains two real state owners, `Scene` and `MountContext`.
   Its size includes direct topology tests; snapshot extraction is justified
   only if another snapshot consumer or representation appears.
-- `platform/river/presentation.zig` is one strict presenter-retirement state
+- `platform/river/presentation/root.zig` is one strict presenter-retirement state
   machine. Its small vtable wrapper is intentional dynamic dispatch, not a
   namespace struct.
-- `script/lua/vm.zig` remains the sole Lua ABI owner. Splitting individual ABI
+- `script/lua_vm.zig` remains the sole Lua ABI owner. Splitting individual ABI
   calls would distribute stack invariants and dynamic-library ownership.
 
 No feature removal is required by any disposition in this audit. The code now

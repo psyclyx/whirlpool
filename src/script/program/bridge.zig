@@ -1,7 +1,7 @@
 //! Lua callback bridge for executing an owned retained program.
 
 const std = @import("std");
-const lua_vm = @import("../lua/vm.zig");
+const lua_vm = @import("../lua_vm.zig");
 const contract = @import("contract.zig");
 
 const Value = contract.Value;

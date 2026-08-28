@@ -6,7 +6,7 @@
 //! host installs a small retained vocabulary and receives typed operations.
 
 const std = @import("std");
-const lua_vm = @import("../lua/vm.zig");
+const lua_vm = @import("../lua_vm.zig");
 const lua_bridge = @import("bridge.zig");
 const contract = @import("contract.zig");
 

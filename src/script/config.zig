@@ -5,7 +5,7 @@
 //! descriptors, never compositor handles or borrowed Lua values.
 
 const std = @import("std");
-const lua_vm = @import("lua/vm.zig");
+const lua_vm = @import("lua_vm.zig");
 const binding_config = @import("config/bindings.zig");
 
 pub const MaxConfigBytes: usize = 256 * 1024;

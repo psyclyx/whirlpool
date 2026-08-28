@@ -4,8 +4,8 @@
 //! them. Lua stack and platform handles remain embedding concerns.
 
 const std = @import("std");
-pub const lua_vm = @import("lua/vm.zig");
-pub const wm_bridge = @import("wm/bridge.zig");
+pub const lua_vm = @import("lua_vm.zig");
+pub const wm_bridge = @import("wm_bridge.zig");
 pub const program_loader = @import("program/loader.zig");
 pub const config = @import("config.zig");
 

@@ -1,7 +1,7 @@
 //! Owned staging queues for River events preceding manage_start/render_start.
 
 const std = @import("std");
-const types = @import("../types.zig");
+const types = @import("types.zig");
 
 fn OwnedBatch(comptime Fact: type) type {
     return struct {
