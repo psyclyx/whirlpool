@@ -10,6 +10,7 @@ pub fn ProxyMap(comptime IdType: type) type {
         by_proxy: std.AutoHashMap(types.ProxyRef, IdType),
         by_id: std.AutoHashMap(IdType, types.ProxyRef),
 
+        /// Initialize an empty proxy-to-ID bijection.
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .by_proxy = .init(allocator),
@@ -17,46 +18,74 @@ pub fn ProxyMap(comptime IdType: type) type {
             };
         }
 
+        /// Release both indexes.
         pub fn deinit(self: *Self) void {
+            self.assertValid();
             self.by_proxy.deinit();
             self.by_id.deinit();
+            self.* = undefined;
         }
 
+        /// Return the number of bound pairs.
         pub fn count(self: *const Self) usize {
+            self.assertValid();
             return self.by_proxy.count();
         }
 
         /// Bind only when both identities are unused. The two indexes change
         /// atomically even if allocating the reverse index fails.
         pub fn bind(self: *Self, proxy: types.ProxyRef, id: IdType) !void {
+            self.assertValid();
             if (self.by_proxy.contains(proxy)) return error.ProxyAlreadyBound;
             if (self.by_id.contains(id)) return error.IdAlreadyBound;
 
             try self.by_proxy.put(proxy, id);
             errdefer _ = self.by_proxy.remove(proxy);
             try self.by_id.put(id, proxy);
+            self.assertValid();
+            std.debug.assert(std.meta.eql(self.idFor(proxy).?, id));
         }
 
+        /// Resolve a proxy identity to its host ID.
         pub fn idFor(self: *const Self, proxy: types.ProxyRef) ?IdType {
+            self.assertValid();
             return self.by_proxy.get(proxy);
         }
 
+        /// Resolve a host ID to its proxy identity.
         pub fn proxyFor(self: *const Self, id: IdType) ?types.ProxyRef {
+            self.assertValid();
             return self.by_id.get(id);
         }
 
+        /// Remove a pair by proxy identity.
         pub fn unbindProxy(self: *Self, proxy: types.ProxyRef) !IdType {
+            self.assertValid();
             const id = self.by_proxy.get(proxy) orelse return error.UnknownProxy;
             std.debug.assert(self.by_proxy.remove(proxy));
             std.debug.assert(self.by_id.remove(id));
+            self.assertValid();
             return id;
         }
 
+        /// Remove a pair by host ID.
         pub fn unbindId(self: *Self, id: IdType) !types.ProxyRef {
+            self.assertValid();
             const proxy = self.by_id.get(id) orelse return error.UnknownId;
             std.debug.assert(self.by_id.remove(id));
             std.debug.assert(self.by_proxy.remove(proxy));
+            self.assertValid();
             return proxy;
+        }
+
+        fn assertValid(self: *const Self) void {
+            if (!std.debug.runtime_safety) return;
+            std.debug.assert(self.by_proxy.count() == self.by_id.count());
+            var iterator = self.by_proxy.iterator();
+            while (iterator.next()) |entry| {
+                const reverse = self.by_id.get(entry.value_ptr.*) orelse unreachable;
+                std.debug.assert(std.meta.eql(reverse, entry.key_ptr.*));
+            }
         }
     };
 }
@@ -70,6 +99,7 @@ pub const ProxyMaps = struct {
     decorations: ProxyMap(types.DecorationId),
     pointer_bindings: ProxyMap(types.PointerBindingId),
 
+    /// Initialize all independent River proxy identity spaces.
     pub fn init(allocator: std.mem.Allocator) ProxyMaps {
         return .{
             .windows = .init(allocator),
@@ -82,6 +112,7 @@ pub const ProxyMaps = struct {
         };
     }
 
+    /// Release all proxy identity spaces.
     pub fn deinit(self: *ProxyMaps) void {
         self.windows.deinit();
         self.outputs.deinit();
@@ -90,6 +121,7 @@ pub const ProxyMaps = struct {
         self.shell_surfaces.deinit();
         self.decorations.deinit();
         self.pointer_bindings.deinit();
+        self.* = undefined;
     }
 };
 
