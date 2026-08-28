@@ -10,6 +10,7 @@ const script = @import("whirlpool-script");
 const lua_program = script.program_loader;
 const ui = @import("whirlpool-ui");
 const graphics = @import("whirlpool-graphics");
+const property_decoder = @import("properties.zig");
 const skia_scene = @import("../skia/scene.zig");
 
 const Allocator = std.mem.Allocator;
@@ -204,38 +205,7 @@ pub const Composition = struct {
 
     fn sinkSet(context: ?*anyopaque, id: lua_program.NodeId, key: []const u8, value: lua_program.Value) anyerror!void {
         const self = fromContext(context);
-        if (!self.in_batch) return error.InvalidBatch;
-        if (id == 0 or id >= self.nodes.items.len) return error.StaleNode;
-        const handle = self.nodes.items[id] orelse return error.StaleNode;
-        const snapshot = self.scene.node(handle) orelse return error.StaleNode;
-
-        if (std.mem.eql(u8, key, "text")) {
-            return self.setText(handle, value);
-        } else if (std.mem.eql(u8, key, "name")) {
-            return self.setText(handle, value);
-        } else if (std.mem.eql(u8, key, "width")) {
-            return self.setU32(handle, value, .width);
-        } else if (std.mem.eql(u8, key, "height")) {
-            return self.setU32(handle, value, .height);
-        } else if (std.mem.eql(u8, key, "gap")) {
-            return self.setU32(handle, value, .gap);
-        } else if (std.mem.eql(u8, key, "flex")) {
-            return self.setU32(handle, value, .flex);
-        } else if (std.mem.eql(u8, key, "font_size") or std.mem.eql(u8, key, "size")) {
-            return self.setFontSize(handle, value);
-        } else if (std.mem.eql(u8, key, "opacity")) {
-            return self.setOpacity(handle, value);
-        } else if (std.mem.eql(u8, key, "padding")) {
-            return self.setPadding(handle, value);
-        } else if (std.mem.eql(u8, key, "radius")) {
-            return self.setRadius(handle, value);
-        } else if (std.mem.eql(u8, key, "fill") or std.mem.eql(u8, key, "color")) {
-            return self.setColor(snapshot.kind, handle, value);
-        } else if (std.mem.eql(u8, key, "text_color")) {
-            return self.setTextColor(handle, value);
-        }
-
-        return error.InvalidProperty;
+        return property_decoder.apply(self, id, key, value);
     }
 
     fn sinkFinish(context: ?*anyopaque) anyerror!void {
@@ -248,120 +218,10 @@ pub const Composition = struct {
     fn ensureNodeSlot(self: *Composition, id: lua_program.NodeId) !void {
         while (self.nodes.items.len <= id) try self.nodes.append(self.allocator, null);
     }
-
-    fn setText(self: *Composition, handle: ui.NodeHandle, value: lua_program.Value) !void {
-        switch (value) {
-            .string => |text| try self.delta.setText(handle, text),
-            else => return error.InvalidProperty,
-        }
-        self.stats.applied_properties += 1;
-    }
-
-    fn setU32(self: *Composition, handle: ui.NodeHandle, value: lua_program.Value, property: U32Property) !void {
-        const number = try integerValue(value);
-        if (number > std.math.maxInt(u32)) return error.InvalidProperty;
-        const converted: u32 = @intCast(number);
-        switch (property) {
-            .width => try self.delta.setWidth(handle, converted),
-            .height => try self.delta.setHeight(handle, converted),
-            .gap => try self.delta.setGap(handle, converted),
-            .flex => try self.delta.setFlex(handle, converted),
-        }
-        self.stats.applied_properties += 1;
-    }
-
-    fn setFontSize(self: *Composition, handle: ui.NodeHandle, value: lua_program.Value) !void {
-        const number = try integerValue(value);
-        if (number == 0 or number > std.math.maxInt(u16)) return error.InvalidProperty;
-        try self.delta.setFontSize(handle, @intCast(number));
-        self.stats.applied_properties += 1;
-    }
-
-    fn setOpacity(self: *Composition, handle: ui.NodeHandle, value: lua_program.Value) !void {
-        const number = try finiteNumber(value);
-        try self.delta.setOpacity(handle, @floatCast(number));
-        self.stats.applied_properties += 1;
-    }
-
-    fn setRadius(self: *Composition, handle: ui.NodeHandle, value: lua_program.Value) !void {
-        const number = try finiteNumber(value);
-        try self.delta.setRadius(handle, @floatCast(number));
-        self.stats.applied_properties += 1;
-    }
-
-    fn setPadding(self: *Composition, handle: ui.NodeHandle, value: lua_program.Value) !void {
-        const values = array(value, 4) orelse return error.InvalidProperty;
-        const edges = ui.Edges{
-            .top = try arrayU32(values[0]),
-            .right = try arrayU32(values[1]),
-            .bottom = try arrayU32(values[2]),
-            .left = try arrayU32(values[3]),
-        };
-        try self.delta.setPadding(handle, edges);
-        self.stats.applied_properties += 1;
-    }
-
-    fn setColor(self: *Composition, kind: ui.NodeKind, handle: ui.NodeHandle, value: lua_program.Value) !void {
-        const color = try colorValue(value);
-        if (kind == .shape) {
-            try self.delta.setFill(handle, color);
-        } else if (kind == .text) {
-            try self.delta.setTextColor(handle, color);
-        } else {
-            return error.InvalidProperty;
-        }
-        self.stats.applied_properties += 1;
-    }
-
-    fn setTextColor(self: *Composition, handle: ui.NodeHandle, value: lua_program.Value) !void {
-        try self.delta.setTextColor(handle, try colorValue(value));
-        self.stats.applied_properties += 1;
-    }
 };
-
-const U32Property = enum { width, height, gap, flex };
 
 fn fromContext(context: ?*anyopaque) *Composition {
     return @ptrCast(@alignCast(context orelse unreachable));
-}
-
-fn finiteNumber(value: lua_program.Value) !f64 {
-    return switch (value) {
-        .number => |number| if (std.math.isFinite(number) and number >= 0) number else error.InvalidProperty,
-        else => error.InvalidProperty,
-    };
-}
-
-fn integerValue(value: lua_program.Value) !u64 {
-    const number = try finiteNumber(value);
-    if (@floor(number) != number) return error.InvalidProperty;
-    return @intFromFloat(number);
-}
-
-fn array(value: lua_program.Value, minimum: usize) ?[]const lua_program.Value {
-    return switch (value) {
-        .array => |items| if (items.len >= minimum) items else null,
-        else => null,
-    };
-}
-
-fn arrayU32(value: lua_program.Value) !u32 {
-    const number = try integerValue(value);
-    if (number > std.math.maxInt(u32)) return error.InvalidProperty;
-    return @intCast(number);
-}
-
-fn colorValue(value: lua_program.Value) !ui.Color {
-    const values = array(value, 3) orelse return error.InvalidProperty;
-    const alpha = if (values.len >= 4) try finiteNumber(values[3]) else 1;
-    const color = ui.Color{
-        .r = @floatCast(try finiteNumber(values[0])),
-        .g = @floatCast(try finiteNumber(values[1])),
-        .b = @floatCast(try finiteNumber(values[2])),
-        .a = @floatCast(alpha),
-    };
-    if (color.r > 1 or color.g > 1 or color.b > 1 or color.a > 1) return error.InvalidProperty;
-    return color;
 }
 
 test "composition mounts an equivalent Lua retained program and lowers a complete snapshot" {
