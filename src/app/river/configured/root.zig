@@ -73,6 +73,10 @@ pub const Services = struct {
         const keybindings = if (self.keybindings) |*value| value else unreachable;
         std.debug.assert(self.layout != null);
         try host.setConfig(config);
+        try host.configureTags(&.{ "1", "2", "3", "4", "5", "6", "7", "8", "9" });
+        if (config.surface("river", "shell")) |descriptor| {
+            if (std.mem.eql(u8, descriptor.edge, "bottom")) try host.reserveBottom(descriptor.exclusive_zone);
+        }
         try host.setSeatHook(.{ .context = @ptrCast(keybindings), .run = onSeat });
         try host.setManageHook(.{ .context = @ptrCast(keybindings), .run = onManage });
         try host.setSpawnHook(.{ .context = @ptrCast(self), .run = spawn });

@@ -34,7 +34,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
         manager.abandon();
 
     var presentation: presentation_app.Bridge = undefined;
-    const role_hooks = try presentation.init(allocator, client, &host_runtime, services.surface("river", "shell"));
+    const role_hooks = try presentation.init(
+        allocator,
+        client,
+        &host_runtime,
+        services.surface("river", "shell"),
+        services.surface("river", "decoration"),
+    );
     defer presentation.deinit() catch |err| std.log.err("River graphics cleanup failed: {s}", .{@errorName(err)});
     var roles = river_role_lifecycle.Runtime.init(allocator, manager, &host_runtime.adapter, compositor, role_hooks);
     var roles_live = true;

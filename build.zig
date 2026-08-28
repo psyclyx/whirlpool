@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
     scanner.addCustomProtocol(b.path("protocol/river-layer-shell-v1.xml"));
     scanner.generate("wl_compositor", 6);
     scanner.generate("wl_output", 4);
+    scanner.generate("wl_seat", 9);
     scanner.generate("xdg_wm_base", 6);
     scanner.generate("zwlr_layer_shell_v1", 4);
     scanner.generate("river_window_manager_v1", 5);
@@ -139,6 +140,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wayland", .module = wayland },
             .{ .name = "whirlpool-wayland-client", .module = wayland_client },
             .{ .name = "whirlpool-host", .module = host },
+            .{ .name = "whirlpool-wm", .module = wm },
             .{ .name = "whirlpool-script", .module = script },
             .{ .name = "whirlpool-graphics", .module = graphics },
             .{ .name = "whirlpool-wayland-wsi", .module = wayland_wsi },
@@ -317,6 +319,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "wayland", .module = wayland },
             .{ .name = "whirlpool-host", .module = host },
+            .{ .name = "whirlpool-wm", .module = wm },
             .{ .name = "whirlpool-script", .module = script },
             .{ .name = "whirlpool-wayland-client", .module = wayland_client },
             .{ .name = "whirlpool-river-host-runtime", .module = river_host_runtime },

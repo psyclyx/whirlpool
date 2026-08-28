@@ -23,6 +23,7 @@ pub const Hooks = struct {
 
 pub const RetirementStatus = enum { pending_release, release_safe };
 pub const ShellVisitor = *const fn (?*anyopaque, types.OutputId, types.ShellSurfaceId) anyerror!void;
+pub const DecorationVisitor = *const fn (?*anyopaque, types.WindowId, types.DecorationId) anyerror!void;
 const RecordState = enum { active, retiring };
 
 const ShellRecord = struct {
@@ -160,6 +161,15 @@ pub const Runtime = struct {
             const shell_id = try self.adapter.objects.shellSurfaceId(record.role);
             try visit(context, record.output_id, shell_id);
         }
+    }
+
+    pub fn forEachDecoration(self: *const Runtime, context: ?*anyopaque, visit: DecorationVisitor) !void {
+        for (self.decorations.items) |record| try visit(context, record.window, record.id);
+    }
+
+    pub fn outputForSurface(self: *const Runtime, surface: *wayland.client.wl.Surface) ?types.OutputId {
+        for (self.shells.items) |record| if (record.surface == surface) return record.output_id;
+        return null;
     }
 
     /// Reconcile only from the post-dispatch safe point.  Role creation and

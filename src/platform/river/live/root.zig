@@ -11,6 +11,8 @@ pub const LayerShell = @import("whirlpool-river-layer-shell");
 const river_layer_shell = LayerShell;
 const ListenerCallbacks = @import("listeners.zig").Callbacks(Manager);
 
+pub const ShellPosition = struct { x: i32, y: i32 };
+
 pub const State = enum { claimed, managing, rendering, stopping, finished, unavailable, destroyed };
 pub const Error = error{ MissingManagerGlobal, BindFailed, InvalidState, Disconnected, RolesStillLive };
 
@@ -193,8 +195,19 @@ pub const Manager = struct {
 
     /// Shell nodes have no meaningful default render-list position. Place
     /// them during the render transaction that applies their surface commit.
-    pub fn placeOutputShellRoles(self: *Manager) void {
-        for (self.output_shell_roles.items) |role| role.node.placeTop();
+    pub fn placeOutputShellRoles(
+        self: *Manager,
+        context: ?*anyopaque,
+        resolve: *const fn (?*anyopaque, *wayland.client.river.OutputV1) ?ShellPosition,
+    ) void {
+        for (self.output_shell_roles.items) |role| {
+            if (resolve(context, role.output)) |position| role.node.setPosition(position.x, position.y);
+            role.node.placeTop();
+        }
+    }
+
+    pub fn placeDecorationRoles(self: *Manager, height: i32) void {
+        for (self.decoration_roles.items) |role| role.decoration.setOffset(0, -height);
     }
 
     /// Create a compositor-owned surface and assign it a River decoration

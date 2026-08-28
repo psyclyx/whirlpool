@@ -156,6 +156,14 @@ pub const Runtime = struct {
         self.assertValid();
     }
 
+    pub fn reserveBottom(self: *Runtime, height: u32) !void {
+        try self.adapter.reserveBottom(height);
+    }
+
+    pub fn configureTags(self: *Runtime, names: []const []const u8) !void {
+        try self.adapter.configureTags(names);
+    }
+
     /// Queue one configured binding action for the next manage cycle.
     pub fn queueConfiguredAction(self: *Runtime, action_index: usize) !void {
         self.assertValid();
@@ -328,7 +336,10 @@ pub const Runtime = struct {
         const frames = &(self.frames orelse return transport.finishRenderError(Runtime, self, error.MissingFrameSet));
         const render_cycle = self.adapter.beginRender(frames) catch |err| return transport.finishRenderError(Runtime, self, err);
         self.render = render_cycle;
-        if (self.manager) |manager| manager.placeOutputShellRoles();
+        if (self.manager) |manager| {
+            manager.placeOutputShellRoles(self, resolveShellPosition);
+            manager.placeDecorationRoles(28);
+        }
         defer {
             self.render.?.deinit();
             self.render = null;
@@ -389,6 +400,13 @@ pub const Runtime = struct {
 
     fn from(raw: ?*anyopaque) *Runtime {
         return @ptrCast(@alignCast(raw orelse unreachable));
+    }
+
+    fn resolveShellPosition(raw: ?*anyopaque, output: *wayland.client.river.OutputV1) ?live.ShellPosition {
+        const self: *Runtime = @ptrCast(@alignCast(raw orelse return null));
+        const id = self.adapter.objects.outputId(output) catch return null;
+        const position = (self.adapter.objects.outputs.get(id) orelse return null).position orelse return null;
+        return .{ .x = position.x, .y = position.y };
     }
 
     fn assertValid(self: *const Runtime) void {

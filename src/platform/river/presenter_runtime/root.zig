@@ -59,7 +59,17 @@ const RolePresenter = struct {
             self.extent.height,
         );
         errdefer self.presenter.deinit();
-        self.composition = try host.surface_composition.Composition.init(self.owner.allocator, self.owner.surface.content);
+        const descriptor = switch (self.role) {
+            .shell => self.owner.surface,
+            .decoration => self.owner.decoration_surface orelse self.owner.surface,
+        };
+        self.composition = try host.surface_composition.Composition.init(self.owner.allocator, descriptor.content);
+        const role_name = switch (self.role) {
+            .shell => "shell",
+            .decoration => "decoration",
+        };
+        const values = [_]script.program_loader.Value{.{ .string = role_name }};
+        try self.composition.update(.{ .service = "surface-role", .values = &values });
     }
 
     fn state(raw: *anyopaque) Registry.PresenterState {
@@ -147,6 +157,7 @@ pub const Runtime = struct {
     client: *client_api.Client,
     context: *wsi.Context,
     surface: *const script.config.SurfaceSpec,
+    decoration_surface: ?*const script.config.SurfaceSpec,
     registry: Registry,
     queue: Queue,
     roles: std.ArrayList(RoleRecord) = .empty,
@@ -157,11 +168,18 @@ pub const Runtime = struct {
         client: *client_api.Client,
         queue: Queue,
         surface: *const script.config.SurfaceSpec,
+        decoration_surface: ?*const script.config.SurfaceSpec,
     ) !*Runtime {
         if (!std.mem.eql(u8, surface.provider, "river") or
             !std.mem.eql(u8, surface.role, "shell") or
             !std.mem.eql(u8, surface.placement, "all-outputs"))
             return error.UnsupportedSurfaceDescriptor;
+        if (decoration_surface) |descriptor| {
+            if (!std.mem.eql(u8, descriptor.provider, "river") or
+                !std.mem.eql(u8, descriptor.role, "decoration") or
+                !std.mem.eql(u8, descriptor.placement, "windows"))
+                return error.UnsupportedSurfaceDescriptor;
+        }
         const self = try allocator.create(Runtime);
         errdefer allocator.destroy(self);
         self.* = undefined;
@@ -170,6 +188,7 @@ pub const Runtime = struct {
         self.context = try wsi.Context.init(allocator, @ptrCast(client.display));
         errdefer self.context.deinit();
         self.surface = surface;
+        self.decoration_surface = decoration_surface;
         self.queue = queue;
         self.roles = .empty;
         self.created_product = null;
@@ -245,7 +264,14 @@ pub const Runtime = struct {
                 defer frame.deinit();
                 break :blk try self.registry.prepareDrawList(role, generation, .{ 0, 0, 0, 0 }, frame.drawList());
             },
-            .decoration => self.registry.prepareDrawList(role, generation, .{ 0.03, 0.04, 0.06, 1 }, .{ .ops = &.{} }),
+            .decoration => blk: {
+                var frame = try record.product.composition.snapshotAndLower(.{
+                    .width = extent.width,
+                    .height = extent.height,
+                });
+                defer frame.deinit();
+                break :blk try self.registry.prepareDrawList(role, generation, .{ 0, 0, 0, 0 }, frame.drawList());
+            },
         };
     }
 

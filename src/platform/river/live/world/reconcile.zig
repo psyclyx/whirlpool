@@ -60,7 +60,8 @@ fn reconcileOutputs(self: anytype) !void {
         const size = record.dimensions orelse return error.IncompleteOutput;
         if (record.wm_id) |output_id| {
             const active_tag = (self.world.getOutput(output_id) orelse return error.UnknownOutput).active_tag;
-            const spec = try outputSpec(position, size, record.usable, active_tag);
+            var spec = try outputSpec(position, size, record.usable, active_tag);
+            try reserveShellArea(self, &spec);
             _ = try wm.lifecycle.applyEvent(&self.world, .{ .output_reconciled = .{
                 .output = output_id,
                 .active_tag = active_tag,
@@ -74,7 +75,8 @@ fn reconcileOutputs(self: anytype) !void {
                 const result = try wm.lifecycle.applyEvent(&self.world, .tag_announced);
                 break :blk result.announced_tag.?;
             };
-            const spec = try outputSpec(position, size, record.usable, tag);
+            var spec = try outputSpec(position, size, record.usable, tag);
+            try reserveShellArea(self, &spec);
             const created = try wm.lifecycle.applyEvent(&self.world, .{ .output_announced = .{
                 .active_tag = tag,
                 .bounds = spec.bounds,
@@ -87,6 +89,12 @@ fn reconcileOutputs(self: anytype) !void {
             try self.objects.wm_to_output.put(output_id, id);
         }
     }
+}
+
+fn reserveShellArea(self: anytype, spec: *wm.OutputSpec) !void {
+    if (self.reserved_bottom == 0) return;
+    if (spec.usable.height <= self.reserved_bottom) return error.InvalidDimensions;
+    spec.usable.height -= self.reserved_bottom;
 }
 
 fn removeRetiredOutputs(self: anytype) !void {
@@ -197,6 +205,7 @@ fn removeClosedRecords(self: anytype) void {
             index += 1;
             continue;
         }
+        self.objects.windows.getPtr(id).?.deinit(self.objects.allocator);
         std.debug.assert(self.objects.windows.remove(id));
         _ = self.objects.window_order.orderedRemove(index);
     }

@@ -150,6 +150,7 @@ pub const Adapter = struct {
     objects: live_objects.Registry,
     input_queue: input_intents.Queue,
     pointer_actions: std.AutoHashMap(types.PointerBindingId, input_intents.NamedAction),
+    reserved_bottom: u32 = 0,
 
     revision: u64 = 0,
     poisoned: bool = false,
@@ -185,6 +186,12 @@ pub const Adapter = struct {
     pub fn configureTags(self: *Adapter, names: []const []const u8) !void {
         if (self.world.liveTagCount() != 0) return error.TagsAlreadyConfigured;
         for (names) |name| _ = try self.world.createNamedTag(name);
+    }
+
+    pub fn reserveBottom(self: *Adapter, height: u32) !void {
+        if (self.objects.outputs.count() != 0 or self.world.liveOutputCount() != 0)
+            return error.OutputsAlreadyAnnounced;
+        self.reserved_bottom = height;
     }
 
     pub fn takeInputIntents(self: *Adapter) ![]input_intents.Intent {

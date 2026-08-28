@@ -14,7 +14,15 @@ pub const WindowRecord = struct {
     preferred_output: ?types.OutputId = null,
     desired_placement: wm.Placement = .tiled,
     actual_size: ?types.Size = null,
+    app_id: []u8 = &.{},
+    title: []u8 = &.{},
     closed: bool = false,
+
+    pub fn deinit(self: *WindowRecord, allocator: std.mem.Allocator) void {
+        if (self.app_id.len != 0) allocator.free(self.app_id);
+        if (self.title.len != 0) allocator.free(self.title);
+        self.* = undefined;
+    }
 };
 
 pub const OutputRecord = struct {
@@ -76,6 +84,8 @@ pub const Registry = struct {
         self.window_order.deinit(self.allocator);
         self.seats.deinit();
         self.outputs.deinit();
+        var windows = self.windows.valueIterator();
+        while (windows.next()) |record| record.deinit(self.allocator);
         self.windows.deinit();
         self.maps.deinit();
         self.* = undefined;
@@ -207,6 +217,20 @@ pub const Registry = struct {
         return (self.windows.get(window) orelse return error.UnknownWindow).actual_size;
     }
 
+    pub fn windowRecord(self: *const Registry, window: types.WindowId) !*const WindowRecord {
+        return self.windows.getPtr(window) orelse error.UnknownWindow;
+    }
+
+    pub fn setWindowAppId(self: *Registry, window: types.WindowId, value: []const u8) !void {
+        const record = self.windows.getPtr(window) orelse return error.UnknownWindow;
+        try replaceOwned(self.allocator, &record.app_id, value);
+    }
+
+    pub fn setWindowTitle(self: *Registry, window: types.WindowId, value: []const u8) !void {
+        const record = self.windows.getPtr(window) orelse return error.UnknownWindow;
+        try replaceOwned(self.allocator, &record.title, value);
+    }
+
     pub fn outputSize(self: *const Registry, output: types.OutputId) !?types.Size {
         return (self.outputs.get(output) orelse return error.UnknownOutput).dimensions;
     }
@@ -261,6 +285,17 @@ pub const Registry = struct {
         return proxyPointer(wayland.client.river.PointerBindingV1, self.maps.pointer_bindings.proxyFor(id) orelse return error.UnknownPointerBinding);
     }
 };
+
+fn replaceOwned(allocator: std.mem.Allocator, destination: *[]u8, value: []const u8) !void {
+    if (value.len == 0) {
+        if (destination.*.len != 0) allocator.free(destination.*);
+        destination.* = &.{};
+        return;
+    }
+    const replacement = try allocator.dupe(u8, value);
+    if (destination.*.len != 0) allocator.free(destination.*);
+    destination.* = replacement;
+}
 
 fn peekId(next: u64) !u64 {
     if (next == 0) return error.IdExhausted;

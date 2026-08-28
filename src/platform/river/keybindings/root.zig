@@ -9,7 +9,7 @@ const Binding = script.config.Binding;
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
-    config: *const script.config.Config,
+    bindings: []const Binding,
     xkb: ?*wayland.client.river.XkbBindingsV1 = null,
     entries: std.ArrayList(Entry) = .empty,
     pending_actions: std.ArrayList(usize) = .empty,
@@ -26,7 +26,10 @@ pub const Runtime = struct {
         client: *client_transport.Client,
         config: *const script.config.Config,
     ) !Runtime {
-        var result: Runtime = .{ .allocator = allocator, .config = config };
+        // Borrow the owned binding allocation, not the address of Config
+        // itself. Services.init returns its Config by value, so retaining that
+        // temporary struct address would dangle before the first seat event.
+        var result: Runtime = .{ .allocator = allocator, .bindings = config.bindings };
         errdefer result.deinit();
         if (config.bindings.len == 0) return result;
 
@@ -65,7 +68,7 @@ pub const Runtime = struct {
             std.log.err("River seat arrived before XKB bindings global was bound", .{});
             return error.MissingXkbBindingsGlobal;
         };
-        for (self.config.bindings, 0..) |binding, action_index| {
+        for (self.bindings, 0..) |binding, action_index| {
             const modifiers: wayland.client.river.SeatV1.Modifiers = @bitCast(binding.modifiers);
             const proxy = try xkb.getXkbBinding(seat, binding.keysym, modifiers);
             errdefer proxy.destroy();
