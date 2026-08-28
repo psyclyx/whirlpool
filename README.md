@@ -25,8 +25,9 @@ revision in `npins/sources.json`; the Nix build rejects any pin/vendor drift.
 - The shared retained UI and renderer-neutral draw contract are the reusable
   part of the Shoal idea. Skia owns native 2D rasterization; Whirlpool owns its
   Wayland surfaces and one Vulkan graphics context.
-- Graphical surfaces use Vulkan Wayland swapchains; Vulkan WSI owns buffer
-  exchange and presentation synchronization.
+- Graphical surfaces use modifier-explicit DMA-BUFs imported into Vulkan and
+  Wayland. Skia renders directly into those images off the Wayland thread;
+  `wl_buffer.release` governs storage reuse.
 - Wayland surface roles are adapters. River shell roles provide integrated WM
   UI; layer-shell roles provide portable panels and overlays under other
   compositors without changing the UI composition.
@@ -37,10 +38,10 @@ and typed intents, PUC Lua protected calls, generated Wayland registry and
 River-manager lifecycle, and same-epoch WM-plan translation. The River path has live
 window/output/seat facts, same-epoch plan application, per-output shell-role
 ownership, WM-driven decoration selection, and bounded named input intents.
-The River path now registers a concrete per-role Skia/Vulkan presenter factory:
-retained scenes are rasterized by Skia and presented through the standard
-`VK_KHR_wayland_surface` and `VK_KHR_swapchain` extensions. River's role
-transaction stays responsible only for its sync-next-commit boundary.
+The River path registers a concrete asynchronous per-role Skia/Vulkan
+presenter factory. Retained scenes render directly into bounded DMA-BUF pools;
+River's role transaction stays responsible only for its sync-next-commit
+boundary and the Wayland thread never waits for Lua or Vulkan.
 
 ## Development
 

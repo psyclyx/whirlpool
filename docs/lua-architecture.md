@@ -64,42 +64,35 @@ such as launchers can use `zwlr_layer_shell_v1` normally.
 ## Drawing
 
 Retained Lua/UI trees are lowered to a small Skia draw list containing scalar
-rectangles and text. Skia rasterizes to BGRA host memory. This keeps scene and
-text behavior independent of Vulkan resource ownership.
+rectangles and text. A role worker asks Skia Ganesh to render that list directly
+into an imported Vulkan image. This keeps scene and text behavior independent
+of DMA-BUF, Vulkan, and Wayland resource ownership without a CPU pixel copy.
 
 ## Vulkan and Wayland
 
-Every surface role uses the same Wayland surface host and Vulkan presentation
-boundary. Once per process:
+Every production surface role uses explicit DMA-BUF exchange without Vulkan
+WSI. A graphics context selects a DRM render node through Vulkan DRM
+properties, intersects Vulkan-importable modifiers with the compositor's
+`zwp_linux_dmabuf_v1` advertisement, and allocates GBM storage on that device.
 
-1. Create `VkInstance` with `VK_KHR_wayland_surface`.
-2. Select a graphics queue with Wayland presentation support and create one
-   logical device.
+Each surface owns a bounded two-slot pool. Vulkan imports each DMA-BUF with its
+explicit modifier and plane layout; Wayland imports the same planes as a
+`wl_buffer`. A role worker performs Lua updates, lowering, and Skia rendering,
+then releases queue-family ownership to `VK_QUEUE_FAMILY_FOREIGN_EXT`. The
+Wayland thread only attaches a completed buffer, damages, and commits.
 
-Then, once per `wl_surface`:
-
-1. Create its `VkSurfaceKHR` and verify support on the shared queue.
-2. Create a FIFO `VK_KHR_swapchain` swapchain.
-3. Copy the Skia frame through one host-visible staging buffer into an acquired
-   BGRA swapchain image.
-4. Present with `vkQueuePresentKHR`.
-
-Vulkan WSI owns buffer exchange and compositor synchronization. Whirlpool does
-not negotiate linux-dmabuf feedback, choose DRM modifiers or render nodes,
-export memory FDs, translate synchronization FDs, or manage DRM syncobj
-timelines.
-
-The process owns one Vulkan device/context. Each `wl_surface` owns only its
-role-specific state and swapchain. A nonblocking fence check provides
-backpressure; image reuse is still governed by `vkAcquireNextImageKHR`.
+GPU completion and compositor release are distinct gates. A second slot may be
+rendered while the compositor retains the current one, but no storage is reused
+or destroyed until its actual `wl_buffer.release` event. Producer updates are
+coalesced under backpressure and worker completion wakes the Wayland event loop.
 
 ## Lifetime order
 
-On normal role retirement, queued work is discarded or completed, the Vulkan
-surface is destroyed, and only then may the River role destroy its
-`wl_surface`. On display loss, callbacks are detached first, queued River
-transactions are drained, presenters are abandoned, role bookkeeping is
-dropped, and the disconnected manager releases its local storage.
+On normal role retirement, queued work is discarded, workers stop, and every
+compositor-owned DMA-BUF remains retained through release before the River role
+destroys its `wl_surface`. On display loss, callbacks are detached first,
+queued River transactions are drained, presenters are abandoned, role
+bookkeeping is dropped, and the disconnected manager releases local storage.
 
 ## Validation
 

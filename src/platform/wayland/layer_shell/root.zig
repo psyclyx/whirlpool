@@ -55,6 +55,11 @@ pub const Manager = struct {
         self.* = undefined;
     }
 
+    pub fn abandon(self: *Manager) void {
+        @as(*wayland.client.wl.Proxy, @ptrCast(self.proxy)).destroy();
+        self.* = undefined;
+    }
+
     /// The returned owner is heap-stable because Wayland retains it as the
     /// configure listener context until the role is destroyed.
     pub fn createSurface(
@@ -111,6 +116,14 @@ pub const Surface = struct {
         const allocator = self.allocator;
         self.role.destroy();
         self.wl_surface.destroy();
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    pub fn abandon(self: *Surface) void {
+        const allocator = self.allocator;
+        @as(*wayland.client.wl.Proxy, @ptrCast(self.role)).destroy();
+        @as(*wayland.client.wl.Proxy, @ptrCast(self.wl_surface)).destroy();
         self.* = undefined;
         allocator.destroy(self);
     }

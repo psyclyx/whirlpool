@@ -22,24 +22,37 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     const compositor = try bindCompositor(client);
     defer compositor.destroy();
 
-    var layer = try layer_shell_runtime.Runtime.init(allocator, client, compositor, .{
+    var layer = try layer_shell_runtime.Runtime.init(allocator, io, client, compositor, .{
         .height = surface_height,
         .anchor = .{ .top = !bottom, .bottom = bottom, .left = true, .right = true },
         .exclusive_zone = exclusive_zone,
     }, surface);
-    defer layer.deinit();
 
     var session: wayland_runtime.Session = undefined;
     try session.init(client);
     defer session.deinit();
-    session.setPollInterval(16);
+    var layer_live = true;
+    // This CLI owns the whole client connection. On any process-exit path,
+    // stop its worker and drop local proxies before wl_display disconnects.
+    defer if (layer_live) layer.abandon();
+    session.setPollInterval(1000);
+    layer.setWake(.{ .context = @ptrCast(&session), .run = wakeSession });
     var after_dispatch = AfterDispatch{ .runtime = &layer, .session = &session };
     session.setAfterDispatch(.{ .context = @ptrCast(&after_dispatch), .run = AfterDispatch.run });
     std.log.info("Portable layer-shell host connected", .{});
     session.run() catch |err| switch (err) {
-        error.Disconnected => std.log.info("Wayland display disconnected", .{}),
+        error.Disconnected => {
+            std.log.info("Wayland display disconnected", .{});
+            layer.abandon();
+            layer_live = false;
+        },
         else => return err,
     };
+}
+
+fn wakeSession(raw: ?*anyopaque) void {
+    const session: *wayland_runtime.Session = @ptrCast(@alignCast(raw orelse return));
+    session.loop.wake() catch {};
 }
 
 const AfterDispatch = struct {

@@ -9,16 +9,16 @@ const client_api = @import("whirlpool-wayland-client");
 const layer_shell = @import("whirlpool-wayland-layer-shell");
 const script = @import("whirlpool-script");
 const surface_presenter = @import("whirlpool-wayland-surface-presenter");
-const wsi = @import("whirlpool-wayland-wsi");
 
 pub const Runtime = struct {
     manager: layer_shell.Manager,
     surface: *layer_shell.Surface,
-    context: *wsi.Context,
-    presenter: surface_presenter.Presenter,
+    context: *surface_presenter.Context,
+    presenter: *surface_presenter.Presenter,
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         client: *client_api.Client,
         compositor: *wayland.client.wl.Compositor,
         config: layer_shell.Config,
@@ -33,9 +33,9 @@ pub const Runtime = struct {
         errdefer manager.deinit();
         const surface = try manager.createSurface(allocator, compositor, config);
         errdefer surface.deinit();
-        const context = try wsi.Context.init(allocator, @ptrCast(client.display));
+        const context = try surface_presenter.Context.init(allocator, client);
         errdefer context.deinit();
-        const presenter = try surface_presenter.Presenter.init(allocator, context, surface.wl_surface, descriptor);
+        const presenter = try surface_presenter.Presenter.init(allocator, io, context, surface.wl_surface, descriptor);
         return .{ .manager = manager, .surface = surface, .context = context, .presenter = presenter };
     }
 
@@ -52,11 +52,23 @@ pub const Runtime = struct {
         try self.presenter.update(update_value);
     }
 
-    pub fn deinit(self: *Runtime) void {
-        self.presenter.deinit();
+    pub fn setWake(self: *Runtime, wake: surface_presenter.Wake) void {
+        self.presenter.setWake(wake);
+    }
+
+    pub fn deinit(self: *Runtime) !void {
+        try self.presenter.deinit();
         self.context.deinit();
         self.surface.deinit();
         self.manager.deinit();
+        self.* = undefined;
+    }
+
+    pub fn abandon(self: *Runtime) void {
+        self.presenter.abandon();
+        self.context.abandon();
+        self.surface.abandon();
+        self.manager.abandon();
         self.* = undefined;
     }
 };

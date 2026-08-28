@@ -47,7 +47,8 @@ than through forwarding methods.
   longer retain raw owner pointers.
 - River render preflight resolves every surface role before the infallible
   synchronized-commit edge.
-- Dead external-Vulkan Skia plumbing and its unused C/C++ bridge were removed.
+- Skia's external-Vulkan bridge is the production raster path; CPU pixel
+  frames remain only for focused renderer tests.
 - Executable startup can import only runtime and the two application modules.
   River configuration, presentation, host, and platform assemblies each have
   explicit build-module dependencies.
@@ -58,8 +59,9 @@ than through forwarding methods.
   mutation.
 - River host policy collection and transport callbacks are localized under
   `host/`; transport is divided into driver, resolver, and surface edges.
-- Vulkan WSI is divided into ABI, display context, staging buffer, and
-  per-surface swapchain resource owners.
+- Vulkan WSI, swapchains, staging uploads, and their production callers were
+  removed. DMA-BUF allocation, Vulkan import, Wayland import, and release
+  ownership are separate explicit resource owners.
 
 ## File-by-file disposition
 
@@ -186,7 +188,7 @@ than through forwarding methods.
 | `src/platform/river/policy_runtime/root.zig` | Cohesive bounded Lua WM policy runtime. |
 | `src/platform/river/layout_runtime/root.zig` | Runtime type is small; free functions encode/decode layout tables. Split codecs only if the schema gains another version. |
 | `src/platform/river/presentation/root.zig` | Cohesive generic presenter registry and strict retirement state machine; much of its size is direct state-transition testing. |
-| `src/platform/river/presenter_runtime/root.zig` | Cohesive concrete Skia/WSI presenter aggregate. |
+| `src/platform/river/presenter_runtime/root.zig` | Concrete asynchronous River role presenter with coalesced Lua updates and a bounded DMA-BUF pool. |
 
 ### Wayland and graphics platform
 
@@ -197,15 +199,13 @@ than through forwarding methods.
 | `src/platform/wayland/event_loop/root.zig` | Lower-level poll/wake and callback scheduling contract imported explicitly by the concrete Wayland runtime. |
 | `src/platform/wayland/layer_shell/root.zig` | Cohesive generated layer-shell role owner. |
 | `src/platform/wayland/layer_shell/runtime/root.zig` | Cohesive portable layer-shell application runtime. |
-| `src/platform/wayland/surface_presenter/root.zig` | Cohesive Skia-to-WSI presenter state machine. |
+| `src/platform/wayland/surface_presenter/root.zig` | Asynchronous ordinary-surface presenter; workers render directly into a bounded DMA-BUF pool while the Wayland thread owns attach, commit, and release. |
+| `src/platform/wayland/dmabuf/root.zig` | Linux-DMA-BUF protocol capability, import, and `wl_buffer.release` ownership. |
 | `src/graphics/root.zig` | Thin graphics export root. |
-| `src/graphics/skia.zig` | Cohesive draw-list/frame wrapper around the local C++ shim. |
-| `src/graphics/skia/shim.h`, `src/graphics/skia/shim.cpp` | Minimal C ABI and Skia implementation; unused external-Vulkan ownership paths were removed. |
-| `src/graphics/wayland/wsi/root.zig` | Public WSI boundary exporting the two resource owners. |
-| `src/graphics/wayland/wsi/api.zig` | Private Vulkan ABI, extension vocabulary, result conversion, and image barrier. |
-| `src/graphics/wayland/wsi/context.zig` | Display-wide Vulkan instance, device selection, and queue lifetime. |
-| `src/graphics/wayland/wsi/staging.zig` | Host-visible mapped transfer-buffer lifetime and row copy. |
-| `src/graphics/wayland/wsi/swapchain.zig` | Per-surface acquisition, command submission, presentation, and resize lifetime. |
+| `src/graphics/skia.zig` | Cohesive CPU and external-Vulkan draw-list wrappers around the local C++ shim. Production presentation uses the Vulkan path. |
+| `src/graphics/skia/shim.h`, `src/graphics/skia/shim.cpp` | Minimal C ABI and Skia implementation, including direct Ganesh rendering into imported Vulkan images. |
+| `src/graphics/dmabuf/root.zig` | Modifier-explicit GBM allocation and exported plane ownership. |
+| `src/graphics/dmabuf/vulkan.zig` | WSI-free Vulkan device selection, external-memory import, DRM modifier negotiation, and foreign queue-family ownership. |
 
 Protocol XML files are upstream interface definitions, not application code;
 they are compiled into typed edges and should not accumulate Whirlpool policy.
@@ -228,7 +228,7 @@ they are compiled into typed edges and should not accumulate Whirlpool policy.
 
 The Tidepool/Shoal-equivalent sample now exercises the integrated River shell,
 window metadata, decoration lifecycle, retained composition, Skia lowering,
-Wayland/Vulkan presentation, configured actions, output cycling, and ordinary
+Wayland DMA-BUF/Vulkan presentation, configured actions, output cycling, and ordinary
 `wl_pointer` bar interaction. Those host and platform layers are therefore not
 speculative; they are the implementation of the supported River application.
 The portable layer-shell application is also a real CLI mode, although it has
@@ -259,7 +259,7 @@ a clean removal pass rather than further abstraction:
 
 The largest remaining hidden cost is `lua/whirlpool/status.lua`: its probes
 are throttled, but `io.popen` is synchronous and each output owns a Lua VM, so
-multi-output sessions duplicate polling and can block presentation briefly.
+multi-output sessions duplicate polling and can occupy each role worker.
 A single process-owned status sampler publishing service updates is the next
 architectural joint if the sample becomes the production shell.
 

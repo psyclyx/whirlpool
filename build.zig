@@ -128,24 +128,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const wayland_wsi = b.addModule("whirlpool-wayland-wsi", .{
-        .root_source_file = b.path("src/graphics/wayland/wsi/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{.{ .name = "whirlpool-graphics", .module = graphics }},
-    });
-    wayland_wsi.linkSystemLibrary("vulkan", .{});
-    wayland_wsi.linkSystemLibrary("wayland-client", .{});
-    for ([_][]const u8{ "vulkan", "wayland-client" }) |package| {
-        const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", package });
-        var tokens = std.mem.tokenizeAny(u8, cflags, " \t\r\n");
-        while (tokens.next()) |token| {
-            if (std.mem.startsWith(u8, token, "-I"))
-                wayland_wsi.addIncludePath(.{ .cwd_relative = token[2..] });
-        }
-    }
-
     const dmabuf_allocator = b.addModule("whirlpool-dmabuf-allocator", .{
         .root_source_file = b.path("src/graphics/dmabuf/root.zig"),
         .target = target,
@@ -164,11 +146,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "wayland", .module = wayland },
             .{ .name = "whirlpool-wayland-client", .module = wayland_client },
+            .{ .name = "whirlpool-wayland-dmabuf", .module = wayland_dmabuf },
+            .{ .name = "whirlpool-dmabuf-allocator", .module = dmabuf_allocator },
             .{ .name = "whirlpool-host", .module = host },
-            .{ .name = "whirlpool-wm", .module = wm },
             .{ .name = "whirlpool-script", .module = script },
             .{ .name = "whirlpool-graphics", .module = graphics },
-            .{ .name = "whirlpool-wayland-wsi", .module = wayland_wsi },
         },
     });
     const wayland_layer_shell_runtime = b.addModule("whirlpool-wayland-layer-shell-runtime", .{
@@ -181,7 +163,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "whirlpool-wayland-client", .module = wayland_client },
             .{ .name = "whirlpool-wayland-layer-shell", .module = wayland_layer_shell },
             .{ .name = "whirlpool-wayland-surface-presenter", .module = wayland_surface_presenter },
-            .{ .name = "whirlpool-wayland-wsi", .module = wayland_wsi },
             .{ .name = "whirlpool-script", .module = script },
         },
     });
@@ -408,7 +389,7 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run Whirlpool").dependOn(&run.step);
 
     const test_step = b.step("test", "Run all unit tests");
-    const graphics_test_step = b.step("graphics-test", "Run graphics and Vulkan WSI tests");
+    const graphics_test_step = b.step("graphics-test", "Run graphics and DMA-BUF tests");
     inline for (.{
         wm,
         ui,
@@ -440,7 +421,7 @@ pub fn build(b: *std.Build) void {
     }) |module| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
     }
-    inline for (.{ graphics, dmabuf_allocator, wayland_wsi }) |module| {
+    inline for (.{ graphics, dmabuf_allocator }) |module| {
         const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = module }));
         test_step.dependOn(&run_tests.step);
         graphics_test_step.dependOn(&run_tests.step);
