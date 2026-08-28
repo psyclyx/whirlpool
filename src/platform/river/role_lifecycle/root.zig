@@ -29,6 +29,7 @@ const RecordState = enum { active, retiring };
 const ShellRecord = struct {
     output: *wayland.client.river.OutputV1,
     output_id: types.OutputId,
+    extent: types.Size,
     role: *wayland.client.river.ShellSurfaceV1,
     surface: *wayland.client.wl.Surface,
     state: RecordState = .active,
@@ -190,16 +191,29 @@ pub const Runtime = struct {
 
     fn reconcileShells(self: *Runtime) !void {
         for (self.manager.outputs.items) |output| {
-            if (self.findShell(output) != null) continue;
             const output_id = try self.adapter.objects.outputId(output);
             // Output identity arrives before its dimensions. Creating the role
             // in that interval would force presentation to guess a buffer size
             // and permanently place the bar against the guessed viewport.
-            if (try self.adapter.objects.outputSize(output_id) == null) continue;
+            const extent = (try self.adapter.objects.outputSize(output_id)) orelse continue;
+            if (self.findShell(output)) |record| {
+                if (record.state == .active and shellExtentChanged(record.extent, extent)) {
+                    const role_index = self.managerShellIndex(record.role) orelse
+                        return error.RoleOwnershipLost;
+                    try self.manager.requestOutputShellRoleRetirement(role_index);
+                }
+                continue;
+            }
 
             const index = try self.manager.createOutputShellRole(self.compositor, output);
             const role = self.manager.output_shell_roles.items[index];
-            self.shells.append(self.allocator, .{ .output = output, .output_id = output_id, .role = role.shell_surface, .surface = role.surface }) catch |err| {
+            self.shells.append(self.allocator, .{
+                .output = output,
+                .output_id = output_id,
+                .extent = extent,
+                .role = role.shell_surface,
+                .surface = role.surface,
+            }) catch |err| {
                 self.rollbackShell(index);
                 return err;
             };
@@ -343,7 +357,22 @@ pub const Runtime = struct {
     }
 };
 
+fn shellExtentChanged(current: types.Size, next: types.Size) bool {
+    return !std.meta.eql(current, next);
+}
+
 test "role lifecycle has explicit hook and ownership seams" {
     try std.testing.expect(@sizeOf(Runtime) > 0);
     _ = Runtime.reconcile;
+}
+
+test "shell extent changes require fresh presentation ownership" {
+    try std.testing.expect(!shellExtentChanged(
+        .{ .width = 1920, .height = 1080 },
+        .{ .width = 1920, .height = 1080 },
+    ));
+    try std.testing.expect(shellExtentChanged(
+        .{ .width = 1920, .height = 1080 },
+        .{ .width = 2560, .height = 1440 },
+    ));
 }
