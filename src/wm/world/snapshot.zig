@@ -1,8 +1,8 @@
 //! Borrowed views and explicitly owned checkpoints over a WM World.
 
 const std = @import("std");
-const ids = @import("ids.zig");
-const types = @import("types.zig");
+const ids = @import("../ids.zig");
+const types = @import("../types.zig");
 
 pub fn View(comptime World: type) type {
     return struct {

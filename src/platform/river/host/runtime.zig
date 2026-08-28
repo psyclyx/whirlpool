@@ -12,11 +12,9 @@ const wm = @import("whirlpool-wm");
 const live = @import("whirlpool-river-live");
 const plans = @import("whirlpool-river-live-plans");
 const world = @import("whirlpool-river-live-world");
-pub const policy_runtime = @import("policy_runtime.zig");
-pub const layout_runtime = @import("layout_runtime.zig");
-pub const configured_actions = @import("configured_actions.zig");
-const listeners = @import("host_runtime/listeners.zig");
-const SurfaceQueue = @import("host_runtime/surface_queue.zig").Queue;
+const configured_actions = @import("runtime/actions.zig");
+const listeners = @import("runtime/listeners.zig");
+const SurfaceQueue = @import("runtime/surface_queue.zig").Queue;
 
 const types = host.types;
 const coordinator = host.river_coordinator;
@@ -136,21 +134,6 @@ pub const Runtime = struct {
 
     pub fn setDriver(self: *Runtime, driver: Driver) void {
         self.driver = driver;
-    }
-
-    pub fn setPolicy(self: *Runtime, policy: *policy_runtime.Runtime) void {
-        self.options.policy = .{
-            .context = @ptrCast(policy),
-            .budget = .{ .max_steps = policy.limits.max_instructions },
-            .run = policy_runtime.Runtime.runHook,
-        };
-    }
-
-    pub fn setLayout(self: *Runtime, layout: *layout_runtime.Runtime) void {
-        self.options.layout = .{
-            .context = @ptrCast(layout),
-            .build = layout_runtime.Runtime.buildHook,
-        };
     }
 
     pub fn setConfig(self: *Runtime, config: *const script.config.Config) !void {

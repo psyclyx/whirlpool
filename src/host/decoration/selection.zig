@@ -1,8 +1,8 @@
-//! Pure WM-driven server-decoration selection and lifetime reconciliation.
+//! Pure WM-driven server-decoration selection.
 
 const std = @import("std");
 const wm = @import("whirlpool-wm");
-const types = @import("whirlpool-host").types;
+const types = @import("../types.zig");
 
 pub const Selection = struct {
     output: types.OutputId,
@@ -59,63 +59,3 @@ pub const SelectionSet = struct {
         for (node.children.items) |child| try collectLeaves(allocator, world, child.id, output, context, resolve_window, result);
     }
 };
-
-pub const Lifetime = struct {
-    active: std.AutoHashMap(types.WindowId, void),
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) Lifetime {
-        return .{ .allocator = allocator, .active = .init(allocator) };
-    }
-    pub fn deinit(self: *Lifetime) void {
-        self.active.deinit();
-        self.* = undefined;
-    }
-    pub fn reconcile(self: *Lifetime, selected: []const types.WindowId, create: *const fn (?*anyopaque, types.WindowId) anyerror!void, destroy: *const fn (?*anyopaque, types.WindowId) anyerror!void, context: ?*anyopaque) !void {
-        for (selected) |window| if (!self.active.contains(window)) {
-            try create(context, window);
-            self.active.put(window, {}) catch |err| {
-                destroy(context, window) catch {};
-                return err;
-            };
-        };
-        var remove = std.ArrayList(types.WindowId).empty;
-        defer remove.deinit(self.allocator);
-        var iterator = self.active.keyIterator();
-        while (iterator.next()) |window| {
-            var found = false;
-            for (selected) |candidate| if (candidate.value == window.value) {
-                found = true;
-                break;
-            };
-            if (!found) try remove.append(self.allocator, window.*);
-        }
-        for (remove.items) |window| {
-            try destroy(context, window);
-            _ = self.active.remove(window);
-        }
-    }
-};
-
-test "lifetime reconciles visible tiled leaves and tears down stale roles" {
-    var lifetime = Lifetime.init(std.testing.allocator);
-    defer lifetime.deinit();
-    const Counter = struct { created: usize = 0, destroyed: usize = 0 };
-    var counter = Counter{};
-    const create = struct {
-        fn f(raw: ?*anyopaque, _: types.WindowId) !void {
-            @as(*Counter, @ptrCast(@alignCast(raw.?))).created += 1;
-        }
-    }.f;
-    const destroy = struct {
-        fn f(raw: ?*anyopaque, _: types.WindowId) !void {
-            @as(*Counter, @ptrCast(@alignCast(raw.?))).destroyed += 1;
-        }
-    }.f;
-    const first = types.WindowId.init(1);
-    const second = types.WindowId.init(2);
-    try lifetime.reconcile(&.{ first, second }, create, destroy, &counter);
-    try lifetime.reconcile(&.{second}, create, destroy, &counter);
-    try std.testing.expectEqual(@as(usize, 2), counter.created);
-    try std.testing.expectEqual(@as(usize, 1), counter.destroyed);
-}

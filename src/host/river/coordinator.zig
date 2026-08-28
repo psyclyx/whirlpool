@@ -5,7 +5,7 @@
 //! UI, or graphics implementations.
 
 const std = @import("std");
-const types = @import("types.zig");
+const types = @import("../types.zig");
 
 pub const SurfaceRole = union(enum) {
     shell: types.ShellSurfaceId,

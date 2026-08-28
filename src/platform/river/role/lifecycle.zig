@@ -41,6 +41,75 @@ const DecorationRecord = struct {
     state: RecordState = .active,
 };
 
+const DecorationLifetime = struct {
+    allocator: std.mem.Allocator,
+    active: std.AutoHashMap(types.WindowId, void),
+
+    fn init(allocator: std.mem.Allocator) DecorationLifetime {
+        return .{ .allocator = allocator, .active = .init(allocator) };
+    }
+
+    fn deinit(self: *DecorationLifetime) void {
+        self.active.deinit();
+        self.* = undefined;
+    }
+
+    fn reconcile(
+        self: *DecorationLifetime,
+        selected: []const types.WindowId,
+        context: ?*anyopaque,
+        create: *const fn (?*anyopaque, types.WindowId) anyerror!void,
+        destroy: *const fn (?*anyopaque, types.WindowId) anyerror!void,
+    ) !void {
+        for (selected) |window| std.debug.assert(window.value != 0);
+        try self.createMissing(selected, context, create, destroy);
+        try self.destroyStale(selected, context, destroy);
+    }
+
+    fn createMissing(
+        self: *DecorationLifetime,
+        selected: []const types.WindowId,
+        context: ?*anyopaque,
+        create: *const fn (?*anyopaque, types.WindowId) anyerror!void,
+        destroy: *const fn (?*anyopaque, types.WindowId) anyerror!void,
+    ) !void {
+        for (selected) |window| {
+            if (self.active.contains(window)) continue;
+            try create(context, window);
+            self.active.put(window, {}) catch |err| {
+                destroy(context, window) catch {};
+                return err;
+            };
+            std.debug.assert(self.active.contains(window));
+        }
+    }
+
+    fn destroyStale(
+        self: *DecorationLifetime,
+        selected: []const types.WindowId,
+        context: ?*anyopaque,
+        destroy: *const fn (?*anyopaque, types.WindowId) anyerror!void,
+    ) !void {
+        var stale = std.ArrayList(types.WindowId).empty;
+        defer stale.deinit(self.allocator);
+        var iterator = self.active.keyIterator();
+        while (iterator.next()) |window| {
+            if (!containsWindow(selected, window.*)) try stale.append(self.allocator, window.*);
+        }
+        for (stale.items) |window| {
+            try destroy(context, window);
+            std.debug.assert(self.active.remove(window));
+            std.debug.assert(!self.active.contains(window));
+        }
+    }
+
+    fn containsWindow(windows: []const types.WindowId, target: types.WindowId) bool {
+        std.debug.assert(target.value != 0);
+        for (windows) |window| if (window.value == target.value) return true;
+        return false;
+    }
+};
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     manager: *live.Manager,
@@ -49,7 +118,7 @@ pub const Runtime = struct {
     hooks: Hooks,
     shells: std.ArrayList(ShellRecord) = .empty,
     decorations: std.ArrayList(DecorationRecord) = .empty,
-    decoration_lifetime: world.decoration_lifecycle.Lifetime,
+    decoration_lifetime: DecorationLifetime,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -105,7 +174,7 @@ pub const Runtime = struct {
         var selected = std.ArrayList(types.WindowId).empty;
         defer selected.deinit(self.allocator);
         for (selection.outputs.items) |output| try selected.appendSlice(self.allocator, output.windows);
-        try self.decoration_lifetime.reconcile(selected.items, createDecoration, destroyDecoration, self);
+        try self.decoration_lifetime.reconcile(selected.items, self, createDecoration, destroyDecoration);
         try self.advanceDecorationRetirements();
     }
 

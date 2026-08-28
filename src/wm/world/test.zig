@@ -1,8 +1,8 @@
 //! Behavioral tests for the authoritative World transaction boundary.
 
 const std = @import("std");
-const types = @import("types.zig");
-const world_mod = @import("world.zig");
+const types = @import("../types.zig");
+const world_mod = @import("../world.zig");
 
 const World = world_mod.World;
 const WindowId = world_mod.WindowId;

@@ -6,15 +6,16 @@
 //! UI or graphics APIs.
 
 pub const types = @import("types.zig");
-pub const proxy_maps = @import("proxy_maps.zig");
-pub const staged_facts = @import("staged_facts.zig");
+pub const proxy_maps = @import("proxy/maps.zig");
+pub const staged_facts = @import("staged/facts.zig");
 pub const phase = @import("phase.zig");
-pub const wm_bridge = @import("wm_bridge.zig");
+pub const wm_bridge = @import("wm/bridge.zig");
 pub const composition = @import("composition.zig");
-pub const skia_scene = @import("skia_scene.zig");
-pub const lua_composition = @import("lua_composition.zig");
-pub const surface_composition = @import("surface_composition.zig");
-pub const river_coordinator = @import("river_coordinator.zig");
+pub const decoration_selection = @import("decoration/selection.zig");
+pub const skia_scene = @import("skia/scene.zig");
+pub const lua_composition = @import("lua/composition.zig");
+pub const surface_composition = @import("surface/composition.zig");
+pub const river_coordinator = @import("river/coordinator.zig");
 
 test {
     _ = types;
@@ -23,6 +24,7 @@ test {
     _ = phase;
     _ = wm_bridge;
     _ = composition;
+    _ = decoration_selection;
     _ = skia_scene;
     _ = lua_composition;
     _ = surface_composition;

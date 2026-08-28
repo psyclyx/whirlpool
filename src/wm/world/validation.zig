@@ -1,8 +1,8 @@
 //! Whole-world invariants and validation for the authoritative WM state.
 
 const std = @import("std");
-const ids = @import("ids.zig");
-const types = @import("types.zig");
+const ids = @import("../ids.zig");
+const types = @import("../types.zig");
 
 const NodeId = ids.NodeId;
 const WindowId = ids.WindowId;

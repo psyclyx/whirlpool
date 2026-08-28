@@ -67,7 +67,7 @@ pub const ResizeAction = input.ResizeAction;
 pub const planAction = input.planAction;
 
 test {
-    _ = @import("world_test.zig");
+    _ = @import("world/test.zig");
     _ = @import("ids.zig");
     _ = @import("types.zig");
     _ = @import("command.zig");

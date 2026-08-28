@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     wayland_client.linkSystemLibrary("wayland-client", .{});
 
     const wayland_layer_shell = b.addModule("whirlpool-wayland-layer-shell", .{
-        .root_source_file = b.path("src/platform/wayland/layer_shell.zig"),
+        .root_source_file = b.path("src/platform/wayland/layer/shell.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -107,7 +107,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const wayland_wsi = b.addModule("whirlpool-wayland-wsi", .{
-        .root_source_file = b.path("src/graphics/wayland_wsi.zig"),
+        .root_source_file = b.path("src/graphics/wayland/wsi.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const wayland_surface_presenter = b.addModule("whirlpool-wayland-surface-presenter", .{
-        .root_source_file = b.path("src/platform/wayland/surface_presenter.zig"),
+        .root_source_file = b.path("src/platform/wayland/surface/presenter.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -139,7 +139,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const wayland_layer_runtime = b.addModule("whirlpool-wayland-layer-runtime", .{
-        .root_source_file = b.path("src/platform/wayland/layer_runtime.zig"),
+        .root_source_file = b.path("src/platform/wayland/layer/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -167,7 +167,7 @@ pub fn build(b: *std.Build) void {
     wayland_runtime.linkSystemLibrary("wayland-client", .{});
 
     const river_layer_shell = b.addModule("whirlpool-river-layer-shell", .{
-        .root_source_file = b.path("src/platform/river/layer_shell.zig"),
+        .root_source_file = b.path("src/platform/river/layer/shell.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -191,7 +191,7 @@ pub fn build(b: *std.Build) void {
     });
     river_live.linkSystemLibrary("wayland-client", .{});
     const river_live_plans = b.addModule("whirlpool-river-live-plans", .{
-        .root_source_file = b.path("src/platform/river/live_plans.zig"),
+        .root_source_file = b.path("src/platform/river/live/plans.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -204,7 +204,7 @@ pub fn build(b: *std.Build) void {
     });
     river_live_plans.linkSystemLibrary("wayland-client", .{});
     const river_live_world = b.addModule("whirlpool-river-live-world", .{
-        .root_source_file = b.path("src/platform/river/live_world.zig"),
+        .root_source_file = b.path("src/platform/river/live/world.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -216,7 +216,17 @@ pub fn build(b: *std.Build) void {
     });
     river_live_world.linkSystemLibrary("wayland-client", .{});
     const river_layout_runtime = b.addModule("whirlpool-river-layout-runtime", .{
-        .root_source_file = b.path("src/platform/river/layout_runtime.zig"),
+        .root_source_file = b.path("src/platform/river/layout/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "whirlpool-script", .module = script },
+            .{ .name = "whirlpool-wm", .module = wm },
+        },
+    });
+    const river_policy_runtime = b.addModule("whirlpool-river-policy-runtime", .{
+        .root_source_file = b.path("src/platform/river/policy/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -226,7 +236,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const river_host_runtime = b.addModule("whirlpool-river-host-runtime", .{
-        .root_source_file = b.path("src/platform/river/host_runtime.zig"),
+        .root_source_file = b.path("src/platform/river/host/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -242,7 +252,7 @@ pub fn build(b: *std.Build) void {
     });
     river_host_runtime.linkSystemLibrary("wayland-client", .{});
     const river_role_lifecycle = b.addModule("whirlpool-river-role-lifecycle", .{
-        .root_source_file = b.path("src/platform/river/role_lifecycle.zig"),
+        .root_source_file = b.path("src/platform/river/role/lifecycle.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -260,7 +270,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const river_presenter_runtime = b.addModule("whirlpool-river-presenter-runtime", .{
-        .root_source_file = b.path("src/platform/river/presenter_runtime.zig"),
+        .root_source_file = b.path("src/platform/river/presenter/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -298,6 +308,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "whirlpool-river-live-plans", .module = river_live_plans },
                 .{ .name = "whirlpool-river-live-world", .module = river_live_world },
                 .{ .name = "whirlpool-river-host-runtime", .module = river_host_runtime },
+                .{ .name = "whirlpool-river-layout-runtime", .module = river_layout_runtime },
+                .{ .name = "whirlpool-river-policy-runtime", .module = river_policy_runtime },
                 .{ .name = "whirlpool-river-role-lifecycle", .module = river_role_lifecycle },
                 .{ .name = "whirlpool-river-presentation", .module = river_presentation },
                 .{ .name = "whirlpool-river-presenter-runtime", .module = river_presenter_runtime },
@@ -339,13 +351,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_live_plans })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_live_world })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_layout_runtime })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_policy_runtime })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_host_runtime })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_role_lifecycle })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_presentation })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_presenter_runtime })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/script/lua_vm.zig"),
+            .root_source_file = b.path("src/script/lua/vm.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -353,7 +366,7 @@ pub fn build(b: *std.Build) void {
     })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/platform/wayland/event_loop.zig"),
+            .root_source_file = b.path("src/platform/wayland/event/loop.zig"),
             .target = target,
             .optimize = optimize,
         }),

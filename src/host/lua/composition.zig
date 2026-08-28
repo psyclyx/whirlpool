@@ -10,7 +10,7 @@ const script = @import("whirlpool-script");
 const lua_program = script.program_loader;
 const ui = @import("whirlpool-ui");
 const graphics = @import("whirlpool-graphics");
-const skia_scene = @import("skia_scene.zig");
+const skia_scene = @import("../skia/scene.zig");
 
 const Allocator = std.mem.Allocator;
 

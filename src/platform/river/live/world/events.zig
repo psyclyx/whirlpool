@@ -2,7 +2,7 @@
 
 const wayland = @import("wayland");
 const host = @import("whirlpool-host");
-const live_objects = @import("../live_objects.zig");
+const live_objects = @import("../objects.zig");
 
 const types = host.types;
 

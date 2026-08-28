@@ -4,10 +4,10 @@ const std = @import("std");
 const ids = @import("ids.zig");
 const types = @import("types.zig");
 const command = @import("command.zig");
-const snapshot_mod = @import("world_snapshot.zig");
-const world_policy = @import("world_policy.zig");
-const world_tree = @import("world_tree.zig");
-const validation = @import("world_validation.zig");
+const snapshot_mod = @import("world/snapshot.zig");
+const world_policy = @import("world/policy.zig");
+const world_tree = @import("world/tree.zig");
+const validation = @import("world/validation.zig");
 
 pub const WindowId = ids.WindowId;
 pub const OutputId = ids.OutputId;

@@ -7,7 +7,7 @@
 const std = @import("std");
 const script = @import("whirlpool-script");
 const lua_stdlib = @import("whirlpool-lua-stdlib");
-const lua_composition = @import("lua_composition.zig");
+const lua_composition = @import("../lua/composition.zig");
 
 pub const Composition = struct {
     vm: script.program_loader.Vm,
@@ -43,7 +43,7 @@ pub const Composition = struct {
 
     pub fn snapshotAndLower(
         self: *Composition,
-        viewport: @import("skia_scene.zig").Viewport,
+        viewport: @import("../skia/scene.zig").Viewport,
     ) !lua_composition.Frame {
         return self.retained.snapshotAndLower(viewport);
     }

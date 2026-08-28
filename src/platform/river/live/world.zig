@@ -21,11 +21,10 @@ const types = host.types;
 const staged_facts = host.staged_facts;
 const composition = host.composition;
 const wm_bridge = host.wm_bridge;
-pub const input_intents = @import("input_intents.zig");
-pub const decoration_lifecycle = @import("decoration_lifecycle.zig");
-pub const live_objects = @import("live_objects.zig");
-pub const events = @import("live_world/events.zig");
-const reconcile = @import("live_world/reconcile.zig");
+pub const input_intents = @import("world/input.zig");
+pub const live_objects = @import("objects.zig");
+pub const events = @import("world/events.zig");
+const reconcile = @import("world/reconcile.zig");
 
 pub const Error = error{
     AdapterPoisoned,
@@ -207,8 +206,8 @@ pub const Adapter = struct {
         try self.input_queue.append(.{ .action = action, .source = .{ .decoration = decoration }, .seat = seat, .window = window, .position = position });
     }
 
-    pub fn visibleTiledDecorationSelection(self: *const Adapter) !decoration_lifecycle.SelectionSet {
-        return decoration_lifecycle.SelectionSet.fromWorld(self.allocator, &self.world, self.objects.output_order.items, @ptrCast(@constCast(self)), resolveSelectionOutput, resolveSelectionWindow);
+    pub fn visibleTiledDecorationSelection(self: *const Adapter) !host.decoration_selection.SelectionSet {
+        return host.decoration_selection.SelectionSet.fromWorld(self.allocator, &self.world, self.objects.output_order.items, @ptrCast(@constCast(self)), resolveSelectionOutput, resolveSelectionWindow);
     }
 
     pub fn isPoisoned(self: *const Adapter) bool {

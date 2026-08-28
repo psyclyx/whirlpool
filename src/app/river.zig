@@ -7,10 +7,12 @@ const wayland_client = @import("whirlpool-wayland-client");
 const wayland_runtime = @import("whirlpool-wayland-runtime");
 const river_live = @import("whirlpool-river-live");
 const river_host_runtime = @import("whirlpool-river-host-runtime");
+const river_layout_runtime = @import("whirlpool-river-layout-runtime");
+const river_policy_runtime = @import("whirlpool-river-policy-runtime");
 const river_keybindings = @import("whirlpool-river-keybindings");
 const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
 const river_presenter_runtime = @import("whirlpool-river-presenter-runtime");
-const presentation_app = @import("river_presentation.zig");
+const presentation_app = @import("river/presentation.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !void {
     var config: ?script.config.Config = null;
@@ -34,23 +36,33 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
         keybindings_active = true;
     }
 
-    var policy = river_host_runtime.policy_runtime.Runtime.initDefault(allocator) catch |err| blk: {
+    var policy = river_policy_runtime.Runtime.initDefault(allocator) catch |err| blk: {
         std.log.err("River Lua policy disabled: {s}", .{@errorName(err)});
         break :blk null;
     };
     defer if (policy) |*loaded| loaded.deinit();
-    var host_runtime = river_host_runtime.Runtime.init(allocator);
-    var host_runtime_live = true;
-    defer if (host_runtime_live) host_runtime.deinit();
-    var layout_storage: river_host_runtime.layout_runtime.Runtime = undefined;
+    var layout_storage: river_layout_runtime.Runtime = undefined;
     var layout_active = false;
     defer if (layout_active) layout_storage.deinit();
-    var spawn_context = SpawnContext{ .io = io };
-    if (policy) |*loaded| host_runtime.setPolicy(loaded);
+    var runtime_options: river_host_runtime.Options = .{};
+    if (policy) |*loaded| runtime_options.policy = .{
+        .context = @ptrCast(loaded),
+        .budget = .{ .max_steps = loaded.limits.max_instructions },
+        .run = river_policy_runtime.Runtime.runHook,
+    };
     if (config) |*value| {
-        layout_storage = try river_host_runtime.layout_runtime.Runtime.init(allocator, value.layout_source, .{});
+        layout_storage = try river_layout_runtime.Runtime.init(allocator, value.layout_source, .{});
         layout_active = true;
-        host_runtime.setLayout(&layout_storage);
+        runtime_options.layout = .{
+            .context = @ptrCast(&layout_storage),
+            .build = river_layout_runtime.Runtime.buildHook,
+        };
+    }
+    var host_runtime = river_host_runtime.Runtime.initWithOptions(allocator, runtime_options);
+    var host_runtime_live = true;
+    defer if (host_runtime_live) host_runtime.deinit();
+    var spawn_context = SpawnContext{ .io = io };
+    if (config) |*value| {
         try host_runtime.setConfig(value);
         try host_runtime.setSeatHook(.{ .context = @ptrCast(&keybindings_storage), .run = onConfiguredSeat });
         try host_runtime.setManageHook(.{ .context = @ptrCast(&keybindings_storage), .run = onConfiguredManage });

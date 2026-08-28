@@ -1,11 +1,11 @@
 //! Geometry, placement, tag, mark, output, and transfer policy mutations.
 
 const std = @import("std");
-const ids = @import("ids.zig");
-const types = @import("types.zig");
-const command = @import("command.zig");
-const validation = @import("world_validation.zig");
-const world_tree = @import("world_tree.zig");
+const ids = @import("../ids.zig");
+const types = @import("../types.zig");
+const command = @import("../command.zig");
+const validation = @import("validation.zig");
+const world_tree = @import("tree.zig");
 
 const WindowId = ids.WindowId;
 const OutputId = ids.OutputId;
