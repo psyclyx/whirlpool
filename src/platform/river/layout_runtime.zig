@@ -1,0 +1,519 @@
+//! Bounded Lua snapshot-to-layout-plan execution.
+//!
+//! The VM sees immutable protocol-free values and returns generic geometry.
+//! It cannot call Wayland or mutate the authoritative WM world.
+
+const std = @import("std");
+const script = @import("whirlpool-script");
+const wm = @import("whirlpool-wm");
+
+pub const Limits = struct {
+    max_instructions: u64 = 200_000,
+    hook_granularity: u32 = 100,
+    max_entries: usize = 4096,
+    max_depth: usize = 256,
+};
+
+pub const Runtime = struct {
+    allocator: std.mem.Allocator,
+    vm: script.lua_vm.Vm,
+    limits: Limits,
+    instructions: u64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, source: []const u8, limits: Limits) !Runtime {
+        if (source.len == 0 or source.len > script.config.MaxLayoutSourceBytes)
+            return error.InvalidLayoutSource;
+        const vm = try script.lua_vm.Vm.init(true);
+        var self: Runtime = .{
+            .allocator = allocator,
+            .vm = vm,
+            .limits = limits,
+        };
+        errdefer self.vm.deinit();
+        var chunk = std.ArrayList(u8).empty;
+        defer chunk.deinit(allocator);
+        try chunk.appendSlice(allocator, "local provider = (function()\n");
+        try chunk.appendSlice(allocator, source);
+        try chunk.appendSlice(
+            allocator,
+            "\nend)()\nassert(type(provider) == 'function', 'layout module must return a function')\nwhirlpool_layout_provider = provider",
+        );
+        self.instructions = 0;
+        try self.vm.setInstructionHook(instructionHook, &self, limits.hook_granularity);
+        defer self.vm.clearInstructionHook();
+        try self.vm.run(chunk.items, "=whirlpool.layout.provider");
+        return self;
+    }
+
+    pub fn deinit(self: *Runtime) void {
+        self.vm.clearInstructionHook();
+        self.vm.deinit();
+        self.* = undefined;
+    }
+
+    pub fn build(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        snapshot: *const wm.WorldView,
+        output: wm.OutputId,
+        sampled_camera: f32,
+    ) !wm.LayoutPlans {
+        if (!std.math.isFinite(sampled_camera)) return error.InvalidCamera;
+        defer self.vm.setTop(0);
+        self.vm.getGlobal("whirlpool_layout_provider");
+        if (self.vm.luaType(-1) != .function) return error.InvalidLayoutSource;
+        var count: usize = 0;
+        try pushSnapshot(&self.vm, snapshot, output, &count, self.limits, 0);
+        self.vm.pushNumber(sampled_camera);
+
+        self.instructions = 0;
+        try self.vm.setInstructionHook(instructionHook, self, self.limits.hook_granularity);
+        defer self.vm.clearInstructionHook();
+        try self.vm.call(2, 1);
+        return parsePlans(allocator, &self.vm, snapshot, output, self.limits.max_entries);
+    }
+
+    pub fn buildHook(
+        raw: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        snapshot: *const wm.WorldView,
+        output: wm.OutputId,
+        sampled_camera: f32,
+    ) anyerror!wm.LayoutPlans {
+        const self: *Runtime = @ptrCast(@alignCast(raw orelse return error.MissingLayoutRuntime));
+        return self.build(allocator, snapshot, output, sampled_camera);
+    }
+
+    fn instructionHook(raw: ?*anyopaque, amount: u64) callconv(.c) bool {
+        const self: *Runtime = @ptrCast(@alignCast(raw.?));
+        self.instructions = std.math.add(u64, self.instructions, amount) catch return false;
+        return self.instructions <= self.limits.max_instructions;
+    }
+};
+
+fn pushSnapshot(
+    vm: *script.lua_vm.Vm,
+    snapshot: *const wm.WorldView,
+    output_id: wm.OutputId,
+    count: *usize,
+    limits: Limits,
+    depth: usize,
+) !void {
+    const output = snapshot.getOutput(output_id) orelse return error.UnknownOutput;
+    const tag = snapshot.getTag(output.active_tag) orelse return error.InvalidInvariant;
+    vm.createTable(0, 3);
+    try setId(vm, "epoch", snapshot.epoch());
+
+    vm.createTable(0, 2);
+    try setId(vm, "id", output_id.raw());
+    vm.createTable(0, 4);
+    setInteger(vm, "x", output.usable.x);
+    setInteger(vm, "y", output.usable.y);
+    setInteger(vm, "width", output.usable.width);
+    setInteger(vm, "height", output.usable.height);
+    vm.setField(-2, "usable");
+    vm.setField(-2, "output");
+
+    vm.createTable(0, 4);
+    try setId(vm, "id", tag.id.raw());
+    if (tag.focused) |focused| {
+        try setId(vm, "focused", focused.raw());
+    } else {
+        vm.pushNil();
+        vm.setField(-2, "focused");
+    }
+    vm.createTable(0, 2);
+    setNumber(vm, "current", tag.camera.current);
+    setNumber(vm, "target", tag.camera.target);
+    vm.setField(-2, "camera");
+    vm.createTable(tag.columns.items.len, 0);
+    for (tag.columns.items, 0..) |column_id, index| {
+        const column = snapshot.getColumn(column_id) orelse return error.InvalidInvariant;
+        vm.createTable(0, 3);
+        try setId(vm, "id", column.id.raw());
+        setNumber(vm, "width", column.width);
+        if (column.root) |root| {
+            try pushNode(vm, snapshot, root, count, limits, depth + 1);
+        } else vm.pushNil();
+        vm.setField(-2, "root");
+        vm.rawSetInteger(-2, @intCast(index + 1));
+    }
+    vm.setField(-2, "columns");
+    vm.setField(-2, "tag");
+}
+
+fn pushNode(
+    vm: *script.lua_vm.Vm,
+    snapshot: *const wm.WorldView,
+    node_id: wm.NodeId,
+    count: *usize,
+    limits: Limits,
+    depth: usize,
+) !void {
+    if (depth > limits.max_depth) return error.LayoutTreeTooDeep;
+    count.* += 1;
+    if (count.* > limits.max_entries) return error.LayoutNodeLimitExceeded;
+    const node = snapshot.getNode(node_id) orelse return error.InvalidInvariant;
+    vm.createTable(0, 6);
+    try setId(vm, "id", node.id.raw());
+    try setId(vm, "column", node.column.raw());
+    setString(vm, "axis", @tagName(node.axis));
+    setInteger(vm, "active", node.active_child + 1);
+    if (node.window) |window_id| {
+        const window = snapshot.getWindow(window_id) orelse return error.InvalidInvariant;
+        vm.createTable(0, 4);
+        try setId(vm, "id", window.id.raw());
+        setString(vm, "placement", @tagName(window.placement));
+        setString(vm, "lifecycle", @tagName(window.lifecycle));
+        try setId(vm, "focus_serial", window.focus_serial);
+        vm.setField(-2, "window");
+        vm.createTable(0, 0);
+        vm.setField(-2, "children");
+        return;
+    }
+    setString(vm, "mode", @tagName(node.mode orelse return error.InvalidInvariant));
+    vm.createTable(node.children.items.len, 0);
+    for (node.children.items, 0..) |child, index| {
+        vm.createTable(0, 2);
+        setNumber(vm, "weight", child.weight);
+        try pushNode(vm, snapshot, child.id, count, limits, depth + 1);
+        vm.setField(-2, "node");
+        vm.rawSetInteger(-2, @intCast(index + 1));
+    }
+    vm.setField(-2, "children");
+}
+
+fn setId(vm: *script.lua_vm.Vm, comptime name: [:0]const u8, value: u64) !void {
+    vm.pushInteger(std.math.cast(i64, value) orelse return error.LayoutIdentityOverflow);
+    vm.setField(-2, name);
+}
+
+fn setInteger(vm: *script.lua_vm.Vm, comptime name: [:0]const u8, value: anytype) void {
+    vm.pushInteger(@intCast(value));
+    vm.setField(-2, name);
+}
+
+fn setNumber(vm: *script.lua_vm.Vm, comptime name: [:0]const u8, value: anytype) void {
+    vm.pushNumber(@floatCast(value));
+    vm.setField(-2, name);
+}
+
+fn setString(vm: *script.lua_vm.Vm, comptime name: [:0]const u8, value: []const u8) void {
+    vm.pushString(value);
+    vm.setField(-2, name);
+}
+
+fn parsePlans(
+    allocator: std.mem.Allocator,
+    vm: *script.lua_vm.Vm,
+    snapshot: *const wm.WorldView,
+    output: wm.OutputId,
+    max_entries: usize,
+) !wm.LayoutPlans {
+    if (vm.luaType(-1) != .table) return error.InvalidLayoutPlan;
+    const epoch = try integerField(u64, vm, -1, "epoch");
+    if (epoch != snapshot.epoch()) return error.PlanEpochMismatch;
+    const tag = try idField(wm.TagId, vm, -1, "tag");
+    const current = try numberField(vm, -1, "camera_current");
+    const target = try numberField(vm, -1, "camera_target");
+    const strip_width = try numberField(vm, -1, "strip_width");
+    if (!std.math.isFinite(current) or !std.math.isFinite(target) or !std.math.isFinite(strip_width) or strip_width < 0)
+        return error.InvalidLayoutPlan;
+    const camera: wm.CameraTarget = .{ .tag = tag, .current = current, .target = target, .strip_width = strip_width };
+    var plans: wm.LayoutPlans = .{
+        .manage = .{ .context = .{ .allocator = allocator, .epoch = epoch, .output = output, .camera = camera } },
+        .render = .{ .context = .{ .allocator = allocator, .epoch = epoch, .output = output, .camera = camera } },
+    };
+    errdefer plans.deinit();
+
+    const base: c_int = @intCast(vm.stackDepth());
+    vm.getField(-1, "entries");
+    if (vm.luaType(-1) != .table) return error.InvalidLayoutPlan;
+    const count = vm.rawLength(-1);
+    if (count > max_entries) return error.LayoutEntryLimitExceeded;
+    try plans.manage.dimensions.ensureTotalCapacity(allocator, count);
+    try plans.render.entries.ensureTotalCapacity(allocator, count);
+    for (0..count) |index| {
+        vm.rawGetInteger(-1, @intCast(index + 1));
+        if (vm.luaType(-1) != .table) return error.InvalidLayoutPlan;
+        const entry_index: c_int = @intCast(vm.stackDepth());
+        const window = try idField(wm.WindowId, vm, -1, "window");
+        const column = try idField(wm.ColumnId, vm, -1, "column");
+        _ = snapshot.getWindow(window) orelse return error.InvalidLayoutPlan;
+        _ = snapshot.getColumn(column) orelse return error.InvalidLayoutPlan;
+        const placement_name = try stringField(vm, -1, "placement");
+        const placement = std.meta.stringToEnum(wm.Placement, placement_name) orelse return error.InvalidLayoutPlan;
+        const virtual = try floatRectField(vm, -1, "virtual");
+        const screen = try rectField(vm, -1, "screen");
+        const clip = try rectField(vm, -1, "clip");
+        const visible = try boolField(vm, -1, "visible");
+        const propose = try boolField(vm, -1, "propose");
+        plans.render.entries.appendAssumeCapacity(.{
+            .window = window,
+            .column = column,
+            .placement = placement,
+            .target_virtual = virtual,
+            .screen = screen,
+            .clip = clip,
+            .visible = visible,
+        });
+        if (propose) plans.manage.dimensions.appendAssumeCapacity(.{
+            .window = window,
+            .column = column,
+            .size = .{
+                .width = @max(@as(u32, 1), @as(u32, @intFromFloat(@ceil(@max(virtual.width, 1))))),
+                .height = @max(@as(u32, 1), @as(u32, @intFromFloat(@ceil(@max(virtual.height, 1))))),
+            },
+            .virtual = virtual,
+        });
+        vm.setTop(entry_index - 1);
+    }
+    vm.setTop(base);
+    return plans;
+}
+
+fn fieldBase(vm: *script.lua_vm.Vm) c_int {
+    return @intCast(vm.stackDepth());
+}
+
+fn integerField(comptime T: type, vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8) !T {
+    const base = fieldBase(vm);
+    vm.getField(index, name);
+    defer vm.setTop(base);
+    const value = vm.integer(-1) orelse return error.InvalidLayoutPlan;
+    return std.math.cast(T, value) orelse error.InvalidLayoutPlan;
+}
+
+fn idField(comptime T: type, vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8) !T {
+    const raw = try integerField(u64, vm, index, name);
+    const value: T = @bitCast(raw);
+    if (!value.isValid()) return error.InvalidLayoutPlan;
+    return value;
+}
+
+fn numberField(vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8) !f32 {
+    const base = fieldBase(vm);
+    vm.getField(index, name);
+    defer vm.setTop(base);
+    const value = vm.number(-1) orelse return error.InvalidLayoutPlan;
+    return @floatCast(value);
+}
+
+fn stringField(vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8) ![]const u8 {
+    const base = fieldBase(vm);
+    vm.getField(index, name);
+    defer vm.setTop(base);
+    return vm.string(-1) orelse error.InvalidLayoutPlan;
+}
+
+fn boolField(vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8) !bool {
+    const base = fieldBase(vm);
+    vm.getField(index, name);
+    defer vm.setTop(base);
+    return vm.boolean(-1) orelse error.InvalidLayoutPlan;
+}
+
+fn floatRectField(vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8) !wm.FRect {
+    const base = fieldBase(vm);
+    vm.getField(index, name);
+    defer vm.setTop(base);
+    if (vm.luaType(-1) != .table) return error.InvalidLayoutPlan;
+    const value: wm.FRect = .{
+        .x = try numberField(vm, -1, "x"),
+        .y = try numberField(vm, -1, "y"),
+        .width = try numberField(vm, -1, "width"),
+        .height = try numberField(vm, -1, "height"),
+    };
+    if (!std.math.isFinite(value.x) or !std.math.isFinite(value.y) or
+        !std.math.isFinite(value.width) or !std.math.isFinite(value.height) or
+        value.width < 0 or value.height < 0) return error.InvalidLayoutPlan;
+    return value;
+}
+
+fn rectField(vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8) !wm.Rect {
+    const base = fieldBase(vm);
+    vm.getField(index, name);
+    defer vm.setTop(base);
+    if (vm.luaType(-1) != .table) return error.InvalidLayoutPlan;
+    return .{
+        .x = try integerField(i32, vm, -1, "x"),
+        .y = try integerField(i32, vm, -1, "y"),
+        .width = try integerField(u32, vm, -1, "width"),
+        .height = try integerField(u32, vm, -1, "height"),
+    };
+}
+
+test "bounded Lua provider turns an immutable snapshot into generic plans" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 10, .y = 20, .width = 300, .height = 200 },
+        .usable = .{ .x = 10, .y = 20, .width = 300, .height = 200 },
+    });
+    const column = try world.createColumn(tag, .{});
+    const window = try world.createWindow(.{ .tag = tag, .output = output });
+    try world.manageWindow(window, column);
+    const second = try world.createWindow(.{ .tag = tag, .output = output });
+    try world.manageWindow(second, column);
+    var snapshot = world.view();
+
+    var runtime = try Runtime.init(std.testing.allocator,
+        \\return function(snapshot, camera)
+        \\  local column = snapshot.tag.columns[1]
+        \\  local window = column.root.children[1].node.window
+        \\  return {
+        \\    epoch = snapshot.epoch, tag = snapshot.tag.id,
+        \\    camera_current = camera, camera_target = 5, strip_width = 320,
+        \\    entries = {{
+        \\      window = window.id, column = column.id, placement = window.placement,
+        \\      virtual = { x = 0, y = 0, width = 300, height = 200 },
+        \\      screen = { x = 10, y = 20, width = 300, height = 200 },
+        \\      clip = { x = 0, y = 0, width = 300, height = 200 },
+        \\      visible = true, propose = true,
+        \\    }},
+        \\  }
+        \\end
+    , .{});
+    defer runtime.deinit();
+    var plans = try runtime.build(std.testing.allocator, &snapshot, output, 2);
+    defer plans.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plans.manage.dimensions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), plans.render.entries.items.len);
+    try std.testing.expectEqual(window, plans.render.entries.items[0].window);
+    try std.testing.expectEqual(@as(f32, 5), plans.render.context.camera.target);
+}
+
+fn loadScrollingSource(allocator: std.mem.Allocator) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "config/lib/scrolling.lua",
+        allocator,
+        .limited(script.config.MaxLayoutSourceBytes),
+    );
+}
+
+test "sample scrolling provider lays out columns, focuses camera, and clips viewport" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 400, .height = 240 },
+        .usable = .{ .x = 0, .y = 0, .width = 400, .height = 240 },
+    });
+    var windows: [3]wm.WindowId = undefined;
+    for (&windows) |*window| {
+        const column = try world.createColumn(tag, .{ .width = 1 });
+        window.* = try world.createWindow(.{ .tag = tag, .output = output });
+        try world.manageWindow(window.*, column);
+    }
+    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = windows[2] } }});
+    var snapshot = world.view();
+    const source = try loadScrollingSource(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    var plans = try runtime.build(std.testing.allocator, &snapshot, output, 0);
+    defer plans.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), plans.render.entries.items.len);
+    try std.testing.expect(plans.render.context.camera.target > 0);
+    try std.testing.expect(plans.render.context.camera.strip_width > 1200);
+    try std.testing.expectEqual(@as(u32, 388), plans.render.entries.items[0].clip.width);
+    try std.testing.expectEqual(@as(u32, 0), plans.render.entries.items[2].clip.width);
+}
+
+test "sample scrolling provider preserves split geometry and tab visibility" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 1000, .height = 600 },
+        .usable = .{ .x = 0, .y = 0, .width = 1000, .height = 600 },
+    });
+    const column = try world.createColumn(tag, .{ .width = 1 });
+    const first = try world.createWindow(.{ .tag = tag, .output = output });
+    const second = try world.createWindow(.{ .tag = tag, .output = output });
+    try world.manageWindow(first, column);
+    try world.manageWindow(second, column);
+    const root = world.getColumn(column).?.root.?;
+    const first_node = world.nodeForWindow(first).?;
+    _ = try world.applyAtomically(&.{
+        .{ .tree = .{ .set_container_mode = .{ .node = root, .mode = .split, .axis = .horizontal } } },
+        .{ .geometry = .{ .resize_split = .{ .split = root, .child = first_node, .weight = 3 } } },
+    });
+    const source = try loadScrollingSource(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    {
+        var snapshot = world.view();
+        var plans = try runtime.build(std.testing.allocator, &snapshot, output, 0);
+        defer plans.deinit();
+        try std.testing.expectEqual(@as(usize, 2), plans.render.entries.items.len);
+        const first_width = plans.render.entries.items[0].target_virtual.width;
+        const second_width = plans.render.entries.items[1].target_virtual.width;
+        try std.testing.expectApproxEqAbs(@as(f32, 992), first_width + second_width, 0.01);
+        try std.testing.expect(first_width > second_width * 2.9);
+    }
+    _ = try world.applyAtomically(&.{
+        .{ .tree = .{ .set_container_mode = .{ .node = root, .mode = .tabbed, .axis = .horizontal } } },
+        .{ .tree = .{ .set_active_tab = .{ .container = root, .child = world.nodeForWindow(second).? } } },
+    });
+    var snapshot = world.view();
+    var plans = try runtime.build(std.testing.allocator, &snapshot, output, 0);
+    defer plans.deinit();
+    var visible: usize = 0;
+    for (plans.render.entries.items) |entry| visible += @intFromBool(entry.visible);
+    try std.testing.expectEqual(@as(usize, 1), visible);
+    try std.testing.expect(!plans.render.entries.items[0].visible);
+    try std.testing.expect(plans.render.entries.items[1].visible);
+}
+
+test "sample scrolling provider isolates fullscreen from floating and scratchpad" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 10, .y = 20, .width = 500, .height = 300 },
+        .usable = .{ .x = 10, .y = 20, .width = 500, .height = 300 },
+    });
+    var windows: [3]wm.WindowId = undefined;
+    for (&windows) |*window| {
+        const column = try world.createColumn(tag, .{});
+        window.* = try world.createWindow(.{ .tag = tag, .output = output });
+        try world.manageWindow(window.*, column);
+    }
+    _ = try world.applyAtomically(&.{
+        .{ .window = .{ .set_placement = .{ .window = windows[0], .placement = .floating } } },
+        .{ .window = .{ .set_placement = .{ .window = windows[1], .placement = .scratchpad } } },
+        .{ .window = .{ .set_placement = .{ .window = windows[2], .placement = .fullscreen } } },
+        .{ .focus = .{ .window = windows[2] } },
+    });
+    var snapshot = world.view();
+    const source = try loadScrollingSource(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    var plans = try runtime.build(std.testing.allocator, &snapshot, output, 0);
+    defer plans.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), plans.render.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), plans.manage.dimensions.items.len);
+    for (plans.render.entries.items) |entry| {
+        if (entry.window == windows[2]) {
+            try std.testing.expect(entry.visible);
+            try std.testing.expectEqual(@as(f32, 500), entry.target_virtual.width);
+            try std.testing.expectEqual(@as(f32, 300), entry.target_virtual.height);
+            try std.testing.expectEqual(@as(i32, 10), entry.screen.x);
+            try std.testing.expectEqual(@as(i32, 20), entry.screen.y);
+        } else {
+            try std.testing.expect(!entry.visible);
+            try std.testing.expectEqual(@as(u32, 0), entry.clip.width);
+        }
+    }
+}

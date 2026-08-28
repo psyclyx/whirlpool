@@ -1,0 +1,85 @@
+//! Ownership boundary for one retained Lua surface program.
+//!
+//! The descriptor supplies source; this object owns the VM, installed program,
+//! and retained composition. Platform presenters only provide extents and
+//! named service updates.
+
+const std = @import("std");
+const script = @import("whirlpool-script");
+const lua_stdlib = @import("whirlpool-lua-stdlib");
+const lua_composition = @import("lua_composition.zig");
+
+pub const Composition = struct {
+    vm: script.program_loader.Vm,
+    program: script.program_loader.Program,
+    retained: lua_composition.Composition,
+
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) !Composition {
+        var vm = try script.program_loader.Vm.init(true);
+        errdefer vm.deinit();
+
+        const loader = script.program_loader.Loader.init(allocator, .{});
+        const modules = [_]script.program_loader.Module{
+            .{ .name = "surface", .source = source },
+            .{ .name = "whirlpool.workspace", .source = lua_stdlib.workspace },
+        };
+        var program = try loader.load("surface", &modules);
+        errdefer program.deinit();
+
+        const retained = try lua_composition.Composition.mount(allocator, &vm, &program, .{});
+        return .{ .vm = vm, .program = program, .retained = retained };
+    }
+
+    pub fn deinit(self: *Composition) void {
+        self.retained.deinit();
+        self.program.deinit();
+        self.vm.deinit();
+        self.* = undefined;
+    }
+
+    pub fn update(self: *Composition, update_value: script.program_loader.Update) !void {
+        try self.retained.update(&self.vm, &self.program, update_value);
+    }
+
+    pub fn snapshotAndLower(
+        self: *Composition,
+        viewport: @import("skia_scene.zig").Viewport,
+    ) !lua_composition.Frame {
+        return self.retained.snapshotAndLower(viewport);
+    }
+};
+
+test "surface composition mounts retained Lua source" {
+    var composition = try Composition.init(std.testing.allocator,
+        \\return function(root)
+        \\  local label = root:text({ text = 'surface' })
+        \\  return { update = function() label:set('text', 'updated') end }
+        \\end
+    );
+    defer composition.deinit();
+
+    var frame = try composition.snapshotAndLower(.{ .width = 100, .height = 20 });
+    defer frame.deinit();
+    try std.testing.expectEqual(@as(usize, 2), frame.node_count);
+}
+
+test "surface composition exposes the workspace stdlib module" {
+    var composition = try Composition.init(std.testing.allocator,
+        \\return function(root)
+        \\  local Workspace = require('whirlpool.workspace')
+        \\  local workspaces = Workspace.new({ count = 3 })
+        \\  local label = root:text({ text = table.concat(workspaces:labels(), ' ') })
+        \\  return { update = function(_, service, values)
+        \\    if workspaces:update(service, values) then
+        \\      label:set('text', table.concat(workspaces:labels(), ' '))
+        \\    end
+        \\  end }
+        \\end
+    );
+    defer composition.deinit();
+
+    try composition.update(.{ .service = "workspaces", .values = &.{.{ .number = 2 }} });
+    var frame = try composition.snapshotAndLower(.{ .width = 100, .height = 20 });
+    defer frame.deinit();
+    try std.testing.expectEqual(@as(usize, 2), frame.node_count);
+}

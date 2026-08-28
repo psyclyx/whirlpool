@@ -15,11 +15,4 @@ linkFarm "whirlpool-zig-packages" [
       hash = "sha256-6iehxkESzs7BvKnKlq0XqAYzO2lnl4tdiksaKfuKDhA=";
     };
   }
-  {
-    name = "snail-0.17.0-vw75SNx0BAFzdp060Ml4RA5dOUlWLslg9XkuGk6B6oi_";
-    path = fetchzip {
-      url = "https://github.com/psyclyx/snail/archive/refs/tags/v0.17.0.tar.gz";
-      hash = "sha256-1bqXrpODgU1X5z2KiPyH1v+ZtGsDoMR+krgiz9CF+lk=";
-    };
-  }
 ]

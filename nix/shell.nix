@@ -1,7 +1,13 @@
 {
+  fontconfig,
   mkShell,
   harfbuzz,
+  lua5_4,
   pkg-config,
+  shellcheck,
+  shfmt,
+  skia,
+  stdenv,
   wayland,
   wayland-protocols,
   wayland-scanner,
@@ -11,13 +17,19 @@
 }:
 mkShell {
   packages = [
+    fontconfig
     harfbuzz
+    lua5_4
     pkg-config
+    shellcheck
+    shfmt
     wayland
     wayland-protocols
     wayland-scanner
     vulkan-headers
     vulkan-loader
+    skia
+    stdenv.cc.cc.lib
     zig_0_16
   ];
 }

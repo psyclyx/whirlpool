@@ -1,6 +1,7 @@
 const std = @import("std");
 const runtime = @import("whirlpool-runtime");
-const studio = @import("whirlpool-studio");
+const river_app = @import("app/river.zig");
+const layer_shell_app = @import("app/layer_shell.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
@@ -13,19 +14,15 @@ pub fn main(init: std.process.Init) !void {
     while (iterator.next()) |arg| try args.append(allocator, arg);
 
     const options = runtime.parseArgs(args.items) catch {
-        std.log.err("usage: whirlpool [river|studio]", .{});
+        std.log.err("usage: whirlpool [river|layer-shell] [--config PATH]", .{});
         return error.InvalidArguments;
     };
-    const plan = runtime.startupPlan(options);
+    const environment_config = init.minimal.environ.getAlloc(allocator, "WHIRLPOOL_CONFIG") catch null;
+    defer if (environment_config) |path| allocator.free(path);
+    const config_path = options.config_path orelse environment_config;
 
     switch (options.mode) {
-        .river => std.log.info("River host selected (graphics={}, river={})", .{
-            plan.create_graphics_context,
-            plan.bind_river_window_manager,
-        }),
-        .studio => {
-            std.debug.assert(!plan.bind_river_window_manager);
-            try studio.run();
-        },
+        .river => try river_app.run(allocator, init.io, config_path),
+        .layer_shell => try layer_shell_app.run(allocator, init.io, config_path),
     }
 }
