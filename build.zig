@@ -152,6 +152,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     dmabuf_allocator.linkSystemLibrary("gbm", .{});
+    dmabuf_allocator.linkSystemLibrary("vulkan", .{});
 
     const wayland_surface_presenter = b.addModule("whirlpool-wayland-surface-presenter", .{
         .root_source_file = b.path("src/platform/wayland/surface_presenter/root.zig"),

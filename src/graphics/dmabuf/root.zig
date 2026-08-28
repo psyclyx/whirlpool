@@ -11,7 +11,12 @@ const c = @cImport({
     @cInclude("gbm.h");
 });
 
+pub const VulkanContext = @import("vulkan.zig").Context;
+pub const VulkanImage = @import("vulkan.zig").Image;
+
 pub const max_planes = 4;
+pub const argb8888: u32 = 0x3432_5241;
+pub const xrgb8888: u32 = 0x3432_5258;
 pub const modifier_linear: u64 = 0;
 pub const modifier_invalid: u64 = 0x00ff_ffff_ffff_ffff;
 
@@ -28,34 +33,23 @@ pub const Device = struct {
     /// Open the render node identified by Vulkan's DRM properties. This keeps
     /// allocation and rendering on the same physical device on multi-GPU hosts.
     pub fn openRenderNode(render_major: i64, render_minor: i64) !Device {
-        var minor: u32 = 128;
-        while (minor < 192) : (minor += 1) {
-            var path_storage: [64]u8 = undefined;
-            const path = std.fmt.bufPrintZ(&path_storage, "/dev/dri/renderD{d}", .{minor}) catch unreachable;
-            const fd = std.c.open(path.ptr, .{
-                .ACCMODE = .RDWR,
-                .CLOEXEC = true,
-                .NONBLOCK = true,
-            });
-            if (fd < 0) continue;
-            var stat: std.c.Stat = undefined;
-            if (std.c.fstat(fd, &stat) != 0) {
-                _ = std.c.close(fd);
-                continue;
-            }
-            if (deviceMajor(stat.st_rdev) != render_major or
-                deviceMinor(stat.st_rdev) != render_minor)
-            {
-                _ = std.c.close(fd);
-                continue;
-            }
-            const gbm = c.gbm_create_device(fd) orelse {
-                _ = std.c.close(fd);
-                return error.GbmDeviceFailed;
-            };
-            return .{ .fd = fd, .gbm = gbm };
-        }
-        return error.RenderNodeNotFound;
+        // Linux names render nodes by their DRM minor (normally 128+). The
+        // major still must be present so an incomplete Vulkan query is not
+        // silently accepted.
+        if (render_major < 0 or render_minor < 0) return error.InvalidRenderNode;
+        var path_storage: [64]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_storage, "/dev/dri/renderD{d}", .{render_minor}) catch unreachable;
+        const fd = std.c.open(path.ptr, .{
+            .ACCMODE = .RDWR,
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+        });
+        if (fd < 0) return error.RenderNodeNotFound;
+        const gbm = c.gbm_create_device(fd) orelse {
+            _ = std.c.close(fd);
+            return error.GbmDeviceFailed;
+        };
+        return .{ .fd = fd, .gbm = gbm };
     }
 
     pub fn deinit(self: *Device) void {
@@ -131,24 +125,24 @@ pub const Buffer = struct {
     }
 };
 
-// Linux dev_t encoding, equivalent to the glibc major/minor macros.
-fn deviceMajor(device: std.c.dev_t) i64 {
-    const value: u64 = @intCast(device);
-    return @intCast(((value >> 8) & 0xfff) | ((value >> 32) & 0xffff_f000));
+test "Vulkan DMA-BUF owners type check" {
+    try std.testing.expect(@sizeOf(VulkanContext) > 0);
+    try std.testing.expect(@sizeOf(VulkanImage) > 0);
 }
 
-fn deviceMinor(device: std.c.dev_t) i64 {
-    const value: u64 = @intCast(device);
-    return @intCast((value & 0xff) | ((value >> 12) & 0xffff_ff00));
-}
-
-test "Linux device number decoding covers extended major and minor bits" {
-    const major: u64 = 0x12345;
-    const minor: u64 = 0x6789a;
-    const encoded = ((major & 0xfff) << 8) |
-        ((major & 0xffff_f000) << 32) |
-        (minor & 0xff) |
-        ((minor & 0xffff_ff00) << 12);
-    try std.testing.expectEqual(@as(i64, major), deviceMajor(@intCast(encoded)));
-    try std.testing.expectEqual(@as(i64, minor), deviceMinor(@intCast(encoded)));
+test "hardware imports a GBM allocation into Vulkan" {
+    if (std.c.getenv("WHIRLPOOL_DMABUF_TEST") == null) return;
+    const allocator = std.testing.allocator;
+    const context = try VulkanContext.init(allocator);
+    defer context.deinit();
+    const modifiers = try context.supportedModifiers(
+        allocator,
+        @import("vulkan.zig").vk.VK_FORMAT_B8G8R8A8_UNORM,
+    );
+    defer allocator.free(modifiers);
+    try std.testing.expect(modifiers.len > 0);
+    var buffer = try Buffer.init(&context.gbm, 64, 64, argb8888, modifiers);
+    defer buffer.deinit();
+    var image = try VulkanImage.init(context, &buffer);
+    defer image.deinit();
 }
