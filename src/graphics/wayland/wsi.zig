@@ -217,11 +217,26 @@ pub const Swapchain = struct {
     pub fn uploadAndSubmit(self: *Swapchain, frame: graphics.skia.Frame) !void {
         if (self.prepared) return error.FrameAlreadyPrepared;
         if (self.needs_recreate) try self.recreate(frame.width, frame.height);
+        const packed_row = try self.validateFrame(frame);
+        try self.acquireImage();
+        try self.copyFrame(frame, packed_row);
+        try self.recordAndSubmit();
+        self.prepared = true;
+        std.debug.assert(self.image_index < self.images.len);
+    }
+
+    fn validateFrame(self: *const Swapchain, frame: graphics.skia.Frame) !usize {
         if (frame.width != self.extent.width or frame.height != self.extent.height)
             return error.ExtentMismatch;
         const packed_row = try std.math.mul(usize, frame.width, 4);
         if (frame.row_bytes < packed_row) return error.InvalidFrameStride;
+        const required = try std.math.mul(usize, frame.row_bytes, frame.height);
+        if (frame.byte_len < required) return error.InvalidFramePixels;
+        if (self.staging_bytes < packed_row * frame.height) return error.StagingBufferTooSmall;
+        return packed_row;
+    }
 
+    fn acquireImage(self: *Swapchain) !void {
         const fence_status = vk.vkWaitForFences(self.context.device, 1, &self.fence, vk.VK_TRUE, 0);
         if (fence_status == vk.VK_TIMEOUT) return error.NotReady;
         try check(fence_status);
@@ -237,14 +252,23 @@ pub const Swapchain = struct {
         if (acquired == vk.VK_ERROR_OUT_OF_DATE_KHR) return error.SwapchainOutOfDate;
         if (acquired != vk.VK_SUCCESS and acquired != vk.VK_SUBOPTIMAL_KHR)
             return error.VulkanFailed;
+        if (self.image_index >= self.images.len) return error.InvalidImageIndex;
+    }
 
+    fn copyFrame(self: *Swapchain, frame: graphics.skia.Frame, packed_row: usize) !void {
+        std.debug.assert(packed_row <= frame.row_bytes);
+        std.debug.assert(self.staging_bytes >= packed_row * frame.height);
         const mapped: [*]u8 = @ptrCast(self.staging_mapped orelse return error.InvalidMappedMemory);
         for (0..frame.height) |row| {
             const source_offset = row * frame.row_bytes;
             const target_offset = row * packed_row;
             @memcpy(mapped[target_offset..][0..packed_row], frame.pixels[source_offset..][0..packed_row]);
         }
+    }
 
+    fn recordAndSubmit(self: *Swapchain) !void {
+        std.debug.assert(self.image_index < self.images.len);
+        std.debug.assert(self.image_index < self.render_finished.len);
         try check(vk.vkResetFences(self.context.device, 1, &self.fence));
         try check(vk.vkResetCommandBuffer(self.command_buffer, 0));
         const begin_info = vk.VkCommandBufferBeginInfo{
@@ -301,7 +325,6 @@ pub const Swapchain = struct {
             .pSignalSemaphores = &signal,
         };
         try check(vk.vkQueueSubmit(self.context.queue, 1, &submit, self.fence));
-        self.prepared = true;
     }
 
     /// Infallible River commit edge. Out-of-date/suboptimal results are

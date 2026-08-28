@@ -67,75 +67,115 @@ pub fn applyEvent(world: *World, event: Event) !ApplyResult {
     switch (event) {
         .tag_announced => result.announced_tag = try world.createTag(),
         .tag_removed => |tag| _ = try world.applyAtomically(&.{.{ .tag = .{ .remove = tag } }}),
-        .output_announced => |spec| {
-            const output = try world.createOutput(spec);
-            result.announced_output = output;
-            result.focused = try repairFocus(world, output, .preserve);
-        },
-        .output_reconciled => |fact| {
-            try reconcileOutput(world, fact);
-            result.focused = try repairFocus(world, fact.output, .preserve);
-        },
+        .output_announced => |spec| result = try announceOutput(world, spec),
+        .output_reconciled => |fact| result.focused = try updateOutput(world, fact),
         .output_removed => |output| _ = try world.applyAtomically(&.{.{ .output = .{ .remove = output } }}),
         .window_announced => |spec| result.announced_window = try world.createWindow(spec),
         .window_managed => |value| {
-            _ = try world.applyAtomically(&.{.{ .tree = .{ .insert_window = .{ .window = value.window, .column = value.column } } }});
-            result.focused = try repairWindowOutput(world, value.window, .preserve);
+            result.focused = try manageWindow(world, value.window, value.column);
         },
         .window_close_requested => |window| {
-            var before = world.view();
-            const output = try windowOutput(&before, window);
-            const was_focused = try isFocused(&before, window);
-            _ = try world.applyAtomically(&.{.{ .window = .{ .begin_close = window } }});
-            if (output) |output_id| result.focused = try repairFocus(world, output_id, if (was_focused) .deterministic_successor else .preserve);
+            result.focused = try beginWindowClose(world, window);
         },
         .window_destroyed => |window| {
-            var before = world.view();
-            const output = try windowOutput(&before, window);
-            const was_focused = try isFocused(&before, window);
-            _ = try world.applyAtomically(&.{.{ .window = .{ .destroy = window } }});
-            if (output) |output_id| if (world.getOutput(output_id) != null) {
-                result.focused = try repairFocus(world, output_id, if (was_focused) .deterministic_successor else .preserve);
-            };
+            result.focused = try destroyWindow(world, window);
         },
         .window_output_changed => |value| {
-            var before = world.view();
-            const old_output = try windowOutput(&before, value.window);
-            _ = try world.applyAtomically(&.{.{ .window = .{ .set_output = .{ .window = value.window, .output = value.output } } }});
-            if (old_output) |output| {
-                if (world.getOutput(output) != null) result.focused = try repairFocus(world, output, .preserve);
-            }
-            if (value.output) |output| result.focused = try repairFocus(world, output, .preserve);
+            result.focused = try changeWindowOutput(world, value.window, value.output);
         },
         .window_moved => |value| {
-            var before = world.view();
-            const output = try windowOutput(&before, value.window);
-            const node = before.nodeForWindow(value.window) orelse return error.NotManaged;
-            _ = try world.applyAtomically(&.{.{ .tree = .{ .move_node = .{ .node = node, .column = value.column } } }});
-            if (output) |output_id| result.focused = try repairFocus(world, output_id, .preserve);
+            result.focused = try moveWindow(world, value.window, value.column);
         },
         .placement => |value| {
-            var before = world.view();
-            const output = try windowOutput(&before, value.window);
-            const previous = (before.getWindow(value.window) orelse return error.UnknownWindow).placement;
-            _ = try world.applyAtomically(&.{.{ .window = .{ .transition_placement = .{ .window = value.window, .transition = value.transition } } }});
-            if (output) |output_id| {
-                const current = world.getWindow(value.window).?.placement;
-                if (previous == .scratchpad and current != .scratchpad and isActiveOutput(world, value.window, output_id)) {
-                    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = value.window } }});
-                    result.focused = value.window;
-                } else {
-                    const mode: FocusMode = if (current == .scratchpad or (previous == .fullscreen and current != .fullscreen))
-                        .deterministic_successor
-                    else
-                        .preserve;
-                    result.focused = try repairFocus(world, output_id, mode);
-                }
-            }
+            result.focused = try changePlacement(world, value.window, value.transition);
         },
         .repair_output_focus => |value| result.focused = try repairFocus(world, value.output, value.mode),
     }
+    if (result.announced_tag) |id| std.debug.assert(id.isValid());
+    if (result.announced_output) |id| std.debug.assert(id.isValid());
+    if (result.announced_window) |id| std.debug.assert(id.isValid());
+    if (result.focused) |id| std.debug.assert(id.isValid());
     return result;
+}
+
+fn announceOutput(world: *World, spec: types.OutputSpec) !ApplyResult {
+    const output = try world.createOutput(spec);
+    std.debug.assert(world.getOutput(output) != null);
+    return .{ .announced_output = output, .focused = try repairFocus(world, output, .preserve) };
+}
+
+fn updateOutput(world: *World, fact: OutputFact) !?WindowId {
+    std.debug.assert(fact.output.isValid());
+    try reconcileOutput(world, fact);
+    return repairFocus(world, fact.output, .preserve);
+}
+
+fn manageWindow(world: *World, window: WindowId, column: ColumnId) !?WindowId {
+    std.debug.assert(window.isValid());
+    std.debug.assert(column.isValid());
+    _ = try world.applyAtomically(&.{.{ .tree = .{ .insert_window = .{ .window = window, .column = column } } }});
+    return repairWindowOutput(world, window, .preserve);
+}
+
+fn beginWindowClose(world: *World, window: WindowId) !?WindowId {
+    var before = world.view();
+    const output = try windowOutput(&before, window);
+    const was_focused = try isFocused(&before, window);
+    _ = try world.applyAtomically(&.{.{ .window = .{ .begin_close = window } }});
+    return if (output) |id| repairFocus(world, id, focusModeAfterRemoval(was_focused)) else null;
+}
+
+fn destroyWindow(world: *World, window: WindowId) !?WindowId {
+    var before = world.view();
+    const output = try windowOutput(&before, window);
+    const was_focused = try isFocused(&before, window);
+    _ = try world.applyAtomically(&.{.{ .window = .{ .destroy = window } }});
+    std.debug.assert(world.getWindow(window) == null);
+    const output_id = output orelse return null;
+    if (world.getOutput(output_id) == null) return null;
+    return repairFocus(world, output_id, focusModeAfterRemoval(was_focused));
+}
+
+fn focusModeAfterRemoval(was_focused: bool) FocusMode {
+    return if (was_focused) .deterministic_successor else .preserve;
+}
+
+fn changeWindowOutput(world: *World, window: WindowId, new_output: ?OutputId) !?WindowId {
+    var before = world.view();
+    const old_output = try windowOutput(&before, window);
+    _ = try world.applyAtomically(&.{.{ .window = .{ .set_output = .{ .window = window, .output = new_output } } }});
+    var focused: ?WindowId = null;
+    if (old_output) |output| {
+        if (world.getOutput(output) != null) focused = try repairFocus(world, output, .preserve);
+    }
+    if (new_output) |output| focused = try repairFocus(world, output, .preserve);
+    return focused;
+}
+
+fn moveWindow(world: *World, window: WindowId, column: ColumnId) !?WindowId {
+    var before = world.view();
+    const output = try windowOutput(&before, window);
+    const node = before.nodeForWindow(window) orelse return error.NotManaged;
+    _ = try world.applyAtomically(&.{.{ .tree = .{ .move_node = .{ .node = node, .column = column } } }});
+    return if (output) |id| repairFocus(world, id, .preserve) else null;
+}
+
+fn changePlacement(world: *World, window: WindowId, transition: PlacementTransition) !?WindowId {
+    var before = world.view();
+    const output = try windowOutput(&before, window);
+    const previous = (before.getWindow(window) orelse return error.UnknownWindow).placement;
+    _ = try world.applyAtomically(&.{.{ .window = .{ .transition_placement = .{ .window = window, .transition = transition } } }});
+    const output_id = output orelse return null;
+    const current = world.getWindow(window).?.placement;
+    if (previous == .scratchpad and current != .scratchpad and isActiveOutput(world, window, output_id)) {
+        _ = try world.applyAtomically(&.{.{ .focus = .{ .window = window } }});
+        return window;
+    }
+    const mode: FocusMode = if (current == .scratchpad or (previous == .fullscreen and current != .fullscreen))
+        .deterministic_successor
+    else
+        .preserve;
+    return repairFocus(world, output_id, mode);
 }
 
 /// Reconcile protocol geometry and the active tag without rebuilding any

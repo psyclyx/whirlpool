@@ -9,7 +9,7 @@ const wayland = @import("wayland");
 const wayland_client = @import("whirlpool-wayland-client");
 pub const LayerShell = @import("whirlpool-river-layer-shell");
 const river_layer_shell = LayerShell;
-const ListenerCallbacks = @import("live/listeners.zig").Callbacks(Manager);
+const ListenerCallbacks = @import("listeners.zig").Callbacks(Manager);
 
 pub const State = enum { claimed, managing, rendering, stopping, finished, unavailable, destroyed };
 pub const Error = error{ MissingManagerGlobal, BindFailed, InvalidState, Disconnected, RolesStillLive };

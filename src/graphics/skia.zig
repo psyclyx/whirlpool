@@ -18,6 +18,7 @@ extern fn whirlpool_skia_end(renderer: *Native, row_bytes: *usize) ?[*]const u8;
 
 pub const Frame = struct {
     pixels: [*]const u8,
+    byte_len: usize,
     width: u32,
     height: u32,
     row_bytes: usize,
@@ -66,7 +67,13 @@ pub const Renderer = struct {
     pub fn end(self: *Renderer) !Frame {
         var row_bytes: usize = 0;
         const pixels = whirlpool_skia_end(self.native, &row_bytes) orelse return error.SkiaEndFailed;
-        return .{ .pixels = pixels, .width = self.width, .height = self.height, .row_bytes = row_bytes };
+        return .{
+            .pixels = pixels,
+            .byte_len = try std.math.mul(usize, row_bytes, self.height),
+            .width = self.width,
+            .height = self.height,
+            .row_bytes = row_bytes,
+        };
     }
 };
 

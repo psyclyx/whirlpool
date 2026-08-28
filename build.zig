@@ -179,7 +179,7 @@ pub fn build(b: *std.Build) void {
     river_layer_shell.linkSystemLibrary("wayland-client", .{});
 
     const river_live = b.addModule("whirlpool-river-live", .{
-        .root_source_file = b.path("src/platform/river/live.zig"),
+        .root_source_file = b.path("src/platform/river/live/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -204,7 +204,7 @@ pub fn build(b: *std.Build) void {
     });
     river_live_plans.linkSystemLibrary("wayland-client", .{});
     const river_live_world = b.addModule("whirlpool-river-live-world", .{
-        .root_source_file = b.path("src/platform/river/live/world.zig"),
+        .root_source_file = b.path("src/platform/river/live/world/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -236,7 +236,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const river_host_runtime = b.addModule("whirlpool-river-host-runtime", .{
-        .root_source_file = b.path("src/platform/river/host/runtime.zig"),
+        .root_source_file = b.path("src/platform/river/host/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,

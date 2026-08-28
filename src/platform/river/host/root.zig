@@ -12,9 +12,9 @@ const wm = @import("whirlpool-wm");
 const live = @import("whirlpool-river-live");
 const plans = @import("whirlpool-river-live-plans");
 const world = @import("whirlpool-river-live-world");
-const configured_actions = @import("runtime/actions.zig");
-const listeners = @import("runtime/listeners.zig");
-const SurfaceQueue = @import("runtime/surface_queue.zig").Queue;
+const configured_actions = @import("actions.zig");
+const listeners = @import("listeners.zig");
+const SurfaceQueue = @import("surface_queue.zig").Queue;
 
 const types = host.types;
 const coordinator = host.river_coordinator;

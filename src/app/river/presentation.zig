@@ -4,9 +4,75 @@ const std = @import("std");
 const wayland = @import("wayland");
 const host = @import("whirlpool-host");
 const script = @import("whirlpool-script");
+const wayland_client = @import("whirlpool-wayland-client");
 const river_host_runtime = @import("whirlpool-river-host-runtime");
 const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
 const river_presenter_runtime = @import("whirlpool-river-presenter-runtime");
+
+/// Owns the optional graphics runtime and its River role callback context.
+pub const Bridge = struct {
+    graphics: ?*river_presenter_runtime.Runtime = null,
+    context: Context = undefined,
+    generation: u64 = 1,
+
+    /// Initialize graphics for a configured surface and return role hooks.
+    pub fn init(
+        self: *Bridge,
+        allocator: std.mem.Allocator,
+        client: *wayland_client.Client,
+        runtime: *river_host_runtime.Runtime,
+        surface: ?*const script.config.SurfaceSpec,
+    ) !river_role_lifecycle.Hooks {
+        self.* = .{};
+        const spec = surface orelse return .{};
+        self.graphics = try river_presenter_runtime.Runtime.init(allocator, client, .{
+            .context = @ptrCast(runtime),
+            .submit = queueCommit,
+        }, spec);
+        errdefer {
+            self.graphics.?.deinit() catch {};
+            self.graphics = null;
+        }
+        try runtime.setSurfaceHooks(self.graphics.?.surfaceHooks());
+        self.context = .{ .runtime = runtime, .roles = undefined, .graphics = self.graphics.? };
+        return self.context.hooks();
+    }
+
+    /// Complete the callback context after role storage has a stable address.
+    pub fn bindRoles(self: *Bridge, roles: *river_role_lifecycle.Runtime) void {
+        if (self.graphics == null) return;
+        std.debug.assert(self.context.graphics == self.graphics.?);
+        self.context.roles = roles;
+    }
+
+    /// Poll graphics releases before role retirement reconciliation.
+    pub fn pollReleases(self: *Bridge) !void {
+        const graphics = self.graphics orelse return;
+        _ = try graphics.pollReleases();
+    }
+
+    /// Update shell services and present all retained roles once per dispatch.
+    pub fn present(self: *Bridge) !void {
+        const graphics = self.graphics orelse return;
+        std.debug.assert(self.generation != 0);
+        try self.context.roles.forEachShell(&self.context, Context.updateShellServices);
+        try graphics.presentAll(self.generation);
+        self.generation +|= 1;
+        if (self.generation == 0) return error.GenerationExhausted;
+    }
+
+    /// Release graphics after orderly role retirement.
+    pub fn deinit(self: *Bridge) !void {
+        if (self.graphics) |graphics| try graphics.deinit();
+        self.* = undefined;
+    }
+
+    /// Drop graphics bookkeeping after transport loss.
+    pub fn abandon(self: *Bridge) void {
+        if (self.graphics) |graphics| graphics.abandon();
+        self.graphics = null;
+    }
+};
 
 pub const Context = struct {
     runtime: *river_host_runtime.Runtime,

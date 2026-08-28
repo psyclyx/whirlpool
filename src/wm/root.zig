@@ -25,6 +25,7 @@ pub const ContainerMode = types.ContainerMode;
 pub const Direction = types.Direction;
 pub const Lifecycle = types.Lifecycle;
 pub const Placement = types.Placement;
+pub const PlacementTransition = types.PlacementTransition;
 pub const Point = types.Point;
 pub const Size = types.Size;
 pub const Rect = types.Rect;

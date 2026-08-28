@@ -21,10 +21,10 @@ const types = host.types;
 const staged_facts = host.staged_facts;
 const composition = host.composition;
 const wm_bridge = host.wm_bridge;
-pub const input_intents = @import("world/input.zig");
+pub const input_intents = @import("input.zig");
 pub const live_objects = @import("objects.zig");
-pub const events = @import("world/events.zig");
-const reconcile = @import("world/reconcile.zig");
+pub const events = @import("events.zig");
+const reconcile = @import("reconcile.zig");
 
 pub const Error = error{
     AdapterPoisoned,
