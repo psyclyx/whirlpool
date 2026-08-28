@@ -9,12 +9,15 @@ const std = @import("std");
 const Native = opaque {};
 
 extern fn whirlpool_skia_create(bgra: c_int) ?*Native;
+extern fn whirlpool_skia_create_vulkan(instance: *anyopaque, physical_device: *anyopaque, device: *anyopaque, queue: *anyopaque, queue_family: u32) ?*Native;
 extern fn whirlpool_skia_destroy(renderer: *Native) void;
 extern fn whirlpool_skia_begin(renderer: *Native, width: u32, height: u32) c_int;
 extern fn whirlpool_skia_clear(renderer: *Native, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_rect(renderer: *Native, x: f32, y: f32, width: f32, height: f32, radius: f32, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_text(renderer: *Native, text: [*]const u8, length: usize, x: f32, baseline: f32, size: f32, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_end(renderer: *Native, row_bytes: *usize) ?[*]const u8;
+extern fn whirlpool_skia_begin_vulkan(renderer: *Native, width: u32, height: u32, image: *anyopaque, memory: *anyopaque, memory_size: u64, format: u32, layout: u32, queue_family: u32) c_int;
+extern fn whirlpool_skia_end_vulkan(renderer: *Native, final_layout: u32, final_queue_family: u32) c_int;
 
 pub const Frame = struct {
     pixels: [*]const u8,
@@ -75,6 +78,77 @@ pub const Renderer = struct {
             .row_bytes = row_bytes,
         };
     }
+};
+
+/// Ganesh renderer for an externally allocated Vulkan image. It owns the Skia
+/// context, but borrows the Vulkan instance/device/queue and each target.
+pub const GpuRenderer = struct {
+    native: *Native,
+
+    pub fn init(context: VulkanContext) !GpuRenderer {
+        return .{ .native = whirlpool_skia_create_vulkan(
+            context.instance,
+            context.physical_device,
+            context.device,
+            context.queue,
+            context.queue_family,
+        ) orelse return error.SkiaGpuInitFailed };
+    }
+
+    pub fn deinit(self: *GpuRenderer) void {
+        whirlpool_skia_destroy(self.native);
+        self.* = undefined;
+    }
+
+    pub fn begin(self: *GpuRenderer, target: VulkanTarget, clear: [4]f32) !void {
+        const result = whirlpool_skia_begin_vulkan(
+            self.native,
+            target.width,
+            target.height,
+            target.image,
+            target.memory,
+            target.memory_size,
+            target.format,
+            target.layout,
+            target.queue_family,
+        );
+        if (result != 0) {
+            std.log.err("Skia rejected Vulkan DMA-BUF target (stage {d})", .{result});
+            return error.SkiaGpuBeginFailed;
+        }
+        whirlpool_skia_clear(self.native, clear[0], clear[1], clear[2], clear[3]);
+    }
+
+    pub fn drawList(self: *GpuRenderer, list: DrawList) void {
+        for (list.ops) |op| switch (op) {
+            .rect => |rect| whirlpool_skia_draw_rect(self.native, rect.rect.x, rect.rect.y, rect.rect.width, rect.rect.height, rect.radius, rect.color.r, rect.color.g, rect.color.b, rect.color.a),
+            .text => |item| whirlpool_skia_draw_text(self.native, item.text.ptr, item.text.len, item.x, item.baseline, item.size, item.color.r, item.color.g, item.color.b, item.color.a),
+        };
+    }
+
+    pub fn end(self: *GpuRenderer, final_layout: u32, final_queue_family: u32) !void {
+        if (whirlpool_skia_end_vulkan(self.native, final_layout, final_queue_family) != 0)
+            return error.SkiaGpuSubmitFailed;
+    }
+};
+
+pub const VulkanContext = struct {
+    instance: *anyopaque,
+    physical_device: *anyopaque,
+    device: *anyopaque,
+    queue: *anyopaque,
+    queue_family: u32,
+};
+
+pub const VulkanTarget = struct {
+    image: *anyopaque,
+    memory: *anyopaque,
+    memory_size: u64,
+    width: u32,
+    height: u32,
+    format: u32,
+    layout: u32,
+    queue_family: u32,
 };
 
 pub const Rect = struct { x: f32, y: f32, width: f32, height: f32 };

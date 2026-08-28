@@ -14,6 +14,16 @@
 #include "core/SkImageInfo.h"
 #include "core/SkPaint.h"
 #include "core/SkSurface.h"
+#include "gpu/ganesh/GrBackendSurface.h"
+#include "gpu/ganesh/GrDirectContext.h"
+#include "gpu/ganesh/GrTypes.h"
+#include "gpu/ganesh/SkSurfaceGanesh.h"
+#include "gpu/ganesh/vk/GrVkBackendSurface.h"
+#include "gpu/ganesh/vk/GrVkDirectContext.h"
+#include "gpu/ganesh/vk/GrVkTypes.h"
+#include "gpu/vk/VulkanBackendContext.h"
+#include "gpu/vk/VulkanExtensions.h"
+#include "gpu/vk/VulkanMutableTextureState.h"
 #include "ports/SkFontMgr_empty.h"
 #include "ports/SkFontMgr_directory.h"
 #include "ports/SkFontMgr_fontconfig.h"
@@ -27,6 +37,7 @@ struct WhirlpoolSkia {
     sk_sp<SkSurface> surface;
     SkCanvas *canvas = nullptr;
     sk_sp<SkFontMgr> font_manager;
+    sk_sp<GrDirectContext> gpu_context;
 };
 
 static SkImageInfo frame_info(const WhirlpoolSkia *renderer) {
@@ -34,17 +45,65 @@ static SkImageInfo frame_info(const WhirlpoolSkia *renderer) {
                              renderer->color_type, kPremul_SkAlphaType, nullptr);
 }
 
-extern "C" WhirlpoolSkia *whirlpool_skia_create(int bgra) {
-    auto *renderer = new (std::nothrow) WhirlpoolSkia();
-    if (!renderer) return nullptr;
-    renderer->color_type = bgra ? kBGRA_8888_SkColorType : kRGBA_8888_SkColorType;
+static bool initialize_fonts(WhirlpoolSkia *renderer) {
     if (const char *font_dir = std::getenv("WHIRLPOOL_FONT_DIR"))
         renderer->font_manager = SkFontMgr_New_Custom_Directory(font_dir);
     if (!renderer->font_manager)
         renderer->font_manager = SkFontMgr_New_FontConfig(nullptr, SkFontScanner_Make_FreeType());
     if (!renderer->font_manager)
         renderer->font_manager = SkFontMgr_New_Custom_Empty();
-    if (!renderer->font_manager) {
+    return renderer->font_manager != nullptr;
+}
+
+extern "C" WhirlpoolSkia *whirlpool_skia_create(int bgra) {
+    auto *renderer = new (std::nothrow) WhirlpoolSkia();
+    if (!renderer) return nullptr;
+    renderer->color_type = bgra ? kBGRA_8888_SkColorType : kRGBA_8888_SkColorType;
+    if (!initialize_fonts(renderer)) {
+        delete renderer;
+        return nullptr;
+    }
+    return renderer;
+}
+
+extern "C" WhirlpoolSkia *whirlpool_skia_create_vulkan(
+        void *instance, void *physical_device, void *device, void *queue,
+        uint32_t queue_family) {
+    if (!instance || !physical_device || !device || !queue) return nullptr;
+    auto *renderer = new (std::nothrow) WhirlpoolSkia();
+    if (!renderer) return nullptr;
+    renderer->color_type = kBGRA_8888_SkColorType;
+    if (!initialize_fonts(renderer)) {
+        delete renderer;
+        return nullptr;
+    }
+    skgpu::VulkanBackendContext backend;
+    backend.fInstance = static_cast<VkInstance>(instance);
+    backend.fPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+    backend.fDevice = static_cast<VkDevice>(device);
+    backend.fQueue = static_cast<VkQueue>(queue);
+    backend.fGraphicsQueueIndex = queue_family;
+    backend.fMaxAPIVersion = VK_API_VERSION_1_1;
+    backend.fGetProc = [](const char *name, VkInstance vk_instance, VkDevice vk_device) {
+        if (vk_device != VK_NULL_HANDLE)
+            return vkGetDeviceProcAddr(vk_device, name);
+        return vkGetInstanceProcAddr(vk_instance, name);
+    };
+    skgpu::VulkanExtensions extensions;
+    const char *device_extensions[] = {
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+        VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+    };
+    extensions.init(backend.fGetProc, backend.fInstance, backend.fPhysicalDevice,
+                    0, nullptr,
+                    static_cast<uint32_t>(sizeof(device_extensions) /
+                                          sizeof(device_extensions[0])),
+                    device_extensions);
+    backend.fVkExtensions = &extensions;
+    renderer->gpu_context = GrDirectContexts::MakeVulkan(backend);
+    if (!renderer->gpu_context) {
         delete renderer;
         return nullptr;
     }
@@ -55,7 +114,44 @@ extern "C" void whirlpool_skia_destroy(WhirlpoolSkia *renderer) {
     if (!renderer) return;
     renderer->canvas = nullptr;
     renderer->surface.reset();
+    renderer->gpu_context.reset();
     delete renderer;
+}
+
+extern "C" int whirlpool_skia_begin_vulkan(
+        WhirlpoolSkia *renderer, uint32_t width, uint32_t height,
+        void *image, void *memory, uint64_t memory_size,
+        uint32_t format, uint32_t layout, uint32_t queue_family) {
+    if (!renderer || !renderer->gpu_context || !image || !memory ||
+        width == 0 || height == 0) return 1;
+    renderer->surface.reset();
+    GrVkImageInfo image_info{};
+    image_info.fImage = static_cast<VkImage>(image);
+    // Ganesh borrows this render target. The allocation remains owned by the
+    // DMA-BUF slot and the API explicitly permits an empty allocation for a
+    // borrowed render target.
+    (void)memory_size;
+    image_info.fImageTiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+    image_info.fImageLayout = static_cast<VkImageLayout>(layout);
+    image_info.fFormat = static_cast<VkFormat>(format);
+    image_info.fImageUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                  VK_IMAGE_USAGE_SAMPLED_BIT |
+                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_info.fSampleCount = 1;
+    image_info.fLevelCount = 1;
+    image_info.fCurrentQueueFamily = queue_family;
+    image_info.fSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    auto target = GrBackendTextures::MakeVk(width, height, image_info);
+    if (!target.isValid()) return 2;
+    renderer->surface = SkSurfaces::WrapBackendTexture(
+        renderer->gpu_context.get(), target, kTopLeft_GrSurfaceOrigin,
+        0, renderer->color_type, nullptr, nullptr);
+    if (!renderer->surface) return 3;
+    renderer->width = width;
+    renderer->height = height;
+    renderer->canvas = renderer->surface->getCanvas();
+    return renderer->canvas ? 0 : 1;
 }
 
 extern "C" int whirlpool_skia_begin(WhirlpoolSkia *renderer, uint32_t width, uint32_t height) {
@@ -111,4 +207,17 @@ extern "C" const uint8_t *whirlpool_skia_end(WhirlpoolSkia *renderer, size_t *ro
     if (row_bytes) *row_bytes = static_cast<size_t>(renderer->width) * 4;
     renderer->canvas = nullptr;
     return renderer->pixels.data();
+}
+
+extern "C" int whirlpool_skia_end_vulkan(
+        WhirlpoolSkia *renderer, uint32_t final_layout, uint32_t final_queue_family) {
+    if (!renderer || !renderer->gpu_context || !renderer->surface) return 1;
+    renderer->canvas = nullptr;
+    const auto final_state = skgpu::MutableTextureStates::MakeVulkan(
+        static_cast<VkImageLayout>(final_layout), final_queue_family);
+    GrFlushInfo flush_info;
+    renderer->gpu_context->flush(renderer->surface.get(), flush_info, &final_state);
+    const bool submitted = renderer->gpu_context->submit(GrSyncCpu::kYes);
+    renderer->surface.reset();
+    return submitted ? 0 : 1;
 }

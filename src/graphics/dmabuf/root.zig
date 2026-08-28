@@ -6,6 +6,7 @@
 //! stopped using the storage.
 
 const std = @import("std");
+const graphics = @import("whirlpool-graphics");
 
 const c = @cImport({
     @cInclude("gbm.h");
@@ -141,8 +142,33 @@ test "hardware imports a GBM allocation into Vulkan" {
     );
     defer allocator.free(modifiers);
     try std.testing.expect(modifiers.len > 0);
-    var buffer = try Buffer.init(&context.gbm, 64, 64, argb8888, modifiers);
+    var chosen: ?usize = null;
+    for (modifiers, 0..) |modifier, index| {
+        if (modifier == modifier_linear) chosen = index;
+    }
+    const index = chosen orelse 0;
+    var buffer = try Buffer.init(&context.gbm, 64, 64, argb8888, modifiers[index .. index + 1]);
     defer buffer.deinit();
     var image = try VulkanImage.init(context, &buffer);
     defer image.deinit();
+    var renderer = try graphics.skia.GpuRenderer.init(context.skiaContext());
+    defer renderer.deinit();
+    try renderer.begin(image.skiaTarget(), .{ 0, 0, 0, 0 });
+    renderer.drawList(.{ .ops = &.{.{ .rect = .{
+        .rect = .{ .x = 4, .y = 4, .width = 56, .height = 56 },
+        .color = .{ .r = 1, .g = 0, .b = 1, .a = 1 },
+    } }} });
+    try renderer.end(
+        @intCast(@import("vulkan.zig").vk.VK_IMAGE_LAYOUT_GENERAL),
+        @intCast(@import("vulkan.zig").vk.VK_QUEUE_FAMILY_FOREIGN_EXT),
+    );
+    image.markReleasedToWayland();
+    // Exercise the FOREIGN -> graphics -> FOREIGN ownership cycle used after
+    // a compositor release, not only the first UNDEFINED render.
+    try renderer.begin(image.skiaTarget(), .{ 0, 0, 0, 0 });
+    try renderer.end(
+        @intCast(@import("vulkan.zig").vk.VK_IMAGE_LAYOUT_GENERAL),
+        @intCast(@import("vulkan.zig").vk.VK_QUEUE_FAMILY_FOREIGN_EXT),
+    );
+    image.markReleasedToWayland();
 }

@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
     });
     graphics.addIncludePath(b.path("src/graphics"));
     addSkia(b, graphics);
+    graphics.linkSystemLibrary("vulkan", .{});
     const script = b.addModule("whirlpool-script", .{
         .root_source_file = b.path("src/script/root.zig"),
         .target = target,
@@ -150,6 +151,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{.{ .name = "whirlpool-graphics", .module = graphics }},
     });
     dmabuf_allocator.linkSystemLibrary("gbm", .{});
     dmabuf_allocator.linkSystemLibrary("vulkan", .{});

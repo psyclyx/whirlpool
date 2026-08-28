@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const dmabuf = @import("root.zig");
+const graphics = @import("whirlpool-graphics");
 
 pub const vk = @cImport({
     @cInclude("vulkan/vulkan.h");
@@ -51,6 +52,16 @@ pub const Context = struct {
         allocator.destroy(self);
     }
 
+    pub fn skiaContext(self: *const Context) graphics.skia.VulkanContext {
+        return .{
+            .instance = @ptrCast(self.instance.?),
+            .physical_device = @ptrCast(self.physical_device.?),
+            .device = @ptrCast(self.device.?),
+            .queue = @ptrCast(self.queue.?),
+            .queue_family = self.queue_family,
+        };
+    }
+
     /// Return single-memory-plane modifiers usable as color targets and
     /// importable from DMA-BUF. The caller intersects this with Wayland v3's
     /// advertised explicit modifiers before asking GBM to allocate.
@@ -78,6 +89,11 @@ pub const Context = struct {
             if (candidate.drmFormatModifierPlaneCount != 1) continue;
             if ((candidate.drmFormatModifierTilingFeatures & vk.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) == 0)
                 continue;
+            if ((candidate.drmFormatModifierTilingFeatures & vk.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) == 0)
+                continue;
+            if ((candidate.drmFormatModifierTilingFeatures & vk.VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) == 0 or
+                (candidate.drmFormatModifierTilingFeatures & vk.VK_FORMAT_FEATURE_TRANSFER_DST_BIT) == 0)
+                continue;
             if (!self.modifierImportable(format, candidate.drmFormatModifier)) continue;
             try result.append(allocator, candidate.drmFormatModifier);
         }
@@ -101,7 +117,7 @@ pub const Context = struct {
             .format = format,
             .type = vk.VK_IMAGE_TYPE_2D,
             .tiling = vk.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-            .usage = vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            .usage = image_usage,
         };
         var external_properties = vk.VkExternalImageFormatProperties{
             .sType = vk.VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
@@ -204,6 +220,9 @@ pub const Image = struct {
     width: u32,
     height: u32,
     format: vk.VkFormat,
+    memory_size: u64 = 0,
+    layout: vk.VkImageLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
+    queue_family: u32 = vk.VK_QUEUE_FAMILY_IGNORED,
 
     pub fn init(context: *Context, buffer: *const dmabuf.Buffer) !Image {
         if (buffer.plane_count != 1) return error.MultiPlaneUnsupported;
@@ -233,7 +252,7 @@ pub const Image = struct {
             .arrayLayers = 1,
             .samples = vk.VK_SAMPLE_COUNT_1_BIT,
             .tiling = vk.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-            .usage = vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            .usage = image_usage,
             .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
             .initialLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
         };
@@ -267,6 +286,7 @@ pub const Image = struct {
             context.physical_device,
             requirements.memoryRequirements.memoryTypeBits & fd_properties.memoryTypeBits,
         ) orelse return error.NoMemoryType;
+        self.memory_size = requirements.memoryRequirements.size;
 
         const imported_fd = std.c.fcntl(buffer.planes[0].fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
         if (imported_fd < 0) return error.DuplicateFailed;
@@ -298,6 +318,24 @@ pub const Image = struct {
         };
         try check(vk.vkBindImageMemory2(context.device, 1, &bind));
         return self;
+    }
+
+    pub fn skiaTarget(self: *const Image) graphics.skia.VulkanTarget {
+        return .{
+            .image = @ptrCast(self.image.?),
+            .memory = @ptrCast(self.memory.?),
+            .memory_size = self.memory_size,
+            .width = self.width,
+            .height = self.height,
+            .format = @intCast(self.format),
+            .layout = @intCast(self.layout),
+            .queue_family = self.queue_family,
+        };
+    }
+
+    pub fn markReleasedToWayland(self: *Image) void {
+        self.layout = vk.VK_IMAGE_LAYOUT_GENERAL;
+        self.queue_family = vk.VK_QUEUE_FAMILY_FOREIGN_EXT;
     }
 
     pub fn deinit(self: *Image) void {
@@ -346,6 +384,11 @@ fn drmToVulkan(format: u32) ?vk.VkFormat {
 fn check(result: vk.VkResult) !void {
     if (result != vk.VK_SUCCESS) return error.VulkanFailed;
 }
+
+const image_usage = vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+    vk.VK_IMAGE_USAGE_SAMPLED_BIT |
+    vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+    vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
 test "DMA-BUF renderer is WSI-free" {
     std.testing.refAllDecls(Context);
