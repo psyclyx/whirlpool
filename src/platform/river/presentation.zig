@@ -173,12 +173,14 @@ pub fn Registry(comptime Api: type) type {
             };
             errdefer self.entries.deinit(allocator);
             try self.entries.ensureTotalCapacity(allocator, config.max_roles);
+            self.assertValid();
             return self;
         }
 
         /// Deinitialization is intentionally strict: protocol-role teardown must
         /// first destroy every presenter while its borrowed wl_surface is live.
         pub fn deinit(self: *Self) !void {
+            self.assertValid();
             if (self.entries.items.len != 0) return error.PresentersStillRetained;
             self.entries.deinit(self.allocator);
             self.* = undefined;
@@ -187,6 +189,7 @@ pub fn Registry(comptime Api: type) type {
         /// Tear down retained presenters when the Wayland transport has gone
         /// away and protocol retirement can no longer complete.
         pub fn abandon(self: *Self) void {
+            self.assertValid();
             for (self.entries.items) |entry| {
                 entry.presenter.deinit();
                 self.allocator.destroy(entry);
@@ -195,25 +198,34 @@ pub fn Registry(comptime Api: type) type {
             self.* = undefined;
         }
 
+        /// Return the number of retained presenter aggregates.
         pub fn count(self: *const Self) usize {
+            self.assertValid();
             return self.entries.items.len;
         }
 
+        /// Report whether a role has a retained presenter.
         pub fn contains(self: *const Self, role: SurfaceRole) bool {
+            self.assertValid();
             return self.findIndex(role) != null;
         }
 
+        /// Return the current state of a role's concrete presenter.
         pub fn stateOf(self: *const Self, role: SurfaceRole) !PresenterState {
+            self.assertValid();
             return (self.find(role) orelse return error.SurfaceRoleNotBound).presenter.stateOf();
         }
 
+        /// Report whether role teardown has begun.
         pub fn isRetiring(self: *const Self, role: SurfaceRole) !bool {
+            self.assertValid();
             return (self.find(role) orelse return error.SurfaceRoleNotBound).retiring;
         }
 
         /// Fallible, allocating role setup. No role becomes visible until the
         /// factory product and stable registry entry both exist.
         pub fn createRole(self: *Self, info: CreateInfo) !void {
+            self.assertValid();
             try info.extent.validate();
             if (self.findIndex(info.role) != null) return error.SurfaceRoleAlreadyBound;
             if (self.entries.items.len == self.max_roles) return error.SurfaceRegistryFull;
@@ -229,12 +241,15 @@ pub fn Registry(comptime Api: type) type {
             errdefer self.allocator.destroy(entry);
             entry.* = .{ .role = info.role, .presenter = presenter };
             self.entries.appendAssumeCapacity(entry);
+            self.assertValid();
+            std.debug.assert(self.contains(info.role));
         }
 
         /// Destroys only an idle presenter. Submitted buffers must first be
         /// released through pollReleases; rendered but uncommitted frames must
         /// first be discarded through discardSubmitted/SurfaceHooks.discard.
         pub fn destroyRole(self: *Self, role: SurfaceRole) !void {
+            self.assertValid();
             const index = self.findIndex(role) orelse return error.SurfaceRoleNotBound;
             const entry = self.entries.items[index];
             if (entry.pending != null) return error.UncommittedFrame;
@@ -248,6 +263,8 @@ pub fn Registry(comptime Api: type) type {
             _ = self.entries.orderedRemove(index);
             entry.presenter.deinit();
             self.allocator.destroy(entry);
+            self.assertValid();
+            std.debug.assert(!self.contains(role));
         }
 
         /// Start or advance release-safe role retirement. Prepared work is
@@ -256,6 +273,7 @@ pub fn Registry(comptime Api: type) type {
         /// `release_safe` is returned only after the presenter aggregate has
         /// been destroyed and no longer borrows the role's wl_surface.
         pub fn retireRole(self: *Self, role: SurfaceRole) !RetirementStatus {
+            self.assertValid();
             const index = self.findIndex(role) orelse return error.SurfaceRoleNotBound;
             const entry = self.entries.items[index];
             entry.retiring = true;
@@ -266,7 +284,10 @@ pub fn Registry(comptime Api: type) type {
             }
 
             switch (entry.presenter.stateOf()) {
-                .submitted => return .pending_release,
+                .submitted => {
+                    self.assertValid();
+                    return .pending_release;
+                },
                 .waiting_for_buffer, .ready => {},
                 .prepared, .armed => return error.InvalidPresenterTransition,
                 .destroyed => return error.PresenterAlreadyDestroyed,
@@ -275,6 +296,8 @@ pub fn Registry(comptime Api: type) type {
             _ = self.entries.orderedRemove(index);
             entry.presenter.deinit();
             self.allocator.destroy(entry);
+            self.assertValid();
+            std.debug.assert(!self.contains(role));
             return .release_safe;
         }
 
@@ -288,6 +311,7 @@ pub fn Registry(comptime Api: type) type {
             clear: [4]f32,
             draw_list: DrawList,
         ) !SubmittedCommit {
+            self.assertValid();
             if (generation == 0) return error.InvalidGeneration;
             const entry = self.find(role) orelse return error.SurfaceRoleNotBound;
             if (entry.retiring) return error.SurfaceRoleRetiring;
@@ -306,11 +330,13 @@ pub fn Registry(comptime Api: type) type {
             }
             if (entry.presenter.stateOf() != .prepared) return error.InvalidPresenterTransition;
             entry.pending = .{ .generation = generation, .token = token };
+            self.assertValid();
             return .{ .role = role, .generation = generation, .token = token };
         }
 
         /// Nonblocking release polling for every submitted role.
         pub fn pollReleases(self: *Self) !usize {
+            self.assertValid();
             var released: usize = 0;
             for (self.entries.items) |entry| {
                 if (entry.presenter.stateOf() != .submitted) continue;
@@ -323,10 +349,13 @@ pub fn Registry(comptime Api: type) type {
                     return error.InvalidPresenterTransition;
                 }
             }
+            self.assertValid();
             return released;
         }
 
+        /// Return allocation-free hooks for the host surface transaction.
         pub fn surfaceHooks(self: *Self) SurfaceHooks {
+            self.assertValid();
             return .{
                 .context = self,
                 .prepare = prepareHook,
@@ -335,8 +364,11 @@ pub fn Registry(comptime Api: type) type {
             };
         }
 
+        /// Discard a queued submission if its identity is still pending.
         pub fn discardSubmitted(self: *Self, submitted: SubmittedCommit) void {
+            self.assertValid();
             discardHook(self, submitted);
+            self.assertValid();
         }
 
         fn prepareHook(raw: ?*anyopaque, submitted: SubmittedCommit) anyerror!void {
@@ -394,6 +426,23 @@ pub fn Registry(comptime Api: type) type {
 
         fn from(raw: ?*anyopaque) *Self {
             return @ptrCast(@alignCast(raw orelse unreachable));
+        }
+
+        fn assertValid(self: *const Self) void {
+            if (!std.debug.runtime_safety) return;
+            std.debug.assert(self.max_roles > 0);
+            std.debug.assert(self.entries.items.len <= self.max_roles);
+            for (self.entries.items, 0..) |entry, index| {
+                std.debug.assert(entry.presenter.stateOf() != .destroyed);
+                if (entry.pending) |identity| {
+                    std.debug.assert(identity.generation != 0);
+                    std.debug.assert(identity.token != 0);
+                    const state = entry.presenter.stateOf();
+                    std.debug.assert(state == .prepared or state == .armed);
+                }
+                for (self.entries.items[index + 1 ..]) |other|
+                    std.debug.assert(!std.meta.eql(entry.role, other.role));
+            }
         }
     };
 }
