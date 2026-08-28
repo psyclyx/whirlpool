@@ -3,6 +3,8 @@
   mkShell,
   harfbuzz,
   lua5_4,
+  libdrm,
+  libgbm,
   pkg-config,
   shellcheck,
   shfmt,
@@ -20,6 +22,8 @@ mkShell {
     fontconfig
     harfbuzz
     lua5_4
+    libdrm
+    libgbm
     pkg-config
     shellcheck
     shfmt

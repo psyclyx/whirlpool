@@ -4,6 +4,8 @@
   fontconfig,
   harfbuzz,
   lua5_4,
+  libdrm,
+  libgbm,
   lib,
   makeWrapper,
   pkg-config,
@@ -69,6 +71,8 @@ stdenv.mkDerivation (finalAttrs: {
     fontconfig
     harfbuzz
     lua5_4
+    libdrm
+    libgbm
     wayland
     wayland-protocols
     vulkan-headers

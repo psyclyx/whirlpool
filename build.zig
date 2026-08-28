@@ -145,6 +145,14 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    const dmabuf_allocator = b.addModule("whirlpool-dmabuf-allocator", .{
+        .root_source_file = b.path("src/graphics/dmabuf/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    dmabuf_allocator.linkSystemLibrary("gbm", .{});
+
     const wayland_surface_presenter = b.addModule("whirlpool-wayland-surface-presenter", .{
         .root_source_file = b.path("src/platform/wayland/surface_presenter/root.zig"),
         .target = target,
@@ -428,7 +436,7 @@ pub fn build(b: *std.Build) void {
     }) |module| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
     }
-    inline for (.{ graphics, wayland_wsi }) |module| {
+    inline for (.{ graphics, dmabuf_allocator, wayland_wsi }) |module| {
         const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = module }));
         test_step.dependOn(&run_tests.step);
         graphics_test_step.dependOn(&run_tests.step);

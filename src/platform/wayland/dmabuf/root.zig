@@ -95,10 +95,10 @@ pub const Manager = struct {
         const params = try self.proxy.createParams();
         defer params.destroy();
         for (planes, 0..) |plane, index| {
-            const transferred_fd = try std.posix.dup(plane.fd);
-            // The Wayland closure owns and closes an fd after marshalling it.
             params.add(
-                transferred_fd,
+                // libwayland duplicates fd arguments while marshalling; the
+                // allocation owner retains this descriptor.
+                plane.fd,
                 @intCast(index),
                 plane.offset,
                 plane.stride,
