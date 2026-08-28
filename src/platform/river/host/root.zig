@@ -14,7 +14,9 @@ const plans = @import("whirlpool-river-live-plans");
 const world = @import("whirlpool-river-live-world");
 const configured_actions = @import("actions.zig");
 const listeners = @import("listeners.zig");
+const policy = @import("policy.zig");
 const SurfaceQueue = @import("surface/queue.zig").Queue;
+const transport = @import("transport/root.zig");
 
 const types = host.types;
 const coordinator = host.river_coordinator;
@@ -254,21 +256,20 @@ pub const Runtime = struct {
 
     fn runManage(self: *Runtime) !void {
         self.boundary = .none;
-        if (self.render != null) return self.finishManageError(error.RenderCycleStillLive);
-        var draft = self.adapter.beginManageDraft() catch |err| return self.finishManageError(err);
+        if (self.render != null) return transport.finishManageError(Runtime, self, error.RenderCycleStillLive);
+        var draft = self.adapter.beginManageDraft() catch |err| return transport.finishManageError(Runtime, self, err);
         defer draft.deinit();
-        try self.consumeInputIntents();
-        try self.runPolicy(&draft);
+        try policy.run(self, &draft);
         var cycle = self.adapter.finishManage(&draft, .{
             .layout_context = if (self.options.layout) |layout| layout.context else null,
             .build_layout = if (self.options.layout) |layout| layout.build else null,
-        }) catch |err| return self.finishManageError(err);
+        }) catch |err| return transport.finishManageError(Runtime, self, err);
         errdefer cycle.deinit();
 
         var operations = std.ArrayList(types.ManageOperation).empty;
         defer operations.deinit(self.allocator);
         for (cycle.frames.frames()) |frame| try operations.appendSlice(self.allocator, frame.plans.river_manage.operations.items);
-        try plans.applyManageTransport(self.manageTransport(), .{ .operations = operations.items });
+        try plans.applyManageTransport(transport.manage(Runtime, self), .{ .operations = operations.items });
 
         if (self.frames) |*previous| previous.deinit();
         self.frames = cycle.frames;
@@ -276,76 +277,10 @@ pub const Runtime = struct {
         cycle = undefined;
     }
 
-    fn runPolicy(self: *Runtime, draft: *const world.ManageDraft) !void {
-        var policy_intents = script.IntentBatch.init(self.allocator, self.options.max_intents);
-        defer policy_intents.deinit();
-        if (self.options.policy != null or self.configured_actions.items.len != 0) {
-            var snapshot = self.adapter.worldView().view();
-            if (self.configured_actions.items.len != 0)
-                try configured_actions.append(self.config_program.?, self.configured_actions.items, &snapshot, &policy_intents, self.options.spawn);
-            self.configured_actions.clearRetainingCapacity();
-            if (self.options.policy) |policy| {
-                var callback: script.Callback = .{};
-                try callback.begin(.wm_policy, policy.budget);
-                defer callback.end();
-                self.stats.policy_callbacks += 1;
-                policy.run(policy.context, &callback, &snapshot, &policy_intents) catch {
-                    self.stats.policy_failures += 1;
-                    policy_intents.clear();
-                };
-            }
-        }
-
-        const total = self.queued_intents.count() + policy_intents.count();
-        if (total == 0) return;
-        if (total > self.options.max_intents) {
-            self.stats.policy_failures += 1;
-            self.queued_intents.clear();
-            return;
-        }
-        const commands = try self.allocator.alloc(wm.Command, total);
-        defer self.allocator.free(commands);
-        const queued_count = try self.queued_intents.translate(commands);
-        _ = try policy_intents.translate(commands[queued_count..]);
-        _ = self.adapter.applyPolicyCommands(draft, commands) catch {
-            self.stats.policy_failures += 1;
-            self.queued_intents.clear();
-            return;
-        };
-        self.queued_intents.clear();
-    }
-
-    fn consumeInputIntents(self: *Runtime) !void {
-        const intents = try self.adapter.takeInputIntents();
-        defer self.allocator.free(intents);
-        for (intents) |intent| {
-            const translated = try self.translateInputIntent(intent) orelse continue;
-            self.queued_intents.append(translated) catch |err| {
-                self.queued_intents.clear();
-                return err;
-            };
-        }
-    }
-
-    fn translateInputIntent(self: *Runtime, intent: world.input_intents.Intent) !?script.Intent {
-        const live_window = intent.window orelse return null;
-        const window = try self.adapter.objects.wmWindowId(live_window);
-        const output = (self.adapter.worldView().getWindow(window) orelse return error.UnknownWindow).output orelse return null;
-        return switch (intent.action) {
-            .focus => .{ .focus_window = window },
-            .close => .{ .close_window = window },
-            .toggle_floating => .{ .transition_placement = .{ .window = window, .transition = .floating } },
-            .toggle_fullscreen => .{ .transition_placement = .{ .window = window, .transition = .fullscreen } },
-            .next_column => .{ .focus_direction = .{ .output = output, .direction = .right } },
-            .previous_column => .{ .focus_direction = .{ .output = output, .direction = .left } },
-            .move, .resize => null,
-        };
-    }
-
     fn runRender(self: *Runtime) !void {
         self.boundary = .none;
-        const frames = &(self.frames orelse return self.finishRenderError(error.MissingFrameSet));
-        const render_cycle = self.adapter.beginRender(frames) catch |err| return self.finishRenderError(err);
+        const frames = &(self.frames orelse return transport.finishRenderError(Runtime, self, error.MissingFrameSet));
+        const render_cycle = self.adapter.beginRender(frames) catch |err| return transport.finishRenderError(Runtime, self, err);
         self.render = render_cycle;
         if (self.manager) |manager| manager.placeOutputShellRoles();
         defer {
@@ -359,7 +294,7 @@ pub const Runtime = struct {
         var commits = std.ArrayList(coordinator.SubmittedCommit).empty;
         defer commits.deinit(self.allocator);
         try self.surface_queue.appendReady(self.allocator, &commits);
-        try coordinator.runRender(.{ .operations = operations.items }, commits.items, self.renderEmitter());
+        try coordinator.runRender(.{ .operations = operations.items }, commits.items, transport.renderEmitter(Runtime, self));
     }
 
     fn runShell(self: *Runtime) !void {
@@ -389,32 +324,6 @@ pub const Runtime = struct {
         };
     }
 
-    fn manageTransport(self: *Runtime) plans.Transport {
-        if (self.driver != null) return .{
-            .phase = .managing,
-            .context = @ptrCast(self),
-            .resolver = null,
-            .emit_manage = driverManage,
-            .emit_render = driverRenderUnused,
-            .finish_manage = driverFinishManage,
-            .finish_render = driverFinishRender,
-        };
-        return plans.liveTransport(self.manager orelse unreachable, self.planResolver(), .managing);
-    }
-
-    fn renderEmitter(self: *Runtime) coordinator.Emitter {
-        return .{ .context = self, .prepare_surface = prepareSurface, .sync_surface = syncSurface, .commit_surface = commitSurface, .render_operation = renderOperation, .finish_render = finishRender };
-    }
-
-    fn finishManageError(self: *Runtime, source: anyerror) anyerror {
-        plans.applyManageTransport(self.manageTransport(), .{ .operations = &.{} }) catch |finish_err| return finish_err;
-        return source;
-    }
-    fn finishRenderError(self: *Runtime, source: anyerror) anyerror {
-        coordinator.runRender(.{ .operations = &.{} }, &.{}, self.renderEmitter()) catch |finish_err| return finish_err;
-        return source;
-    }
-
     fn requestManageDirty(self: *Runtime) !void {
         if (self.driver) |driver| return driver.manage_dirty(driver.context);
         const manager = self.manager orelse return error.MissingManager;
@@ -432,94 +341,8 @@ pub const Runtime = struct {
         self.boundary = boundary;
     }
 
-    fn planResolver(self: *Runtime) plans.Resolver {
-        return .{ .context = self, .window = resolveWindow, .node = resolveNode, .seat = resolveSeat, .output = resolveOutput, .shell_surface = resolveShellSurface, .decoration = resolveDecoration, .pointer_binding = resolvePointerBinding };
-    }
-
     fn from(raw: ?*anyopaque) *Runtime {
         return @ptrCast(@alignCast(raw orelse unreachable));
-    }
-    fn fromRequired(raw: *anyopaque) *Runtime {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn resolveWindow(raw: *anyopaque, id: types.WindowId) anyerror!*wayland.client.river.WindowV1 {
-        return fromRequired(raw).adapter.objects.windowProxy(id);
-    }
-    fn resolveNode(raw: *anyopaque, id: types.NodeId) anyerror!*wayland.client.river.NodeV1 {
-        return fromRequired(raw).adapter.objects.nodeProxy(id);
-    }
-    fn resolveSeat(raw: *anyopaque, id: types.SeatId) anyerror!*wayland.client.river.SeatV1 {
-        return fromRequired(raw).adapter.objects.seatProxy(id);
-    }
-    fn resolveOutput(raw: *anyopaque, id: types.OutputId) anyerror!*wayland.client.river.OutputV1 {
-        return fromRequired(raw).adapter.objects.outputProxy(id);
-    }
-    fn resolveShellSurface(raw: *anyopaque, id: types.ShellSurfaceId) anyerror!*wayland.client.river.ShellSurfaceV1 {
-        return fromRequired(raw).adapter.objects.shellSurfaceProxy(id);
-    }
-    fn resolveDecoration(raw: *anyopaque, id: types.DecorationId) anyerror!*wayland.client.river.DecorationV1 {
-        return fromRequired(raw).adapter.objects.decorationProxy(id);
-    }
-    fn resolvePointerBinding(raw: *anyopaque, id: types.PointerBindingId) anyerror!*wayland.client.river.PointerBindingV1 {
-        return fromRequired(raw).adapter.objects.pointerBindingProxy(id);
-    }
-
-    fn driverManage(raw: *anyopaque, _: ?*const plans.Resolver, operation: types.ManageOperation) anyerror!void {
-        const self = fromRequired(raw);
-        const driver = self.driver.?;
-        return driver.emit_manage(driver.context, operation);
-    }
-    fn driverRenderUnused(_: *anyopaque, _: ?*const plans.Resolver, _: types.RenderOperation) anyerror!void {
-        return error.InvalidSequencePhase;
-    }
-    fn driverFinishManage(raw: *anyopaque) anyerror!void {
-        const self = fromRequired(raw);
-        const driver = self.driver.?;
-        return driver.finish_manage(driver.context);
-    }
-    fn driverFinishRender(raw: *anyopaque) anyerror!void {
-        const self = fromRequired(raw);
-        const driver = self.driver.?;
-        return driver.finish_render(driver.context);
-    }
-
-    fn prepareSurface(raw: ?*anyopaque, commit: coordinator.SubmittedCommit) anyerror!void {
-        const self = from(raw);
-        // Resolve every live role before the first sync/commit request. The
-        // manager cannot mutate these maps during this post-dispatch phase.
-        if (self.driver == null) switch (commit.role) {
-            .shell => |id| _ = try self.adapter.objects.shellSurfaceProxy(id),
-            .decoration => |id| _ = try self.adapter.objects.decorationProxy(id),
-        };
-        const surface_hooks = self.options.surfaces orelse return error.MissingSurfacePresenter;
-        return surface_hooks.prepare(surface_hooks.context, commit);
-    }
-    fn syncSurface(raw: ?*anyopaque, role: coordinator.SurfaceRole) void {
-        const self = from(raw);
-        if (self.driver) |driver| return driver.sync_surface(driver.context, role);
-        switch (role) {
-            .shell => |id| (self.adapter.objects.shellSurfaceProxy(id) catch unreachable).syncNextCommit(),
-            .decoration => |id| (self.adapter.objects.decorationProxy(id) catch unreachable).syncNextCommit(),
-        }
-    }
-    fn commitSurface(raw: ?*anyopaque, commit: coordinator.SubmittedCommit) void {
-        const self = from(raw);
-        const surface_hooks = self.options.surfaces.?;
-        surface_hooks.commit(surface_hooks.context, commit);
-        std.debug.assert(self.surface_queue.complete(commit));
-        self.stats.committed_surfaces += 1;
-    }
-    fn renderOperation(raw: ?*anyopaque, operation: types.RenderOperation) anyerror!void {
-        const self = from(raw);
-        if (self.driver) |driver| return driver.emit_render(driver.context, operation);
-        var transport = plans.liveTransport(self.manager.?, self.planResolver(), .rendering);
-        return transport.emit_render(transport.context, &transport.resolver.?, operation);
-    }
-    fn finishRender(raw: ?*anyopaque) anyerror!void {
-        const self = from(raw);
-        if (self.driver) |driver| return driver.finish_render(driver.context);
-        return self.manager.?.renderFinish();
     }
 };
 
