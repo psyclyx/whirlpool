@@ -96,6 +96,17 @@ test "sample shell and decoration modules mount as distinct compositions" {
     var shell_frame = try shell.snapshotAndLower(.{ .width = 800, .height = 600 });
     defer shell_frame.deinit();
     try std.testing.expect(shell_frame.node_count > 100);
+    var shell_background: ?@import("whirlpool-graphics").skia.Rect = null;
+    for (shell_frame.drawList().ops) |operation| switch (operation) {
+        .rect => |rect| if (rect.rect.width == 800 and rect.rect.height == 38) {
+            shell_background = rect.rect;
+            break;
+        },
+        .text => {},
+    };
+    const background = shell_background orelse return error.MissingShellBackground;
+    try std.testing.expectEqual(@as(f32, 0), background.x);
+    try std.testing.expectEqual(@as(f32, 562), background.y);
 
     var decoration = try Composition.init(std.testing.allocator,
         \\return require("whirlpool.decorator")

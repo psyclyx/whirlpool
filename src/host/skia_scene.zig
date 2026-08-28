@@ -132,9 +132,12 @@ const Lowerer = struct {
                 preferred_main
             else
                 auto_share;
-            const preferred_cross = try self.intrinsic(child_index, other(axis));
             const cross_available = crossSize(content, axis);
-            const child_cross = if (preferred_cross > 0) @min(preferred_cross, cross_available) else cross_available;
+            const explicit_cross = if (axis == .horizontal) child.properties.height else child.properties.width;
+            const child_cross = if (explicit_cross) |value|
+                @min(try dimension(value), cross_available)
+            else
+                cross_available;
             const child_box = if (axis == .horizontal)
                 Box{ .x = cursor, .y = content.y, .width = child_main, .height = child_cross }
             else
@@ -237,10 +240,6 @@ fn crossSize(box: Box, axis: Axis) f32 {
     return if (axis == .horizontal) box.height else box.width;
 }
 
-fn other(axis: Axis) Axis {
-    return if (axis == .horizontal) .vertical else .horizontal;
-}
-
 fn validateViewport(viewport: Viewport) LowerError!void {
     if (viewport.width == 0 or viewport.height == 0) return error.InvalidViewport;
 }
@@ -302,6 +301,18 @@ test "stack stretches auto-sized paint nodes to its box" {
     defer result.deinit();
     try std.testing.expectEqual(@as(f32, 80), result.ops[0].rect.rect.width);
     try std.testing.expectEqual(@as(f32, 24), result.ops[0].rect.rect.height);
+}
+
+test "flows stretch auto-sized children across their box" {
+    const root = ui.NodeHandle{ .slot = 0, .generation = 1 };
+    const snapshots = [_]ui.NodeSnapshot{
+        fixture(.column, 0, null, .{}),
+        fixture(.shape, 1, root, .{ .height = 10, .fill = ui.Color.rgba(0, 1, 0, 1) }),
+    };
+    var result = try lower(std.testing.allocator, &snapshots, .{ .width = 100, .height = 30 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(f32, 100), result.ops[0].rect.rect.width);
+    try std.testing.expectEqual(@as(f32, 10), result.ops[0].rect.rect.height);
 }
 
 test "lower rejects unusable input" {
