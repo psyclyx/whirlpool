@@ -37,76 +37,7 @@ pub const Queue = struct {
     submit: *const fn (?*anyopaque, SubmittedCommit) anyerror!void,
 };
 
-const OwnedUpdate = struct {
-    arena: std.heap.ArenaAllocator,
-    value: script.program_loader.Update,
-
-    fn clone(backing: std.mem.Allocator, source: script.program_loader.Update) !OwnedUpdate {
-        var arena = std.heap.ArenaAllocator.init(backing);
-        errdefer arena.deinit();
-        const allocator = arena.allocator();
-        const service = try allocator.dupe(u8, source.service);
-        const values = try allocator.alloc(script.program_loader.Value, source.values.len);
-        for (source.values, values) |item, *destination|
-            destination.* = try cloneValue(allocator, item);
-        return .{ .arena = arena, .value = .{ .service = service, .values = values } };
-    }
-
-    fn deinit(self: *OwnedUpdate) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-
-    fn cloneValue(allocator: std.mem.Allocator, source: script.program_loader.Value) !script.program_loader.Value {
-        return switch (source) {
-            .nil => .nil,
-            .boolean => |value| .{ .boolean = value },
-            .number => |value| .{ .number = value },
-            .string => |value| .{ .string = try allocator.dupe(u8, value) },
-            .array => |value| blk: {
-                const items = try allocator.alloc(script.program_loader.Value, value.len);
-                for (value, items) |item, *destination|
-                    destination.* = try cloneValue(allocator, item);
-                break :blk .{ .array = items };
-            },
-        };
-    }
-
-    fn eql(self: *const OwnedUpdate, source: script.program_loader.Update) bool {
-        if (!std.mem.eql(u8, self.value.service, source.service)) return false;
-        if (self.value.values.len != source.values.len) return false;
-        for (self.value.values, source.values) |left, right|
-            if (!eqlValue(left, right)) return false;
-        return true;
-    }
-
-    fn eqlValue(left: script.program_loader.Value, right: script.program_loader.Value) bool {
-        return switch (left) {
-            .nil => right == .nil,
-            .boolean => |value| switch (right) {
-                .boolean => |other| value == other,
-                else => false,
-            },
-            .number => |value| switch (right) {
-                .number => |other| value == other,
-                else => false,
-            },
-            .string => |value| switch (right) {
-                .string => |other| std.mem.eql(u8, value, other),
-                else => false,
-            },
-            .array => |value| switch (right) {
-                .array => |other| blk: {
-                    if (value.len != other.len) break :blk false;
-                    for (value, other) |item, other_item|
-                        if (!eqlValue(item, other_item)) break :blk false;
-                    break :blk true;
-                },
-                else => false,
-            },
-        };
-    }
-};
+const OwnedUpdate = script.program_loader.OwnedUpdate;
 
 const SlotState = enum { free, rendering, ready, prepared, armed, submitted };
 
@@ -602,18 +533,4 @@ fn createRoleProduct(raw: ?*anyopaque, info: Registry.CreateInfo) !Registry.Pres
     try product.init();
     owner.created_product = product;
     return .{ .context = product, .vtable = &RolePresenter.vtable };
-}
-
-test "owned updates recursively detach borrowed service values" {
-    const nested = [_]script.program_loader.Value{.{ .string = "title" }};
-    const source = [_]script.program_loader.Value{.{ .array = &nested }};
-    var owned = try OwnedUpdate.clone(std.testing.allocator, .{ .service = "desktop", .values = &source });
-    defer owned.deinit();
-    try std.testing.expectEqualStrings("desktop", owned.value.service);
-    try std.testing.expectEqualStrings("title", owned.value.values[0].array[0].string);
-    try std.testing.expect(owned.eql(.{ .service = "desktop", .values = &source }));
-
-    const changed_nested = [_]script.program_loader.Value{.{ .string = "other" }};
-    const changed = [_]script.program_loader.Value{.{ .array = &changed_nested }};
-    try std.testing.expect(!owned.eql(.{ .service = "desktop", .values = &changed }));
 }
