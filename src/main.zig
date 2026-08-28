@@ -1,7 +1,7 @@
 const std = @import("std");
 const runtime = @import("whirlpool-runtime");
-const river_app = @import("app/river.zig");
-const layer_shell_app = @import("app/layer/shell.zig");
+const river_app = @import("whirlpool-app-river");
+const layer_shell_app = @import("whirlpool-app-layer-shell");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;

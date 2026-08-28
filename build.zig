@@ -286,6 +286,65 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Application modules are intentionally narrow composition roots. Keeping
+    // their imports explicit prevents startup code from reaching through to a
+    // lower layer merely because the executable happens to know about it.
+    const app_river_configured = b.addModule("whirlpool-app-river-configured", .{
+        .root_source_file = b.path("src/app/river/configured.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wayland", .module = wayland },
+            .{ .name = "whirlpool-script", .module = script },
+            .{ .name = "whirlpool-wayland-client", .module = wayland_client },
+            .{ .name = "whirlpool-river-host-runtime", .module = river_host_runtime },
+            .{ .name = "whirlpool-river-keybindings", .module = river_keybindings },
+            .{ .name = "whirlpool-river-layout-runtime", .module = river_layout_runtime },
+            .{ .name = "whirlpool-river-policy-runtime", .module = river_policy_runtime },
+        },
+    });
+    const app_river_presentation = b.addModule("whirlpool-app-river-presentation", .{
+        .root_source_file = b.path("src/app/river/presentation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wayland", .module = wayland },
+            .{ .name = "whirlpool-host", .module = host },
+            .{ .name = "whirlpool-script", .module = script },
+            .{ .name = "whirlpool-wayland-client", .module = wayland_client },
+            .{ .name = "whirlpool-river-host-runtime", .module = river_host_runtime },
+            .{ .name = "whirlpool-river-role-lifecycle", .module = river_role_lifecycle },
+            .{ .name = "whirlpool-river-presenter-runtime", .module = river_presenter_runtime },
+        },
+    });
+    const app_river = b.addModule("whirlpool-app-river", .{
+        .root_source_file = b.path("src/app/river.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wayland", .module = wayland },
+            .{ .name = "whirlpool-wayland-client", .module = wayland_client },
+            .{ .name = "whirlpool-wayland-runtime", .module = wayland_runtime },
+            .{ .name = "whirlpool-river-live", .module = river_live },
+            .{ .name = "whirlpool-river-host-runtime", .module = river_host_runtime },
+            .{ .name = "whirlpool-river-role-lifecycle", .module = river_role_lifecycle },
+            .{ .name = "whirlpool-app-river-configured", .module = app_river_configured },
+            .{ .name = "whirlpool-app-river-presentation", .module = app_river_presentation },
+        },
+    });
+    const app_layer_shell = b.addModule("whirlpool-app-layer-shell", .{
+        .root_source_file = b.path("src/app/layer/shell.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wayland", .module = wayland },
+            .{ .name = "whirlpool-script", .module = script },
+            .{ .name = "whirlpool-wayland-client", .module = wayland_client },
+            .{ .name = "whirlpool-wayland-runtime", .module = wayland_runtime },
+            .{ .name = "whirlpool-wayland-layer-runtime", .module = wayland_layer_runtime },
+        },
+    });
+
     const exe = b.addExecutable(.{
         .name = "whirlpool",
         .root_module = b.createModule(.{
@@ -293,26 +352,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "wayland", .module = wayland },
                 .{ .name = "whirlpool-runtime", .module = runtime },
-                .{ .name = "whirlpool-wm", .module = wm },
-                .{ .name = "whirlpool-ui", .module = ui },
-                .{ .name = "whirlpool-graphics", .module = graphics },
-                .{ .name = "whirlpool-host", .module = host },
-                .{ .name = "whirlpool-script", .module = script },
-                .{ .name = "whirlpool-wayland-client", .module = wayland_client },
-                .{ .name = "whirlpool-wayland-runtime", .module = wayland_runtime },
-                .{ .name = "whirlpool-wayland-layer-runtime", .module = wayland_layer_runtime },
-                .{ .name = "whirlpool-river-live", .module = river_live },
-                .{ .name = "whirlpool-river-keybindings", .module = river_keybindings },
-                .{ .name = "whirlpool-river-live-plans", .module = river_live_plans },
-                .{ .name = "whirlpool-river-live-world", .module = river_live_world },
-                .{ .name = "whirlpool-river-host-runtime", .module = river_host_runtime },
-                .{ .name = "whirlpool-river-layout-runtime", .module = river_layout_runtime },
-                .{ .name = "whirlpool-river-policy-runtime", .module = river_policy_runtime },
-                .{ .name = "whirlpool-river-role-lifecycle", .module = river_role_lifecycle },
-                .{ .name = "whirlpool-river-presentation", .module = river_presentation },
-                .{ .name = "whirlpool-river-presenter-runtime", .module = river_presenter_runtime },
+                .{ .name = "whirlpool-app-river", .module = app_river },
+                .{ .name = "whirlpool-app-layer-shell", .module = app_layer_shell },
             },
         }),
     });
@@ -356,6 +398,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_role_lifecycle })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_presentation })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_presenter_runtime })).step);
+    inline for (.{ app_river_configured, app_river_presentation, app_river, app_layer_shell }) |module| {
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+    }
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/script/lua/vm.zig"),

@@ -7,8 +7,8 @@ const wayland_runtime = @import("whirlpool-wayland-runtime");
 const river_live = @import("whirlpool-river-live");
 const river_host_runtime = @import("whirlpool-river-host-runtime");
 const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
-const configured = @import("river/configured.zig");
-const presentation_app = @import("river/presentation.zig");
+const configured = @import("whirlpool-app-river-configured");
+const presentation_app = @import("whirlpool-app-river-presentation");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !void {
     var client = try wayland_client.Client.connect(allocator);
