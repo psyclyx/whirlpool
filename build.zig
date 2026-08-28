@@ -373,33 +373,39 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all unit tests");
     const graphics_test_step = b.step("graphics-test", "Run graphics and Vulkan WSI tests");
-    inline for (.{ wm, ui, runtime, host, script }) |module| {
+    inline for (.{
+        wm,
+        ui,
+        runtime,
+        host,
+        script,
+        wayland_client,
+        wayland_layer_shell,
+        wayland_surface_presenter,
+        wayland_layer_runtime,
+        wayland_runtime,
+        river_layer_shell,
+        river_live,
+        river_keybindings,
+        river_live_plans,
+        river_live_world,
+        river_layout_runtime,
+        river_policy_runtime,
+        river_host_runtime,
+        river_role_lifecycle,
+        river_presentation,
+        river_presenter_runtime,
+        app_river_configured,
+        app_river_presentation,
+        app_river,
+        app_layer_shell,
+    }) |module| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
     }
-    const graphics_tests = b.addRunArtifact(b.addTest(.{ .root_module = graphics }));
-    test_step.dependOn(&graphics_tests.step);
-    graphics_test_step.dependOn(&graphics_tests.step);
-    const wsi_tests = b.addRunArtifact(b.addTest(.{ .root_module = wayland_wsi }));
-    test_step.dependOn(&wsi_tests.step);
-    graphics_test_step.dependOn(&wsi_tests.step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wayland_client })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wayland_layer_shell })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wayland_surface_presenter })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wayland_layer_runtime })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wayland_runtime })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_layer_shell })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_live })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_keybindings })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_live_plans })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_live_world })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_layout_runtime })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_policy_runtime })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_host_runtime })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_role_lifecycle })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_presentation })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = river_presenter_runtime })).step);
-    inline for (.{ app_river_configured, app_river_presentation, app_river, app_layer_shell }) |module| {
-        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+    inline for (.{ graphics, wayland_wsi }) |module| {
+        const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = module }));
+        test_step.dependOn(&run_tests.step);
+        graphics_test_step.dependOn(&run_tests.step);
     }
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
         .root_module = b.createModule(.{
