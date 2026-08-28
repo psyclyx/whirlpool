@@ -52,6 +52,14 @@ pub const Bridge = struct {
         self.context.roles = roles;
     }
 
+    pub fn setWake(self: *Bridge, wake: river_presenter_runtime.Wake) void {
+        if (self.graphics) |graphics| graphics.setWake(wake);
+    }
+
+    pub fn clearWake(self: *Bridge) void {
+        if (self.graphics) |graphics| graphics.clearWake();
+    }
+
     /// Poll graphics releases before role retirement reconciliation.
     pub fn pollReleases(self: *Bridge) !void {
         const graphics = self.graphics orelse return;

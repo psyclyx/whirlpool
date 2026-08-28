@@ -37,6 +37,11 @@ pub const Queue = struct {
     submit: *const fn (?*anyopaque, SubmittedCommit) anyerror!void,
 };
 
+pub const Wake = struct {
+    context: ?*anyopaque = null,
+    run: *const fn (?*anyopaque) void,
+};
+
 const OwnedUpdate = script.program_loader.OwnedUpdate;
 
 const SlotState = enum { free, rendering, ready, prepared, armed, submitted };
@@ -44,12 +49,14 @@ const SlotState = enum { free, rendering, ready, prepared, armed, submitted };
 const Slot = struct {
     allocation: dmabuf.Buffer,
     image: dmabuf.VulkanImage,
-    wl_buffer: *wayland_dmabuf.Buffer,
+    wl_buffer: ?*wayland_dmabuf.Buffer = null,
     state: SlotState = .free,
 
     fn deinit(self: *Slot, abandon: bool) void {
         if (!abandon) std.debug.assert(self.state == .free or self.state == .ready);
-        if (abandon) self.wl_buffer.abandon() else self.wl_buffer.deinit();
+        if (self.wl_buffer) |buffer| {
+            if (abandon) buffer.abandon() else buffer.deinit();
+        }
         self.image.deinit();
         self.allocation.deinit();
         self.* = undefined;
@@ -70,12 +77,14 @@ const RolePresenter = struct {
     composition: host.surface_composition.Composition,
     slots: [slot_count]Slot = undefined,
     initialized_slots: usize = 0,
+    buffers_adopted: bool = false,
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     thread: ?std.Thread = null,
     pending: ?OwnedUpdate = null,
     accepted: ?OwnedUpdate = null,
     worker_active: bool = false,
+    worker_error: ?anyerror = null,
     closing: bool = false,
     retiring: bool = false,
     status: Registry.PresenterState = .waiting_for_buffer,
@@ -96,16 +105,12 @@ const RolePresenter = struct {
         };
         const values = [_]script.program_loader.Value{.{ .string = role_name }};
         try self.composition.update(.{ .service = "surface-role", .values = &values });
-        errdefer while (self.initialized_slots > 0) {
-            self.initialized_slots -= 1;
-            self.slots[self.initialized_slots].deinit(false);
-        };
-        while (self.initialized_slots < slot_count) : (self.initialized_slots += 1)
-            self.slots[self.initialized_slots] = try self.createSlot();
         self.thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, workerMain, .{self});
     }
 
-    fn createSlot(self: *RolePresenter) !Slot {
+    fn createGraphicsSlot(self: *RolePresenter) !Slot {
+        self.owner.gpu_mutex.lockUncancelable(self.owner.io);
+        defer self.owner.gpu_mutex.unlock(self.owner.io);
         var allocation = try dmabuf.Buffer.init(
             &self.owner.context.gbm,
             self.extent.width,
@@ -116,20 +121,23 @@ const RolePresenter = struct {
         errdefer allocation.deinit();
         var image = try dmabuf.VulkanImage.init(self.owner.context, &allocation);
         errdefer image.deinit();
+        return .{ .allocation = allocation, .image = image };
+    }
+
+    fn createWaylandBuffer(self: *RolePresenter, allocation: *const dmabuf.Buffer) !*wayland_dmabuf.Buffer {
         var planes: [dmabuf.max_planes]wayland_dmabuf.Plane = undefined;
         for (allocation.planeSlice(), 0..) |plane, index| planes[index] = .{
             .fd = plane.fd,
             .offset = plane.offset,
             .stride = plane.stride,
         };
-        const wl_buffer = try self.owner.dmabuf_manager.createBuffer(
+        return self.owner.dmabuf_manager.createBuffer(
             allocation.width,
             allocation.height,
             allocation.format,
             allocation.modifier,
             planes[0..allocation.plane_count],
         );
-        return .{ .allocation = allocation, .image = image, .wl_buffer = wl_buffer };
     }
 
     fn enqueue(self: *RolePresenter, source: script.program_loader.Update) !void {
@@ -165,10 +173,26 @@ const RolePresenter = struct {
     }
 
     fn workerMain(self: *RolePresenter) void {
-        var renderer = graphics.skia.GpuRenderer.init(self.owner.context.skiaContext()) catch |err| {
-            std.log.err("Skia DMA-BUF worker failed to initialize: {s}", .{@errorName(err)});
+        self.allocateSlots() catch |err| {
+            self.lock();
+            const closing = self.closing;
+            if (!closing) self.worker_error = err;
+            self.changed.broadcast(self.owner.io);
+            self.unlock();
+            if (!closing) self.owner.notifyWake();
             return;
         };
+        self.owner.gpu_mutex.lockUncancelable(self.owner.io);
+        var renderer = graphics.skia.GpuRenderer.init(self.owner.context.skiaContext()) catch |err| {
+            self.owner.gpu_mutex.unlock(self.owner.io);
+            self.lock();
+            self.worker_error = err;
+            self.changed.broadcast(self.owner.io);
+            self.unlock();
+            self.owner.notifyWake();
+            return;
+        };
+        self.owner.gpu_mutex.unlock(self.owner.io);
         defer renderer.deinit();
         while (true) {
             self.lock();
@@ -206,7 +230,51 @@ const RolePresenter = struct {
                 self.status = .ready;
             self.changed.signal(self.owner.io);
             self.unlock();
+            self.owner.notifyWake();
         }
+    }
+
+    fn allocateSlots(self: *RolePresenter) !void {
+        var slots: [slot_count]Slot = undefined;
+        var initialized: usize = 0;
+        errdefer while (initialized > 0) {
+            initialized -= 1;
+            slots[initialized].deinit(false);
+        };
+        while (initialized < slot_count) : (initialized += 1)
+            slots[initialized] = try self.createGraphicsSlot();
+
+        self.lock();
+        if (self.closing) {
+            self.unlock();
+            return error.PresenterClosing;
+        }
+        self.slots = slots;
+        self.initialized_slots = slot_count;
+        self.changed.broadcast(self.owner.io);
+        self.unlock();
+        self.owner.notifyWake();
+    }
+
+    fn adoptBuffers(self: *RolePresenter) !void {
+        self.lock();
+        if (self.worker_error) |err| {
+            self.unlock();
+            return err;
+        }
+        const ready = self.initialized_slots == slot_count;
+        const adopted = self.buffers_adopted;
+        self.unlock();
+        if (!ready or adopted) return;
+
+        var index: usize = 0;
+        while (index < slot_count) : (index += 1) {
+            if (self.slots[index].wl_buffer != null) continue;
+            self.slots[index].wl_buffer = try self.createWaylandBuffer(&self.slots[index].allocation);
+        }
+        self.lock();
+        self.buffers_adopted = true;
+        self.unlock();
     }
 
     fn render(self: *RolePresenter, renderer: *graphics.skia.GpuRenderer, slot_index: usize, update: script.program_loader.Update) !void {
@@ -277,9 +345,9 @@ const RolePresenter = struct {
         const index = self.ready_slot.?;
         self.unlock();
         const slot = &self.slots[index];
-        self.surface.attach(slot.wl_buffer.proxy, 0, 0);
+        self.surface.attach(slot.wl_buffer.?.proxy, 0, 0);
         self.surface.damageBuffer(0, 0, @intCast(self.extent.width), @intCast(self.extent.height));
-        slot.wl_buffer.markAttached();
+        slot.wl_buffer.?.markAttached();
         self.surface.commit();
         self.lock();
         slot.state = .submitted;
@@ -360,7 +428,7 @@ const RolePresenter = struct {
     fn reapReleasedLocked(self: *RolePresenter) void {
         var freed = false;
         for (&self.slots) |*slot| {
-            if (slot.state != .submitted or !slot.wl_buffer.reusable()) continue;
+            if (slot.state != .submitted or !slot.wl_buffer.?.reusable()) continue;
             slot.state = .free;
             freed = true;
         }
@@ -399,6 +467,7 @@ pub const Runtime = struct {
     decoration_surface: ?*const script.config.SurfaceSpec,
     registry: Registry,
     queue: Queue,
+    wake: ?Wake = null,
     roles: std.ArrayList(RoleRecord) = .empty,
     created_product: ?*RolePresenter = null,
     abandoning: bool = false,
@@ -431,6 +500,7 @@ pub const Runtime = struct {
         self.surface = surface;
         self.decoration_surface = decoration_surface;
         self.queue = queue;
+        self.wake = null;
         self.roles = .empty;
         self.created_product = null;
         self.abandoning = false;
@@ -471,6 +541,15 @@ pub const Runtime = struct {
         return .{ .context = self, .create = createRoleProduct };
     }
 
+    pub fn setWake(self: *Runtime, wake: Wake) void {
+        std.debug.assert(self.roles.items.len == 0);
+        self.wake = wake;
+    }
+
+    pub fn clearWake(self: *Runtime) void {
+        self.wake = null;
+    }
+
     pub fn createRole(self: *Runtime, role: SurfaceRole, surface: *wayland.client.wl.Surface, extent: Extent) !void {
         if (self.created_product != null) return error.ProductCreationReentered;
         try self.registry.createRole(.{ .role = role, .surface = surface, .extent = extent });
@@ -488,7 +567,10 @@ pub const Runtime = struct {
     }
 
     pub fn pollReleases(self: *Runtime) !usize {
-        for (self.roles.items) |record| record.product.reapReleased();
+        for (self.roles.items) |record| {
+            try record.product.adoptBuffers();
+            record.product.reapReleased();
+        }
         return self.registry.pollReleases();
     }
 
@@ -522,6 +604,10 @@ pub const Runtime = struct {
     fn findRole(self: *const Runtime, role: SurfaceRole) ?*const RoleRecord {
         for (self.roles.items) |*record| if (std.meta.eql(record.role, role)) return record;
         return null;
+    }
+
+    fn notifyWake(self: *const Runtime) void {
+        if (self.wake) |callback| callback.run(callback.context);
     }
 };
 

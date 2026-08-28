@@ -52,6 +52,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     var session: wayland_runtime.Session = undefined;
     try session.init(client);
     defer session.deinit();
+    presentation.setWake(.{ .context = @ptrCast(&session), .run = wakeSession });
+    defer presentation.clearWake();
     session.setPollInterval(16);
     var after_dispatch = AfterDispatch{
         .client = client,
@@ -80,6 +82,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
         roles_live = false;
     }
     if (manager.takeListenerError()) |err| return err;
+}
+
+fn wakeSession(raw: ?*anyopaque) void {
+    const session: *wayland_runtime.Session = @ptrCast(@alignCast(raw orelse return));
+    session.loop.wake() catch {};
 }
 
 const AfterDispatch = struct {
