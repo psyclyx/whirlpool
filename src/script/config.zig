@@ -20,9 +20,13 @@ pub const SurfaceSpec = struct {
     role: []u8,
     placement: []u8,
     content: []u8,
+    edge: []u8,
+    height: u32 = 0,
+    exclusive_zone: u32 = 0,
 
     pub fn deinit(self: *SurfaceSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
+        allocator.free(self.edge);
         allocator.free(self.placement);
         allocator.free(self.role);
         allocator.free(self.provider);
@@ -158,8 +162,21 @@ fn parseSurface(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!SurfaceSpec 
     errdefer allocator.free(placement);
     const content = try dupeField(allocator, vm, base, "content", error.InvalidContent);
     errdefer allocator.free(content);
+    const edge = try dupeOptionalField(allocator, vm, base, "edge", "top");
+    errdefer allocator.free(edge);
     if (content.len > MaxSurfaceSourceBytes) return error.InvalidContent;
-    return .{ .provider = provider, .role = role, .placement = placement, .content = content };
+    const height = try optionalU32Field(vm, base, "height");
+    const exclusive_zone = try optionalU32Field(vm, base, "exclusive_zone");
+    if (!std.mem.eql(u8, edge, "top") and !std.mem.eql(u8, edge, "bottom")) return error.InvalidSurface;
+    return .{
+        .provider = provider,
+        .role = role,
+        .placement = placement,
+        .content = content,
+        .edge = edge,
+        .height = height,
+        .exclusive_zone = exclusive_zone,
+    };
 }
 
 fn dupeField(allocator: std.mem.Allocator, vm: *lua_vm.Vm, base: c_int, comptime name: [:0]const u8, failure: Error) Error![]u8 {
@@ -168,6 +185,24 @@ fn dupeField(allocator: std.mem.Allocator, vm: *lua_vm.Vm, base: c_int, comptime
     const value = vm.string(-1) orelse return failure;
     if (value.len == 0) return failure;
     return allocator.dupe(u8, value);
+}
+
+fn dupeOptionalField(allocator: std.mem.Allocator, vm: *lua_vm.Vm, base: c_int, comptime name: [:0]const u8, fallback: []const u8) Error![]u8 {
+    vm.getField(-1, name);
+    defer vm.setTop(base);
+    if (vm.luaType(-1) == .nil) return allocator.dupe(u8, fallback);
+    const value = vm.string(-1) orelse return error.InvalidSurface;
+    if (value.len == 0) return error.InvalidSurface;
+    return allocator.dupe(u8, value);
+}
+
+fn optionalU32Field(vm: *lua_vm.Vm, base: c_int, comptime name: [:0]const u8) Error!u32 {
+    vm.getField(-1, name);
+    defer vm.setTop(base);
+    if (vm.luaType(-1) == .nil) return 0;
+    const value = vm.integer(-1) orelse return error.InvalidSurface;
+    if (value < 0 or value > std.math.maxInt(u32)) return error.InvalidSurface;
+    return @intCast(value);
 }
 
 test "loads the declarative binding shape" {
@@ -203,4 +238,5 @@ test "generic surface descriptors own provider placement and content" {
     try std.testing.expectEqualStrings("shell", surfaces[0].role);
     try std.testing.expectEqualStrings("all-outputs", surfaces[0].placement);
     try std.testing.expectEqualStrings("return function(parent) return {} end", surfaces[0].content);
+    try std.testing.expectEqualStrings("top", surfaces[0].edge);
 }

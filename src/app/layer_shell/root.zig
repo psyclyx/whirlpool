@@ -13,6 +13,9 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     defer config.deinit();
     const surface = config.surface("layer-shell", "shell") orelse
         return error.MissingLayerShellSurface;
+    const bottom = std.mem.eql(u8, surface.edge, "bottom");
+    const surface_height = if (surface.height != 0) surface.height else 40;
+    const exclusive_zone: i32 = @intCast(if (surface.exclusive_zone != 0) surface.exclusive_zone else surface_height);
 
     var client = try wayland_client.Client.connect(allocator);
     defer client.deinit();
@@ -20,9 +23,9 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     defer compositor.destroy();
 
     var layer = try layer_shell_runtime.Runtime.init(allocator, client, compositor, .{
-        .height = 40,
-        .anchor = .{ .top = true, .left = true, .right = true },
-        .exclusive_zone = 40,
+        .height = surface_height,
+        .anchor = .{ .top = !bottom, .bottom = bottom, .left = true, .right = true },
+        .exclusive_zone = exclusive_zone,
     }, surface);
     defer layer.deinit();
 
@@ -45,6 +48,7 @@ const AfterDispatch = struct {
 
     fn run(raw: ?*anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
+        try self.runtime.update(.{ .service = "tick" });
         _ = self.runtime.presentIfReady() catch |err| switch (err) {
             error.NotReady => return,
             error.SurfaceClosed => {
