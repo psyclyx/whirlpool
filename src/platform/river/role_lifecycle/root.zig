@@ -159,13 +159,16 @@ pub const Runtime = struct {
 
     pub fn forEachShell(self: *const Runtime, context: ?*anyopaque, visit: ShellVisitor) !void {
         for (self.shells.items) |record| {
+            if (record.state != .active) continue;
             const shell_id = try self.adapter.objects.shellSurfaceId(record.role);
             try visit(context, record.output_id, shell_id);
         }
     }
 
     pub fn forEachDecoration(self: *const Runtime, context: ?*anyopaque, visit: DecorationVisitor) !void {
-        for (self.decorations.items) |record| try visit(context, record.window, record.id);
+        for (self.decorations.items) |record| {
+            if (record.state == .active) try visit(context, record.window, record.id);
+        }
     }
 
     pub fn outputForSurface(self: *const Runtime, surface: *wayland.client.wl.Surface) ?types.OutputId {
