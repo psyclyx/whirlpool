@@ -21,7 +21,7 @@ pub fn append(
         .snapshot = snapshot,
         .intents = intents,
         .spawn = spawn,
-        .focus_output = snapshot.firstOutput(),
+        .focus_output = focusedOutput(snapshot),
     };
     try runner.appendAll(action_indices);
 }
@@ -56,6 +56,7 @@ const Runner = struct {
             },
             .toggle_split_tabbed => try self.toggleContainerMode(),
             .focus_tab => |step| try self.focusTab(step),
+            .focus_output => |step| try self.focusOutput(step),
             .focus_tag => |ordinal| try self.focusTag(ordinal),
             .send_to_tag => |ordinal| try self.sendToTag(ordinal),
             .spawn => |args| try self.spawnCommand(args),
@@ -99,6 +100,22 @@ const Runner = struct {
         } });
     }
 
+    fn focusOutput(self: *Runner, step: script.config.TabStep) !void {
+        const count = self.snapshot.liveOutputCount();
+        if (count < 2) return;
+        const current = self.focus_output orelse return;
+        var current_index: usize = 0;
+        while (current_index < count and self.snapshot.outputAt(current_index) != current) : (current_index += 1) {}
+        if (current_index == count) return;
+        const next_index = switch (step) {
+            .previous => if (current_index == 0) count - 1 else current_index - 1,
+            .next => (current_index + 1) % count,
+        };
+        const output = self.snapshot.outputAt(next_index) orelse return;
+        self.focus_output = output;
+        if (self.snapshot.focusedWindow(output)) |window| try self.intents.append(.{ .focus_window = window });
+    }
+
     fn focusTag(self: *Runner, ordinal: u8) !void {
         std.debug.assert(ordinal > 0);
         const output = self.focusedWindowOutput() orelse return;
@@ -127,9 +144,24 @@ const Runner = struct {
 };
 
 fn focusedNode(snapshot: *const script.Snapshot) ?wm.NodeId {
-    const output = snapshot.firstOutput() orelse return null;
+    const output = focusedOutput(snapshot) orelse return null;
     const window = snapshot.focusedWindow(output) orelse return null;
     return snapshot.nodeForWindow(window);
+}
+
+fn focusedOutput(snapshot: *const script.Snapshot) ?wm.OutputId {
+    var result = snapshot.firstOutput();
+    var best_serial: u64 = 0;
+    var output_index: usize = 0;
+    while (snapshot.outputAt(output_index)) |output| : (output_index += 1) {
+        const window_id = snapshot.focusedWindow(output) orelse continue;
+        const window = snapshot.getWindow(window_id) orelse continue;
+        if (result == null or window.focus_serial > best_serial) {
+            result = output;
+            best_serial = window.focus_serial;
+        }
+    }
+    return result;
 }
 
 fn focusedParent(snapshot: *const script.Snapshot) ?*const wm.Node {

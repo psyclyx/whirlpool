@@ -21,6 +21,7 @@ pub const Action = union(enum) {
     cycle_width: wm.ColumnWidthStep,
     toggle_split_tabbed,
     focus_tab: TabStep,
+    focus_output: TabStep,
     focus_tag: u8,
     send_to_tag: u8,
     spawn: [][]u8,
@@ -140,7 +141,6 @@ fn parseAction(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!Action {
     if (directionAction(name, "focus-")) |direction| return .{ .focus = direction };
     if (directionAction(name, "swap-")) |direction| return .{ .swap = direction };
     if (directionAction(name, "absorb-")) |direction| {
-        if (direction == .up or direction == .down) return error.InvalidAction;
         return .{ .absorb = direction };
     }
     if (directionAction(name, "expel-")) |direction| {
@@ -156,6 +156,8 @@ fn parseAction(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!Action {
     if (std.mem.eql(u8, name, "toggle-split-tabbed")) return .toggle_split_tabbed;
     if (std.mem.eql(u8, name, "focus-tab-next")) return .{ .focus_tab = .next };
     if (std.mem.eql(u8, name, "focus-tab-prev")) return .{ .focus_tab = .previous };
+    if (std.mem.eql(u8, name, "focus-output-next")) return .{ .focus_output = .next };
+    if (std.mem.eql(u8, name, "focus-output-prev")) return .{ .focus_output = .previous };
     return error.InvalidAction;
 }
 

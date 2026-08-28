@@ -250,6 +250,30 @@ test "directional actions and structural moves keep the tree valid" {
     try world.validate();
 }
 
+test "vertical absorb groups adjacent leaves without losing either window" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
+        .usable = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
+    });
+    const column = try world.createColumn(tag, .{});
+    const first = try world.createWindow(.{ .tag = tag, .output = output });
+    const second = try world.createWindow(.{ .tag = tag, .output = output });
+    try world.manageWindow(first, column);
+    try world.manageWindow(second, column);
+    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = second } }});
+    _ = try world.applyAtomically(&.{.{ .tree = .{ .absorb = .{ .output = output, .direction = .up } } }});
+    try world.validate();
+    const first_node = world.getNode(world.nodeForWindow(first).?).?;
+    const second_node = world.getNode(world.nodeForWindow(second).?).?;
+    try std.testing.expectEqual(first_node.parent, second_node.parent);
+    try std.testing.expect(first_node.parent != null);
+    try std.testing.expectEqual(types.Axis.vertical, world.getNode(first_node.parent.?).?.axis);
+}
+
 test "output removal orphans windows and repairs focus" {
     var world = World.init(std.testing.allocator);
     defer world.deinit();

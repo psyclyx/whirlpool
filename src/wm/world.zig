@@ -310,6 +310,20 @@ pub const World = struct {
         return null;
     }
 
+    pub fn outputAt(self: *const World, target: usize) ?OutputId {
+        var ordinal: usize = 0;
+        for (self.outputs.slots.items) |slot| {
+            const output = slot.value orelse continue;
+            if (ordinal == target) return output.id;
+            ordinal += 1;
+        }
+        return null;
+    }
+
+    pub fn liveOutputCount(self: *const World) usize {
+        return self.outputs.liveCount();
+    }
+
     /// Return the number of live tags.
     pub fn liveTagCount(self: *const World) usize {
         return self.tags.liveCount();

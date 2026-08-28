@@ -54,6 +54,14 @@ pub fn View(comptime World: type) type {
             return self.world.firstOutput();
         }
 
+        pub fn outputAt(self: Self, ordinal: usize) ?ids.OutputId {
+            return self.world.outputAt(ordinal);
+        }
+
+        pub fn liveOutputCount(self: Self) usize {
+            return self.world.liveOutputCount();
+        }
+
         pub fn focusedWindow(self: Self, output_id: ids.OutputId) ?ids.WindowId {
             const output = self.getOutput(output_id) orelse return null;
             const tag = self.getTag(output.active_tag) orelse return null;
@@ -133,6 +141,14 @@ pub fn Checkpoint(comptime World: type) type {
 
         pub fn firstOutput(self: *const Self) ?ids.OutputId {
             return self.state.world.firstOutput();
+        }
+
+        pub fn outputAt(self: *const Self, ordinal: usize) ?ids.OutputId {
+            return self.state.world.outputAt(ordinal);
+        }
+
+        pub fn liveOutputCount(self: *const Self) usize {
+            return self.state.world.liveOutputCount();
         }
 
         pub fn focusedWindow(self: *const Self, output_id: ids.OutputId) ?ids.WindowId {

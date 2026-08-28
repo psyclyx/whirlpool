@@ -117,10 +117,37 @@ pub fn swapDirectionInPlace(world: anytype, output: OutputId, direction: Directi
 }
 
 pub fn absorbInPlace(world: anytype, output: OutputId, direction: Direction) !void {
-    if (direction != .left and direction != .right) return error.NoFocusTarget;
     const focused = focusedNode(world, output) orelse return error.NoFocusTarget;
     const node = world.nodes.getConst(focused) orelse return error.InvalidInvariant;
     const column = world.columns.getConst(node.column) orelse return error.InvalidInvariant;
+    if (direction == .up or direction == .down) {
+        var leaves = std.ArrayList(NodeId).empty;
+        defer leaves.deinit(world.allocator);
+        try collectVisibleLeaves(world, column.root, &leaves);
+        const current_index = indexOfNode(leaves.items, focused) orelse return error.NoFocusTarget;
+        const target_index = if (direction == .up)
+            if (current_index == 0) null else current_index - 1
+        else if (current_index + 1 >= leaves.items.len) null else current_index + 1;
+        const target = leaves.items[target_index orelse return error.NoFocusTarget];
+        const moved_window = world.nodes.getConst(target).?.window orelse return error.InvalidInvariant;
+
+        try detachNodeInPlace(world, target);
+        const container_id = try wrapNodeInPlace(world, focused, .split, .vertical);
+        const container = world.nodes.get(container_id) orelse return error.InvalidInvariant;
+        try container.children.ensureTotalCapacity(world.allocator, 2);
+        if (direction == .up) {
+            container.children.appendAssumeCapacity(container.children.items[0]);
+            container.children.items[0] = .{ .id = target };
+            container.active_child = 1;
+        } else {
+            container.children.appendAssumeCapacity(.{ .id = target });
+            container.active_child = 0;
+        }
+        world.nodes.get(target).?.parent = container_id;
+        setColumnRecursive(world, target, column.id);
+        try focusWindowInPlace(world, moved_window);
+        return;
+    }
     const tag = world.tags.getConst(column.tag) orelse return error.InvalidInvariant;
     const index = indexOfColumn(tag.columns.items, column.id) orelse return error.InvalidInvariant;
     const target_index = if (direction == .left)
