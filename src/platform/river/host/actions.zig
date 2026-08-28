@@ -138,7 +138,12 @@ const Runner = struct {
 
     fn spawnCommand(self: *Runner, args: []const []const u8) !void {
         std.debug.assert(args.len > 0);
-        if (self.spawn) |hook| return hook.run(hook.context, args);
+        if (self.spawn) |hook| {
+            hook.run(hook.context, args) catch |err| {
+                std.log.warn("configured command '{s}' failed to start: {s}", .{ args[0], @errorName(err) });
+            };
+            return;
+        }
         std.log.warn("configured spawn action has no host hook: {s}", .{args[0]});
     }
 };
@@ -167,4 +172,16 @@ fn focusedOutput(snapshot: *const script.Snapshot) ?wm.OutputId {
 fn focusedParent(snapshot: *const script.Snapshot) ?*const wm.Node {
     const node = snapshot.getNode(focusedNode(snapshot) orelse return null) orelse return null;
     return snapshot.getNode(node.parent orelse return null);
+}
+
+test "configured spawn failures do not escape into the compositor loop" {
+    const FailingSpawn = struct {
+        fn run(_: ?*anyopaque, _: []const []const u8) !void {
+            return error.FileNotFound;
+        }
+    };
+
+    var runner: Runner = undefined;
+    runner.spawn = .{ .run = FailingSpawn.run };
+    try runner.spawnCommand(&.{"missing-command"});
 }
