@@ -374,17 +374,13 @@ pub const Context = struct {
     }
 
     fn shellExtent(self: *const Context, output: host.types.OutputId) !river_presenter_runtime.Extent {
-        return extentFromOptional(try self.roles.adapter.objects.outputSize(output), .{ .width = 1280, .height = 720 });
+        const size = (try self.roles.adapter.objects.outputSize(output)) orelse return error.OutputGeometryUnavailable;
+        return extent(size.width, size.height);
     }
 
     fn decorationExtent(self: *const Context, window: host.types.WindowId) !river_presenter_runtime.Extent {
         const size: host.types.Size = (try self.roles.adapter.objects.actualWindowSize(window)) orelse .{ .width = 480, .height = 28 };
         return extent(size.width, 28);
-    }
-
-    fn extentFromOptional(size: ?host.types.Size, fallback: host.types.Size) !river_presenter_runtime.Extent {
-        const value = size orelse fallback;
-        return extent(value.width, value.height);
     }
 };
 

@@ -191,12 +191,14 @@ pub const Runtime = struct {
     fn reconcileShells(self: *Runtime) !void {
         for (self.manager.outputs.items) |output| {
             if (self.findShell(output) != null) continue;
+            const output_id = try self.adapter.objects.outputId(output);
+            // Output identity arrives before its dimensions. Creating the role
+            // in that interval would force presentation to guess a buffer size
+            // and permanently place the bar against the guessed viewport.
+            if (try self.adapter.objects.outputSize(output_id) == null) continue;
+
             const index = try self.manager.createOutputShellRole(self.compositor, output);
             const role = self.manager.output_shell_roles.items[index];
-            const output_id = self.adapter.objects.outputId(output) catch |err| {
-                self.rollbackShell(index);
-                return err;
-            };
             self.shells.append(self.allocator, .{ .output = output, .output_id = output_id, .role = role.shell_surface, .surface = role.surface }) catch |err| {
                 self.rollbackShell(index);
                 return err;
