@@ -121,6 +121,10 @@ than through forwarding methods.
 | `lua/root.zig` | Lua package source aggregation only. |
 | `lua/whirlpool/init.lua` | Public Lua constructors and action vocabulary. |
 | `lua/whirlpool/workspace.lua` | Cohesive workspace service convention. |
+| `lua/whirlpool/theme.lua` | Shared theme data and color blending. |
+| `lua/whirlpool/status.lua` | Throttled operating-system status sampling and histories. Its synchronous command probes are the main remaining hidden-cost seam. |
+| `lua/whirlpool/shell.lua` | Retained bottom bar, system widgets, minimap, and audio OSD policy. |
+| `lua/whirlpool/decorator.lua` | Retained focused-title and tab-decoration policy. |
 | `config/whirlpool.lua` | Supported user configuration example. |
 | `config/lib/scrolling.lua` | Replaceable scrolling layout policy, correctly outside native WM mechanics. |
 
@@ -220,5 +224,46 @@ they are compiled into typed edges and should not accumulate Whirlpool policy.
 - `script/lua_vm.zig` remains the sole Lua ABI owner. Splitting individual ABI
   calls would distribute stack invariants and dynamic-library ownership.
 
-No feature removal is required by any disposition in this audit. The code now
-builds higher layers by composing these lower modules at explicit roots.
+## Production-caller audit after the full sample
+
+The Tidepool/Shoal-equivalent sample now exercises the integrated River shell,
+window metadata, decoration lifecycle, retained composition, Skia lowering,
+Wayland/Vulkan presentation, configured actions, output cycling, and ordinary
+`wl_pointer` bar interaction. Those host and platform layers are therefore not
+speculative; they are the implementation of the supported River application.
+The portable layer-shell application is also a real CLI mode, although it has
+no River desktop-state or WM-action authority.
+
+The following remain outside the production call graph and are candidates for
+a clean removal pass rather than further abstraction:
+
+- `src/runtime/lifecycle.zig`, `src/runtime/ipc.zig`, and
+  `src/runtime/persistence.zig`: test-only runtime framework; the executable
+  uses only argument parsing from `src/runtime/root.zig`.
+- `src/host/phase.zig`: test-only sequence state machine duplicating the live
+  manager/host transaction state machines.
+- `src/ui/signal.zig`, `src/ui/animation.zig`, and `src/ui/target.zig`:
+  test-only retained-UI experiments. Production uses `tree.zig`, `scene.zig`,
+  and `properties.zig` directly.
+- `src/wm/input.zig`: test-only pointer-planning vocabulary. Production input
+  is lowered through script intents and the River host.
+- River `pointer_binding` ownership, proxy maps, plans, and
+  `src/platform/river/live/world/input.zig`: no production binding is created.
+  The sample bar correctly uses standard `wl_pointer`, leaving this alternate
+  input route dormant.
+- `World.saveState`/`restoreState`: covered by tests but not called by the
+  executable because the dormant runtime persistence layer is not wired in.
+- `src/platform/river/host/transport/driver.zig`: intentionally test-only. It
+  is a valuable deterministic integration seam, unlike the dormant product
+  subsystems above.
+
+The largest remaining hidden cost is `lua/whirlpool/status.lua`: its probes
+are throttled, but `io.popen` is synchronous and each output owns a Lua VM, so
+multi-output sessions duplicate polling and can block presentation briefly.
+A single process-owned status sampler publishing service updates is the next
+architectural joint if the sample becomes the production shell.
+
+One operational mismatch is also now explicit: the installed
+`whirlpool-compositor-free-smoke` script expects a source tree containing
+`build.zig`, while the package installs only the launcher and helper. It works
+from a checkout but not as a standalone installed command.

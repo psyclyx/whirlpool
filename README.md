@@ -76,10 +76,12 @@ timeout 15 "$(nix-build -A whirlpool-nested)/bin/whirlpool-nested" \
 ```
 
 The Nix attribute `whirlpool-nested` packages the same launcher and defaults
-to the installed config and Lua module path. The sample composes one retained
-Lua surface for both River's integrated shell role and portable layer shell.
-Its workspace state comes through an ordinary Lua provider, and `Alt+d`
-launches Fuzzel through River's layer-shell integration.
+to the installed config and Lua module path. The sample is the Whirlpool/Lua
+equivalent of the Tidepool/Shoal desktop: an Alt-based window-management map,
+a bottom bar with workspace, minimap, focused-window, system-status, and clock
+widgets, an audio OSD, and title/tab decorations. The same retained shell
+content is used by River's integrated shell role and the portable layer-shell
+adapter; River additionally supplies live desktop state and bar interaction.
 
 ## Testing strategy
 

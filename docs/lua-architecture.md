@@ -19,24 +19,32 @@ bounded, immutable world snapshot and accepts a validated generic geometry
 plan. `config/lib/scrolling.lua` is the sample scrolling policy; it is not an
 installed stdlib algorithm and can be replaced without changing Zig.
 
-Workspace state and actions are likewise an ordinary Lua convention.
-`whirlpool.workspace` implements that convention over generic named service
-updates and semantic action values. UI may substitute another module backed by
-another compositor without changing surface or rendering code.
+Workspace actions are likewise an ordinary Lua convention.
+`whirlpool.workspace` constructs semantic action values without exposing
+compositor objects. The sample shell consumes the generic `desktop` service
+for workspace occupancy, focused-window metadata, and its layout minimap.
+
+Widget policy remains in Lua. `whirlpool.shell` composes the retained bar and
+OSD, `whirlpool.decorator` owns title/tab presentation, `whirlpool.status`
+polls portable operating-system status sources, and `whirlpool.theme` is the
+shared color vocabulary. None of those modules owns a Wayland proxy or River
+transaction.
 
 ## Surfaces
 
 The program declares generic surface descriptors containing a provider, role,
-placement, and retained Lua content. The sample reuses the exact same content
-source for two adapters:
+placement, edge, height, exclusive zone, and retained Lua content. The sample
+reuses the exact same shell source for two adapters:
 
 - `river` + `shell` creates River-owned integrated UI synchronized with River
   render transactions.
 - `layer-shell` + `shell` creates a portable `zwlr_layer_shell_v1` surface and
   never claims window-management authority.
 
-There is no native bar type. A bar is merely UI content on a top-anchored,
-exclusive surface.
+There is no native bar type. A bar is merely UI content on an edge-anchored,
+exclusive surface. The sample's bar is bottom-anchored and reserves 38 pixels.
+Its River role receives desktop updates and pointer gestures; the portable
+layer-shell role deliberately has no compositor-specific WM authority.
 
 ## River host
 
