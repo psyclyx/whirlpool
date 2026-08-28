@@ -99,6 +99,11 @@ const AfterDispatch = struct {
     fn run(raw: ?*anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         try self.services.drainActions(self.runtime);
+        // A worker completion can race with River's render_start. Claim it
+        // before draining the staged boundary so it can join this transaction
+        // instead of demanding an otherwise unnecessary manage/render cycle.
+        try self.presentation.pollReleases();
+        try self.presentation.collectReady();
         try self.runtime.afterDispatch();
         // River transaction requests are latency-critical. Flush them before
         // any shell work so a slow renderer can never delay manage_dirty,

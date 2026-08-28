@@ -118,6 +118,8 @@ pub const Runtime = struct {
     surface_queue: SurfaceQueue,
     shell_requested: bool = false,
     manage_dirty_requested: bool = false,
+    manage_request_pending: bool = false,
+    render_expected: bool = false,
     stats: Stats = .{},
 
     /// Initialize a compositor-free host runtime with default limits.
@@ -258,7 +260,10 @@ pub const Runtime = struct {
         if (self.boundary == .none) try self.runShell();
         self.discardCancelledSurfaces();
         if (self.manage_dirty_requested and self.boundary == .none) {
-            try self.requestManageDirty();
+            if (!self.manage_request_pending) {
+                try self.requestManageDirty();
+                self.manage_request_pending = true;
+            }
             self.manage_dirty_requested = false;
         }
         self.assertValid();
@@ -285,7 +290,12 @@ pub const Runtime = struct {
         // An asynchronous presenter can become ready while River is idle.
         // Demand a transaction so the queued buffer reaches the sync/commit
         // edge instead of waiting for unrelated window-manager activity.
-        if (self.manager != null) self.manage_dirty_requested = true;
+        if (self.manager != null and !renderAlreadyScheduled(
+            self.boundary,
+            self.manage_request_pending,
+            self.render_expected,
+        ))
+            self.manage_dirty_requested = true;
     }
 
     /// Return the number of pending or cancelled surface commits.
@@ -314,6 +324,7 @@ pub const Runtime = struct {
 
     fn runManage(self: *Runtime) !void {
         self.boundary = .none;
+        self.manage_request_pending = false;
         if (self.render != null) return transport.finishManageError(Runtime, self, error.RenderCycleStillLive);
         var draft = self.adapter.beginManageDraft() catch |err| return transport.finishManageError(Runtime, self, err);
         defer draft.deinit();
@@ -330,6 +341,10 @@ pub const Runtime = struct {
         try self.adapter.appendServerDecorationRequests(&operations);
         try plans.applyManageTransport(transport.manage(Runtime, self), .{ .operations = operations.items });
         self.adapter.commitServerDecorationRequests();
+        // River guarantees at least one render sequence after every completed
+        // manage sequence. Remember that credit so asynchronous surface work
+        // does not request a redundant manage transaction in the interval.
+        self.render_expected = true;
 
         if (self.frames) |*previous| previous.deinit();
         self.frames = cycle.frames;
@@ -339,6 +354,7 @@ pub const Runtime = struct {
 
     fn runRender(self: *Runtime) !void {
         self.boundary = .none;
+        self.render_expected = false;
         const frames = &(self.frames orelse return transport.finishRenderError(Runtime, self, error.MissingFrameSet));
         const render_cycle = self.adapter.beginRender(frames) catch |err| return transport.finishRenderError(Runtime, self, err);
         self.render = render_cycle;
@@ -425,6 +441,18 @@ pub const Runtime = struct {
         std.debug.assert(self.driver == null or self.manager == null);
     }
 };
+
+fn renderAlreadyScheduled(boundary: Boundary, manage_pending: bool, render_expected: bool) bool {
+    return manage_pending or render_expected or boundary == .manage or boundary == .render;
+}
+
+test "surface completions reuse staged and promised render transactions" {
+    try std.testing.expect(!renderAlreadyScheduled(.none, false, false));
+    try std.testing.expect(renderAlreadyScheduled(.none, true, false));
+    try std.testing.expect(renderAlreadyScheduled(.manage, false, false));
+    try std.testing.expect(renderAlreadyScheduled(.render, false, false));
+    try std.testing.expect(renderAlreadyScheduled(.none, false, true));
+}
 
 test "hooks defer transaction work to the after-dispatch seam" {
     var runtime = Runtime.init(std.testing.allocator);

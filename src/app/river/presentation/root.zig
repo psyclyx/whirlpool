@@ -68,10 +68,18 @@ pub const Bridge = struct {
 
     /// Update shell services and present all retained roles once per dispatch.
     pub fn present(self: *Bridge) !void {
-        const graphics = self.graphics orelse return;
-        std.debug.assert(self.generation != 0);
+        if (self.graphics == null) return;
         try self.context.roles.forEachShell(&self.context, Context.updateShellServices);
         try self.context.roles.forEachDecoration(&self.context, Context.updateDecorationServices);
+        try self.collectReady();
+    }
+
+    /// Claim worker-completed frames before an already-staged River render
+    /// transaction is drained. This is deliberately separate from service
+    /// updates: the worker may finish between the manage and render edges.
+    pub fn collectReady(self: *Bridge) !void {
+        const graphics = self.graphics orelse return;
+        std.debug.assert(self.generation != 0);
         try graphics.presentAll(self.generation);
         self.generation +|= 1;
         if (self.generation == 0) return error.GenerationExhausted;

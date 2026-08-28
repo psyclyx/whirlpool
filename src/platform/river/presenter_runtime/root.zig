@@ -331,7 +331,8 @@ const RolePresenter = struct {
         const self = from(raw);
         self.lock();
         defer self.unlock();
-        if (self.status != .ready or self.ready_slot == null) return error.NotReady;
+        if (!self.buffers_adopted or self.status != .ready or self.ready_slot == null)
+            return error.NotReady;
         const index = self.ready_slot.?;
         self.slots[index].state = .prepared;
         self.generation = generation;
