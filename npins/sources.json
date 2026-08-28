@@ -10,16 +10,15 @@
     "river": {
       "type": "Git",
       "repository": {
-        "type": "Forgejo",
-        "server": "https://codeberg.org/",
-        "owner": "river",
+        "type": "GitHub",
+        "owner": "psyclyx",
         "repo": "river"
       },
-      "branch": "main",
+      "branch": "psyclyx/integration",
       "submodules": false,
-      "revision": "011620314585a82ac6de9851448c3d7e1269d86b",
-      "url": "https://codeberg.org/river/river/archive/011620314585a82ac6de9851448c3d7e1269d86b.tar.gz",
-      "hash": "sha256-BEDG/9Sf8zKLOGsloXsfUHL2PfkcxAZd61oGHYY9xQg="
+      "revision": "e4a648a7c39722d6d5dce0834c3929c19041f25a",
+      "url": "https://github.com/psyclyx/river/archive/e4a648a7c39722d6d5dce0834c3929c19041f25a.tar.gz",
+      "hash": "sha256-PHwDe7rQiQy7WXpyGDJXBTmZo9Cw+peg1GBU2X8myB0="
     }
   },
   "version": 8

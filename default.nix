@@ -15,7 +15,8 @@ let
   # asking for an attribute of the fixpoint while its overlay keys are still
   # being formed.
   overlay = final: prev:
-    (mkPackages final prev.lib)
+    ((import "${npins.river}/overlay.nix") final prev)
+    // (mkPackages final prev.lib)
     // {
       whirlpoolRiverSource = npins.river;
     };
