@@ -36,12 +36,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     var presentation: presentation_app.Bridge = undefined;
     const role_hooks = try presentation.init(
         allocator,
+        io,
         client,
         &host_runtime,
         services.surface("river", "shell"),
         services.surface("river", "decoration"),
     );
-    defer presentation.deinit() catch |err| std.log.err("River graphics cleanup failed: {s}", .{@errorName(err)});
+    var presentation_live = true;
+    defer if (presentation_live) presentation.deinit() catch |err| std.log.err("River graphics cleanup failed: {s}", .{@errorName(err)});
     var roles = river_role_lifecycle.Runtime.init(allocator, manager, &host_runtime.adapter, compositor, role_hooks);
     var roles_live = true;
     defer if (roles_live) roles.deinit() catch |err| std.log.err("River role cleanup failed: {s}", .{@errorName(err)});
@@ -73,6 +75,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
         host_runtime.deinit();
         host_runtime_live = false;
         presentation.abandon();
+        presentation_live = false;
         roles.abandon();
         roles_live = false;
     }
@@ -100,6 +103,13 @@ const AfterDispatch = struct {
         try self.presentation.pollReleases();
         try self.roles.reconcile();
         try self.presentation.present();
+        // Presentation can queue a newly completed asynchronous frame after
+        // the first host safe point. Drain its transaction request now.
+        try self.runtime.afterDispatch();
+        self.client.flush() catch |err| switch (err) {
+            error.WouldBlock => {},
+            else => return err,
+        };
     }
 };
 

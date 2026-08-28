@@ -282,6 +282,10 @@ pub const Runtime = struct {
     /// Take ownership of one prepared surface commit.
     pub fn queueSubmittedCommit(self: *Runtime, commit: coordinator.SubmittedCommit) !void {
         try self.surface_queue.enqueue(commit);
+        // An asynchronous presenter can become ready while River is idle.
+        // Demand a transaction so the queued buffer reaches the sync/commit
+        // edge instead of waiting for unrelated window-manager activity.
+        if (self.manager != null) self.manage_dirty_requested = true;
     }
 
     /// Return the number of pending or cancelled surface commits.

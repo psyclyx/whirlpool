@@ -311,10 +311,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "wayland", .module = wayland },
             .{ .name = "whirlpool-wayland-client", .module = wayland_client },
+            .{ .name = "whirlpool-wayland-dmabuf", .module = wayland_dmabuf },
+            .{ .name = "whirlpool-dmabuf-allocator", .module = dmabuf_allocator },
             .{ .name = "whirlpool-host", .module = host },
             .{ .name = "whirlpool-script", .module = script },
             .{ .name = "whirlpool-graphics", .module = graphics },
-            .{ .name = "whirlpool-wayland-wsi", .module = wayland_wsi },
             .{ .name = "whirlpool-river-host-runtime", .module = river_host_runtime },
             .{ .name = "whirlpool-river-presentation", .module = river_presentation },
         },

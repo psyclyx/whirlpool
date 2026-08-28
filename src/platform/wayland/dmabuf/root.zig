@@ -67,6 +67,14 @@ pub const Manager = struct {
         allocator.destroy(self);
     }
 
+    pub fn abandon(self: *Manager) void {
+        const allocator = self.allocator;
+        @as(*wayland.client.wl.Proxy, @ptrCast(self.proxy)).destroy();
+        self.formats.deinit(allocator);
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
     pub fn supports(self: *const Manager, format: u32, modifier: u64) bool {
         for (self.formats.items) |candidate| {
             if (candidate.format == format and candidate.modifier == modifier) return true;
@@ -170,6 +178,13 @@ pub const Buffer = struct {
         std.debug.assert(self.reusable());
         const allocator = self.allocator;
         self.proxy.destroy();
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    pub fn abandon(self: *Buffer) void {
+        const allocator = self.allocator;
+        @as(*wayland.client.wl.Proxy, @ptrCast(self.proxy)).destroy();
         self.* = undefined;
         allocator.destroy(self);
     }

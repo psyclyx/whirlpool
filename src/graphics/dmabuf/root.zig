@@ -14,6 +14,7 @@ const c = @cImport({
 
 pub const VulkanContext = @import("vulkan.zig").Context;
 pub const VulkanImage = @import("vulkan.zig").Image;
+pub const vk = @import("vulkan.zig").vk;
 
 pub const max_planes = 4;
 pub const argb8888: u32 = 0x3432_5241;

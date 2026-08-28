@@ -22,6 +22,7 @@ pub const Bridge = struct {
     pub fn init(
         self: *Bridge,
         allocator: std.mem.Allocator,
+        io: std.Io,
         client: *wayland_client.Client,
         runtime: *river_host_runtime.Runtime,
         surface: ?*const script.config.SurfaceSpec,
@@ -30,7 +31,7 @@ pub const Bridge = struct {
         self.* = .{};
         self.allocator = allocator;
         const spec = surface orelse return .{};
-        self.graphics = try river_presenter_runtime.Runtime.init(allocator, client, .{
+        self.graphics = try river_presenter_runtime.Runtime.init(allocator, io, client, .{
             .context = @ptrCast(runtime),
             .submit = queueCommit,
         }, spec, decoration_surface);
