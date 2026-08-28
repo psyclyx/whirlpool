@@ -120,69 +120,101 @@ pub const Runtime = struct {
     manage_dirty_requested: bool = false,
     stats: Stats = .{},
 
+    /// Initialize a compositor-free host runtime with default limits.
     pub fn init(allocator: std.mem.Allocator) Runtime {
         return initWithOptions(allocator, .{});
     }
 
+    /// Initialize a host runtime with explicit hooks and resource limits.
     pub fn initWithOptions(allocator: std.mem.Allocator, options: Options) Runtime {
-        return .{
+        std.debug.assert(options.max_intents > 0);
+        std.debug.assert(options.max_pending_commits > 0);
+        const runtime = Runtime{
             .allocator = allocator,
             .adapter = world.Adapter.init(allocator, .{}),
             .options = options,
             .queued_intents = script.IntentBatch.init(allocator, options.max_intents),
             .surface_queue = .init(allocator, options.max_pending_commits),
         };
+        runtime.assertValid();
+        return runtime;
     }
 
+    /// Install the transport edge used by compositor-free integration tests.
     pub fn setDriver(self: *Runtime, driver: Driver) void {
+        self.assertValid();
+        std.debug.assert(self.manager == null);
         self.driver = driver;
+        self.assertValid();
     }
 
+    /// Borrow an owned configuration for configured-action lookup.
     pub fn setConfig(self: *Runtime, config: *const script.config.Config) !void {
+        self.assertValid();
+        if (self.config_program != null) return error.ConfigAlreadyLoaded;
         self.config_program = config;
+        self.assertValid();
     }
 
+    /// Queue one configured binding action for the next manage cycle.
     pub fn queueConfiguredAction(self: *Runtime, action_index: usize) !void {
+        self.assertValid();
         if (self.config_program == null) return error.ConfigNotLoaded;
         if (action_index >= self.config_program.?.bindings.len) return error.InvalidConfiguredAction;
         try self.configured_actions.append(self.allocator, action_index);
         self.manage_dirty_requested = true;
+        self.assertValid();
     }
 
+    /// Install the sole surface-presentation hook owner.
     pub fn setSurfaceHooks(self: *Runtime, hooks_value: SurfaceHooks) !void {
+        self.assertValid();
         if (self.options.surfaces != null) return error.SurfaceHooksAlreadySet;
         if (self.surface_queue.count() != 0) return error.SurfaceCommitsStillPending;
         self.options.surfaces = hooks_value;
+        self.assertValid();
     }
 
+    /// Install the sole seat callback owner.
     pub fn setSeatHook(self: *Runtime, hook: SeatHook) !void {
         if (self.options.seat != null) return error.SeatHookAlreadySet;
         self.options.seat = hook;
     }
 
+    /// Install the sole post-manage callback owner.
     pub fn setManageHook(self: *Runtime, hook: ManageHook) !void {
         if (self.options.manage != null) return error.ManageHookAlreadySet;
         self.options.manage = hook;
     }
 
+    /// Install the sole configured-process spawning owner.
     pub fn setSpawnHook(self: *Runtime, hook: SpawnHook) !void {
         if (self.options.spawn != null) return error.SpawnHookAlreadySet;
         self.options.spawn = hook;
     }
 
+    /// Remove surface hooks after all submitted commits are resolved.
     pub fn clearSurfaceHooks(self: *Runtime, expected_context: ?*anyopaque) !void {
+        self.assertValid();
         const hooks_value = self.options.surfaces orelse return error.SurfaceHooksNotSet;
         if (hooks_value.context != expected_context) return error.WrongSurfaceHooksOwner;
         if (self.surface_queue.count() != 0) return error.SurfaceCommitsStillPending;
         self.options.surfaces = null;
+        self.assertValid();
     }
 
+    /// Attach the live River manager used by production transports.
     pub fn attachManager(self: *Runtime, manager: *live.Manager) !void {
+        self.assertValid();
+        if (self.driver != null) return error.DriverAlreadyAttached;
         if (self.manager != null) return error.ManagerAlreadyAttached;
         self.manager = manager;
+        self.assertValid();
     }
 
+    /// Release all queued and staged host state.
     pub fn deinit(self: *Runtime) void {
+        self.assertValid();
         if (self.render) |*cycle| cycle.deinit();
         if (self.frames) |*frames| frames.deinit();
         if (self.options.surfaces) |surface_hooks|
@@ -195,10 +227,12 @@ pub const Runtime = struct {
         self.* = undefined;
     }
 
+    /// Return generated-listener hooks that only stage work.
     pub fn hooks() live.Hooks {
         return listeners.hooks(Runtime);
     }
 
+    /// Run afterDispatch through an erased callback context.
     pub fn afterDispatchCallback(raw: ?*anyopaque) anyerror!void {
         try from(raw).afterDispatch();
     }
@@ -206,6 +240,7 @@ pub const Runtime = struct {
     /// Drain one protocol boundary and eligible shell work. This is invalid
     /// while any generated listener is active.
     pub fn afterDispatch(self: *Runtime) !void {
+        self.assertValid();
         if (self.callback_depth != 0) return error.ProtocolCallbackActive;
         switch (self.boundary) {
             .manage => try self.runManage(),
@@ -218,21 +253,30 @@ pub const Runtime = struct {
             try self.requestManageDirty();
             self.manage_dirty_requested = false;
         }
+        self.assertValid();
     }
 
+    /// Queue one semantic intent for the next policy transaction.
     pub fn queueIntent(self: *Runtime, intent: script.Intent) !void {
+        self.assertValid();
         try self.queued_intents.append(intent);
         self.manage_dirty_requested = true;
+        self.assertValid();
     }
 
+    /// Request one shell callback at the next safe point.
     pub fn requestShellPhase(self: *Runtime) void {
+        self.assertValid();
         self.shell_requested = true;
+        self.assertValid();
     }
 
+    /// Take ownership of one prepared surface commit.
     pub fn queueSubmittedCommit(self: *Runtime, commit: coordinator.SubmittedCommit) !void {
         try self.surface_queue.enqueue(commit);
     }
 
+    /// Return the number of pending or cancelled surface commits.
     pub fn pendingCommitCount(self: *const Runtime) usize {
         return self.surface_queue.count();
     }
@@ -250,6 +294,8 @@ pub const Runtime = struct {
     pub fn stageManageBoundary(self: *Runtime) !void {
         try self.noteBoundary(.manage);
     }
+
+    /// Stage a compositor-free render boundary for integration tests.
     pub fn stageRenderBoundary(self: *Runtime) !void {
         try self.noteBoundary(.render);
     }
@@ -343,6 +389,16 @@ pub const Runtime = struct {
 
     fn from(raw: ?*anyopaque) *Runtime {
         return @ptrCast(@alignCast(raw orelse unreachable));
+    }
+
+    fn assertValid(self: *const Runtime) void {
+        std.debug.assert(self.options.max_intents > 0);
+        std.debug.assert(self.options.max_pending_commits > 0);
+        std.debug.assert(self.queued_intents.count() <= self.options.max_intents);
+        std.debug.assert(self.surface_queue.count() <= self.options.max_pending_commits);
+        std.debug.assert(self.config_program != null or self.configured_actions.items.len == 0);
+        std.debug.assert(self.render == null or self.frames != null);
+        std.debug.assert(self.driver == null or self.manager == null);
     }
 };
 
