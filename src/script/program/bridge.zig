@@ -21,6 +21,7 @@ const lua_type_number: c_int = 3;
 const lua_type_string: c_int = 4;
 const lua_type_table: c_int = 5;
 const first_upvalue_index: c_int = -1001001;
+const next_id_global: [*:0]const u8 = "whirlpool_retained_next_node_id";
 const Error = anyerror;
 
 /// Build the VM execution bridge for an owned program representation.
@@ -75,6 +76,12 @@ pub fn Execution(comptime Program: type) type {
         pub fn install(self: *Bridge) Error!void {
             self.assertValid();
             const state = self.api.state;
+            _ = self.api.get_global(state, next_id_global);
+            var is_number: c_int = 0;
+            const retained_next_id = self.api.to_integer(state, -1, &is_number);
+            if (is_number != 0 and retained_next_id > 0 and retained_next_id <= std.math.maxInt(NodeId))
+                self.next_id = @intCast(retained_next_id);
+            self.api.set_top(state, 0);
             try self.installFunction("whirlpool_native_create", nativeCreateCallback);
             try self.installFunction("whirlpool_native_set", nativeSetCallback);
             try self.installFunction("whirlpool_native_require", nativeRequireCallback);
@@ -198,6 +205,8 @@ pub fn Execution(comptime Program: type) type {
             const id = self.next_id;
             if (id == std.math.maxInt(NodeId)) return self.raise("retained node id space exhausted");
             self.next_id +|= 1;
+            self.api.push_integer(state, self.next_id);
+            self.api.set_global(state, next_id_global);
             self.countOperation() catch |err| return self.raise(@errorName(err));
             self.sink.create(self.sink.context, id, kind_value, parent) catch |err| return self.raise(@errorName(err));
             self.api.push_integer(state, id);

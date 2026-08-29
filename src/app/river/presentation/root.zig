@@ -10,6 +10,7 @@ const river_host_runtime = @import("whirlpool-river-host-runtime");
 const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
 const river_presenter_runtime = @import("whirlpool-river-presenter-runtime");
 const status_app = @import("whirlpool-app-status");
+const window_strip = @import("window_strip.zig");
 
 /// Owns the optional graphics runtime and its River role callback context.
 pub const Bridge = struct {
@@ -48,7 +49,7 @@ pub const Bridge = struct {
             self.status = null;
         }
         try runtime.setSurfaceHooks(self.graphics.?.surfaceHooks());
-        self.context = .{ .runtime = runtime, .roles = undefined, .graphics = self.graphics.? };
+        self.context = .{ .allocator = allocator, .runtime = runtime, .roles = undefined, .graphics = self.graphics.? };
         try self.bindInputSeats(client);
         return self.context.hooks();
     }
@@ -105,7 +106,10 @@ pub const Bridge = struct {
         for (self.input_seats.items) |seat| seat.deinit();
         self.input_seats.deinit(self.allocator);
         if (self.status) |status| status.deinit();
-        if (self.graphics) |graphics| try graphics.deinit();
+        if (self.graphics) |graphics| {
+            self.context.deinit();
+            try graphics.deinit();
+        }
         self.* = undefined;
     }
 
@@ -115,7 +119,10 @@ pub const Bridge = struct {
         self.input_seats.deinit(self.allocator);
         if (self.status) |status| status.deinit();
         self.status = null;
-        if (self.graphics) |graphics| graphics.abandon();
+        if (self.graphics) |graphics| {
+            self.context.deinit();
+            graphics.abandon();
+        }
         self.graphics = null;
     }
 
@@ -188,10 +195,10 @@ const InputSeat = struct {
                 self.y = wayland.client.wl.Fixed.toDouble(value.surface_y);
             },
             .button => |value| if (value.state == .pressed and value.button == 0x110) {
-                if (self.output) |output| self.context.activateTagAt(output, self.x) catch {};
+                if (self.output) |output| self.context.activateAt(output, self.x) catch {};
             },
             .axis => |value| if (value.axis == .vertical_scroll) {
-                if (self.output) |output| self.context.cycleTag(output, self.x, wayland.client.wl.Fixed.toDouble(value.value) > 0) catch {};
+                if (self.output) |output| self.context.scrollAt(output, self.x, wayland.client.wl.Fixed.toDouble(value.value)) catch {};
             },
             .frame, .axis_source, .axis_stop, .axis_discrete, .axis_value120, .axis_relative_direction => {},
         }
@@ -199,10 +206,30 @@ const InputSeat = struct {
 };
 
 pub const Context = struct {
+    allocator: std.mem.Allocator,
     runtime: *river_host_runtime.Runtime,
     roles: *river_role_lifecycle.Runtime,
     graphics: *river_presenter_runtime.Runtime,
     status: status_app.Snapshot = .{},
+    strip_states: std.AutoHashMapUnmanaged(u64, StripState) = .empty,
+
+    const StripState = struct {
+        offset: u32 = 0,
+        focused: ?wm.WindowId = null,
+        focused_x: ?u32 = null,
+        viewport_width: u32 = 0,
+    };
+
+    const workspace_gap: u32 = 8;
+    const workspace_visible_width: u32 = 30;
+    const workspace_hidden_width: u32 = 1;
+    const workspace_padding_right: u32 = 8;
+    const right_width_without_battery: u32 = 549;
+    const right_width_with_battery: u32 = 592;
+
+    fn deinit(self: *Context) void {
+        self.strip_states.deinit(self.allocator);
+    }
 
     pub fn hooks(self: *Context) river_role_lifecycle.Hooks {
         return .{
@@ -214,50 +241,56 @@ pub const Context = struct {
         };
     }
 
-    fn activateTagAt(self: *Context, output_id: host.types.OutputId, x: f64) !void {
+    fn activateAt(self: *Context, output_id: host.types.OutputId, x: f64) !void {
         const world = self.runtime.adapter.worldView();
         const wm_output = try self.runtime.adapter.objects.wmOutputId(output_id);
         const output = world.getOutput(wm_output) orelse return error.UnknownOutput;
         const selected = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
+        const workspace_width = self.workspaceWidth(world, selected);
+        if (x >= @as(f64, @floatFromInt(workspace_width))) {
+            const viewport = self.stripViewport(output.bounds.width, workspace_width);
+            const right_edge = workspace_width + viewport;
+            if (x >= @as(f64, @floatFromInt(right_edge))) return;
+            const focused = world.view().focusedWindow(wm_output);
+            const strip = window_strip.build(world, output.active_tag, focused);
+            const state = try self.stripState(output_id);
+            const local = x - @as(f64, @floatFromInt(workspace_width)) + @as(f64, @floatFromInt(state.offset));
+            if (local < 0 or local > std.math.maxInt(u32)) return;
+            const token = strip.tokenAt(@intFromFloat(local)) orelse return;
+            if (token.window) |window| try self.runtime.queueIntent(.{ .focus_window = window });
+            return;
+        }
+
         var cursor: f64 = 0;
         for (0..9) |index| {
-            const visible = index == selected or self.tagOccupied(world.tagAt(index));
-            const width: f64 = if (visible) 30 else 1;
+            const visible = index == selected or self.tagOccupied(world, world.tagAt(index));
+            const width: f64 = if (visible) workspace_visible_width else workspace_hidden_width;
             if (visible and x >= cursor and x < cursor + width) {
                 const tag = world.tagAt(index) orelse return;
                 try self.runtime.queueIntent(.{ .set_active_tag = .{ .output = wm_output, .tag = tag } });
                 return;
             }
-            cursor += width + 8;
+            cursor += width + workspace_gap;
         }
     }
 
-    fn cycleTag(self: *Context, output_id: host.types.OutputId, x: f64, next: bool) !void {
+    fn scrollAt(self: *Context, output_id: host.types.OutputId, x: f64, delta: f64) !void {
+        if (delta == 0) return;
         const world = self.runtime.adapter.worldView();
         const wm_output = try self.runtime.adapter.objects.wmOutputId(output_id);
         const output = world.getOutput(wm_output) orelse return error.UnknownOutput;
         const current = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
-        var cursor: f64 = 0;
-        var over_tag = false;
-        for (0..9) |index| {
-            const visible = index == current or self.tagOccupied(world.tagAt(index));
-            const width: f64 = if (visible) 30 else 1;
-            if (visible and x >= cursor and x < cursor + width) over_tag = true;
-            cursor += width + 8;
-        }
-        if (!over_tag) {
-            const right_width: f64 = 592;
-            const content_width: f64 = @floatFromInt(output.bounds.width);
-            const center_start = @max(0, (content_width - right_width) / 2);
-            const center_end = @max(center_start, content_width - right_width);
-            if (x >= center_start and x < center_end) {
-                try self.runtime.queueIntent(.{ .focus_direction = .{
-                    .output = wm_output,
-                    .direction = if (next) .right else .left,
-                } });
-            }
+        const workspace_width = self.workspaceWidth(world, current);
+        if (x >= @as(f64, @floatFromInt(workspace_width))) {
+            const viewport = self.stripViewport(output.bounds.width, workspace_width);
+            if (x >= @as(f64, @floatFromInt(workspace_width + viewport))) return;
+            const strip = window_strip.build(world, output.active_tag, world.view().focusedWindow(wm_output));
+            const state = try self.stripState(output_id);
+            const amount: i32 = if (delta > 0) 96 else if (delta < 0) -96 else 0;
+            state.offset = window_strip.pan(state.offset, amount, viewport, strip.content_width);
             return;
         }
+        const next = delta > 0;
         const target = if (next) @min(@as(usize, 8), current + 1) else if (current == 0) 0 else current - 1;
         if (target == current) return;
         try self.runtime.queueIntent(.{ .set_active_tag = .{ .output = wm_output, .tag = world.tagAt(target) orelse return } });
@@ -270,45 +303,53 @@ pub const Context = struct {
         const output = world.getOutput(wm_output) orelse
             return error.UnknownOutput;
         const ordinal = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
-        const tag = world.getTag(output.active_tag) orelse return error.UnknownTag;
-
         var occupied_storage: [9]script.program_loader.Value = undefined;
-        for (&occupied_storage, 0..) |*item, index| item.* = .{ .boolean = tagOccupied(self, world.tagAt(index)) };
+        for (&occupied_storage, 0..) |*item, index| item.* = .{ .boolean = self.tagOccupied(world, world.tagAt(index)) };
 
-        var column_storage: [10][3]script.program_loader.Value = undefined;
-        var columns: [10]script.program_loader.Value = undefined;
-        var column_count: usize = 0;
-        const focused_node = tag.focused;
-        for (tag.columns.items) |column_id| {
-            if (column_count == columns.len) break;
-            const column = world.getColumn(column_id) orelse continue;
-            column_storage[column_count] = .{
-                .{ .number = column.width },
-                .{ .number = @floatFromInt(countLeaves(world, column.root)) },
-                .{ .boolean = if (focused_node) |node| (world.getNode(node) orelse return error.UnknownWindow).column == column_id else false },
-            };
-            columns[column_count] = .{ .array = &column_storage[column_count] };
-            column_count += 1;
+        const focused = world.view().focusedWindow(wm_output);
+        const strip = window_strip.build(world, output.active_tag, focused);
+        const workspace_width = self.workspaceWidth(world, ordinal);
+        const viewport = self.stripViewport(output.bounds.width, workspace_width);
+        const strip_state = try self.stripState(output_id);
+        const focused_x = if (strip.focused_index) |index| strip.tokens[index].x else null;
+        if (strip_state.focused != focused or strip_state.focused_x != focused_x or strip_state.viewport_width != viewport) {
+            strip_state.offset = window_strip.reveal(strip_state.offset, viewport, &strip);
+            strip_state.focused = focused;
+            strip_state.focused_x = focused_x;
+            strip_state.viewport_width = viewport;
+        } else {
+            strip_state.offset = window_strip.pan(strip_state.offset, 0, viewport, strip.content_width);
         }
 
-        var app_id: []const u8 = "";
-        var title: []const u8 = "";
-        const focused = world.view().focusedWindow(wm_output);
-        if (focused) |window| if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
-            const record = try self.runtime.adapter.objects.windowRecord(live_window);
-            app_id = record.app_id;
-            title = record.title;
-        };
+        var token_storage: [window_strip.max_tokens][6]script.program_loader.Value = undefined;
+        var tokens: [window_strip.max_tokens]script.program_loader.Value = undefined;
+        for (strip.slice(), 0..) |token, index| {
+            var app_id: []const u8 = "";
+            var title: []const u8 = "";
+            if (token.window) |window| if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
+                const record = try self.runtime.adapter.objects.windowRecord(live_window);
+                app_id = record.app_id;
+                title = record.title;
+            };
+            token_storage[index] = .{
+                .{ .number = @floatFromInt(@intFromEnum(token.kind)) },
+                .{ .string = token.label },
+                .{ .string = app_id },
+                .{ .string = title },
+                .{ .boolean = token.focused },
+                .{ .number = @floatFromInt(token.width) },
+            };
+            tokens[index] = .{ .array = &token_storage[index] };
+        }
 
         const values = [_]script.program_loader.Value{
             .{ .number = @floatFromInt(ordinal + 1) },
             .{ .array = &occupied_storage },
-            .{ .boolean = focusedOutput(self, wm_output) },
-            .{ .string = app_id },
-            .{ .string = title },
-            .{ .array = columns[0..column_count] },
-            .{ .number = @floatFromInt(output.bounds.width) },
-            .{ .number = @floatFromInt(output.bounds.height) },
+            .{ .array = tokens[0..strip.len] },
+            .{ .number = @floatFromInt(strip_state.offset) },
+            .{ .number = @floatFromInt(strip.content_width) },
+            .{ .boolean = strip_state.offset != 0 },
+            .{ .boolean = strip_state.offset +| viewport < strip.content_width },
         };
         try self.graphics.update(.{ .shell = shell_id }, .{
             .service = "desktop",
@@ -393,9 +434,8 @@ pub const Context = struct {
         });
     }
 
-    fn tagOccupied(self: *const Context, maybe_tag: ?wm.TagId) bool {
+    fn tagOccupied(self: *const Context, world: *const wm.World, maybe_tag: ?wm.TagId) bool {
         const wanted = maybe_tag orelse return false;
-        const world = self.runtime.adapter.worldView();
         for (self.runtime.adapter.objects.window_order.items) |live_window| {
             const record = self.runtime.adapter.objects.windows.get(live_window) orelse continue;
             const wm_window = record.wm_id orelse continue;
@@ -405,28 +445,24 @@ pub const Context = struct {
         return false;
     }
 
-    fn focusedOutput(self: *const Context, candidate: wm.OutputId) bool {
-        const world = self.runtime.adapter.worldView();
-        var best_output: ?wm.OutputId = null;
-        var best_serial: u64 = 0;
-        for (self.runtime.adapter.objects.window_order.items) |live_window| {
-            const record = self.runtime.adapter.objects.windows.get(live_window) orelse continue;
-            const wm_window = record.wm_id orelse continue;
-            const window = world.getWindow(wm_window) orelse continue;
-            if (window.output != null and (best_output == null or window.focus_serial > best_serial)) {
-                best_output = window.output;
-                best_serial = window.focus_serial;
-            }
+    fn workspaceWidth(self: *const Context, world: *const wm.World, selected: usize) u32 {
+        var width: u32 = workspace_padding_right + workspace_gap * 8;
+        for (0..9) |index| {
+            const visible = index == selected or self.tagOccupied(world, world.tagAt(index));
+            width += if (visible) workspace_visible_width else workspace_hidden_width;
         }
-        return (best_output orelse world.firstOutput()) == candidate;
+        return width;
     }
 
-    fn countLeaves(world: *const wm.World, maybe_node: ?wm.NodeId) usize {
-        const node = world.getNode(maybe_node orelse return 0) orelse return 0;
-        if (node.isLeaf()) return 1;
-        var result: usize = 0;
-        for (node.children.items) |child| result += countLeaves(world, child.id);
-        return result;
+    fn stripViewport(self: *const Context, output_width: u32, workspace_width: u32) u32 {
+        const right_width: u32 = if (self.status.battery_present) right_width_with_battery else right_width_without_battery;
+        return @max(1, output_width -| workspace_width -| right_width);
+    }
+
+    fn stripState(self: *Context, output: host.types.OutputId) !*StripState {
+        const entry = try self.strip_states.getOrPut(self.allocator, output.value);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        return entry.value_ptr;
     }
 
     fn activeLeafWindow(world: *const wm.World, node_id: wm.NodeId) ?wm.WindowId {
@@ -470,8 +506,9 @@ fn onShellCreated(raw: ?*anyopaque, output: host.types.OutputId, shell: *wayland
     std.log.info("River shell surface ready (output {d})", .{output.value});
 }
 
-fn onShellRetire(raw: ?*anyopaque, _: host.types.OutputId, shell: host.types.ShellSurfaceId) !river_role_lifecycle.RetirementStatus {
+fn onShellRetire(raw: ?*anyopaque, output: host.types.OutputId, shell: host.types.ShellSurfaceId) !river_role_lifecycle.RetirementStatus {
     const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
+    _ = self.strip_states.remove(output.value);
     return retire(self, .{ .shell = shell });
 }
 

@@ -56,13 +56,15 @@ const Lowerer = struct {
         try validateSnapshot(snapshot);
         const properties = snapshot.properties;
         const box = Box{
-            .x = offered.x,
+            .x = offered.x + @as(f32, @floatFromInt(properties.offset_x)),
             .y = offered.y,
             .width = if (properties.width) |value| try dimension(value) else offered.width,
             .height = if (properties.height) |value| try dimension(value) else offered.height,
         };
         const opacity = inherited_opacity * properties.opacity;
         if (opacity == 0) return;
+
+        if (properties.clip) try self.ops.append(self.allocator, .{ .push_clip = toRect(box) });
 
         switch (snapshot.kind) {
             .shape => if (box.width > 0 and box.height > 0) try self.ops.append(self.allocator, .{ .rect = .{
@@ -86,6 +88,7 @@ const Lowerer = struct {
             .stack => try self.layoutStack(index, box, opacity),
             .spacer => {},
         }
+        if (properties.clip) try self.ops.append(self.allocator, .pop_clip);
     }
 
     fn layoutFlow(self: *Lowerer, parent_index: usize, box: Box, axis: Axis, opacity: f32) (LowerError || Allocator.Error)!void {
@@ -232,6 +235,10 @@ fn inset(box: Box, edges: ui.Edges) Box {
     };
 }
 
+fn toRect(box: Box) graphics.skia.Rect {
+    return .{ .x = box.x, .y = box.y, .width = box.width, .height = box.height };
+}
+
 fn mainSize(box: Box, axis: Axis) f32 {
     return if (axis == .horizontal) box.width else box.height;
 }
@@ -319,4 +326,20 @@ test "lower rejects unusable input" {
     try std.testing.expectError(error.InvalidViewport, lower(std.testing.allocator, &.{}, .{ .width = 0, .height = 1 }));
     const bad = fixture(.text, 0, null, .{ .text = "x", .font_size = 0 });
     try std.testing.expectError(error.InvalidFontSize, lower(std.testing.allocator, &.{bad}, .{ .width = 1, .height = 1 }));
+}
+
+test "clip and horizontal offset bound translated descendants" {
+    const root = ui.NodeHandle{ .slot = 0, .generation = 1 };
+    const content = ui.NodeHandle{ .slot = 1, .generation = 1 };
+    const snapshots = [_]ui.NodeSnapshot{
+        fixture(.stack, 0, null, .{ .width = 40, .height = 20, .clip = true }),
+        fixture(.row, 1, root, .{ .width = 80, .offset_x = -12 }),
+        fixture(.shape, 2, content, .{ .width = 20, .fill = ui.Color.white }),
+    };
+    var result = try lower(std.testing.allocator, &snapshots, .{ .width = 100, .height = 30 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.operationCount());
+    try std.testing.expectEqual(@as(f32, 40), result.ops[0].push_clip.width);
+    try std.testing.expectEqual(@as(f32, -12), result.ops[1].rect.rect.x);
+    try std.testing.expect(result.ops[2] == .pop_clip);
 }

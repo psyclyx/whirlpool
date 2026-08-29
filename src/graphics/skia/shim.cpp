@@ -1,5 +1,6 @@
 #include "shim.h"
 
+#include <algorithm>
 #include <memory>
 #include <cstdlib>
 #include <cstdio>
@@ -200,6 +201,18 @@ extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *te
     SkFont font(std::move(typeface), size);
     renderer->canvas->drawSimpleText(text, length, SkTextEncoding::kUTF8, x, baseline,
                                      font, paint);
+}
+
+extern "C" void whirlpool_skia_push_clip(WhirlpoolSkia *renderer,
+                                           float x, float y, float width, float height) {
+    if (!renderer || !renderer->canvas) return;
+    renderer->canvas->save();
+    renderer->canvas->clipRect(SkRect::MakeXYWH(x, y, std::max(0.0f, width), std::max(0.0f, height)));
+}
+
+extern "C" void whirlpool_skia_pop_clip(WhirlpoolSkia *renderer) {
+    if (!renderer || !renderer->canvas) return;
+    renderer->canvas->restore();
 }
 
 extern "C" const uint8_t *whirlpool_skia_end(WhirlpoolSkia *renderer, size_t *row_bytes) {

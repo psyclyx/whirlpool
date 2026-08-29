@@ -15,6 +15,8 @@ extern fn whirlpool_skia_begin(renderer: *Native, width: u32, height: u32) c_int
 extern fn whirlpool_skia_clear(renderer: *Native, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_rect(renderer: *Native, x: f32, y: f32, width: f32, height: f32, radius: f32, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_text(renderer: *Native, text: [*]const u8, length: usize, x: f32, baseline: f32, size: f32, r: f32, g: f32, b: f32, a: f32) void;
+extern fn whirlpool_skia_push_clip(renderer: *Native, x: f32, y: f32, width: f32, height: f32) void;
+extern fn whirlpool_skia_pop_clip(renderer: *Native) void;
 extern fn whirlpool_skia_end(renderer: *Native, row_bytes: *usize) ?[*]const u8;
 extern fn whirlpool_skia_begin_vulkan(renderer: *Native, width: u32, height: u32, image: *anyopaque, memory: *anyopaque, memory_size: u64, format: u32, layout: u32, queue_family: u32) c_int;
 extern fn whirlpool_skia_end_vulkan(renderer: *Native, final_layout: u32, final_queue_family: u32) c_int;
@@ -64,6 +66,8 @@ pub const Renderer = struct {
         for (list.ops) |op| switch (op) {
             .rect => |rect| self.drawRect(rect.rect, rect.radius, rect.color),
             .text => |item| self.drawText(item.text, item.x, item.baseline, item.size, item.color),
+            .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
+            .pop_clip => whirlpool_skia_pop_clip(self.native),
         };
     }
 
@@ -123,6 +127,8 @@ pub const GpuRenderer = struct {
         for (list.ops) |op| switch (op) {
             .rect => |rect| whirlpool_skia_draw_rect(self.native, rect.rect.x, rect.rect.y, rect.rect.width, rect.rect.height, rect.radius, rect.color.r, rect.color.g, rect.color.b, rect.color.a),
             .text => |item| whirlpool_skia_draw_text(self.native, item.text.ptr, item.text.len, item.x, item.baseline, item.size, item.color.r, item.color.g, item.color.b, item.color.a),
+            .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
+            .pop_clip => whirlpool_skia_pop_clip(self.native),
         };
     }
 
@@ -161,6 +167,8 @@ pub const DrawList = struct {
 };
 
 pub const DrawOp = union(enum) {
+    push_clip: Rect,
+    pop_clip,
     rect: struct {
         rect: Rect,
         radius: f32 = 0,

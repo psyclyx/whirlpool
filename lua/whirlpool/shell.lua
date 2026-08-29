@@ -4,10 +4,23 @@
 
 local theme = require("whirlpool.theme")
 local Status = require("whirlpool.status")
+local Icons = require("whirlpool.icons")
 
 local BAR_HEIGHT = 38
 local SPARK_COUNT = 15
 local CLEAR = { 0, 0, 0, 0 }
+
+local function with_alpha(color, alpha)
+  return { color[1], color[2], color[3], alpha }
+end
+
+local function ellipsis(text, limit)
+  text = tostring(text or "")
+  local length = utf8.len(text)
+  if not length or length <= limit then return text end
+  local boundary = utf8.offset(text, limit + 1)
+  return string.sub(text, 1, boundary - 1) .. "…"
+end
 
 local function meter(parent, color, initial)
   local column = parent:column({ width = 8, height = BAR_HEIGHT })
@@ -48,10 +61,8 @@ local function build(parent)
     role = "shell",
     selected = 1,
     occupied = {},
-    focused_output = true,
-    app_id = "",
-    title = "",
-    columns = {},
+    tokens = {},
+    token_count = 0,
   }
 
   local root = parent:stack()
@@ -60,15 +71,14 @@ local function build(parent)
   -- A 38px portable layer surface naturally collapses that spacer to zero.
   local shell = root:column()
   shell:spacer({ flex = 1 })
-  local bar = shell:stack({ height = BAR_HEIGHT })
-  bar:shape({ fill = theme.bg })
+  local bar_layer = shell:stack({ height = BAR_HEIGHT })
+  bar_layer:shape({ fill = theme.bg })
+  local bar = bar_layer:row({ height = BAR_HEIGHT })
 
-  -- Stack three full-width flows so each section is anchored independently:
-  -- fixed-width status widgets cannot push the title away from screen center.
-  local left = bar:row({ height = BAR_HEIGHT, gap = 8, padding = { 0, 8, 0, 0 } })
+  local workspaces = bar:row({ height = BAR_HEIGHT, gap = 8, padding = { 0, 8, 0, 0 } })
   local workspace_cells = {}
   for index = 1, 9 do
-    local cell = left:stack({ width = index == 1 and 30 or 1, height = BAR_HEIGHT, opacity = index == 1 and 1 or 0 })
+    local cell = workspaces:stack({ width = index == 1 and 30 or 1, height = BAR_HEIGHT, opacity = index == 1 and 1 or 0 })
     local background = cell:shape({ fill = index == 1 and theme.accent or CLEAR })
     local label = cell:column({ padding = { 9, 9, 0, 10 } }):text({
       text = tostring(index),
@@ -78,23 +88,35 @@ local function build(parent)
     workspace_cells[index] = { cell = cell, background = background, label = label }
   end
 
-  local minimap = left:row({ height = BAR_HEIGHT, gap = 2, padding = { 3, 6, 3, 6 } })
-  local minimap_columns = {}
-  for index = 1, 10 do
-    local column = minimap:column({ width = 1, height = 32, gap = 2, opacity = 0 })
-    local pieces = {}
-    for leaf = 1, 4 do pieces[leaf] = column:shape({ width = 6, height = 5, fill = theme.overlay }) end
-    minimap_columns[index] = { column = column, pieces = pieces }
+  local strip = bar:stack({ height = BAR_HEIGHT, flex = 1, clip = true })
+  local strip_content = strip:row({ width = 1, height = BAR_HEIGHT, gap = 4 })
+  local window_tokens = {}
+  local function create_window_token()
+    local cell = strip_content:stack({ width = 1, height = BAR_HEIGHT, opacity = 0, clip = true })
+    local background = cell:shape({ fill = CLEAR, radius = 3 })
+    local group_label = cell:text({ text = "", font_size = 14, text_color = theme.muted, padding = { 10, 3, 0, 3 } })
+    local window = cell:row({ gap = 5, padding = { 0, 7, 0, 7 }, opacity = 0 })
+    local icon = window:text({ text = "", width = 20, font_size = 15, text_color = theme.accent, padding = { 10, 0, 0, 0 } })
+    local title = window:text({ text = "", width = 108, font_size = 14, text_color = theme.text, padding = { 10, 0, 0, 0 } })
+    window_tokens[#window_tokens + 1] = {
+      cell = cell,
+      background = background,
+      group_label = group_label,
+      window = window,
+      icon = icon,
+      title = title,
+    }
   end
 
-  local center = bar:row({ height = BAR_HEIGHT, gap = 7 })
-  center:spacer({ flex = 1 })
-  local app_label = center:text({ text = "", font_size = 14, text_color = theme.muted, padding = { 10, 0, 0, 0 } })
-  local title_label = center:text({ text = "", font_size = 17, text_color = theme.text, padding = { 8, 0, 0, 0 } })
-  center:spacer({ flex = 1 })
+  local left_fade = strip:row({ width = 24, height = BAR_HEIGHT, opacity = 0 })
+  local right_fade = strip:row({ height = BAR_HEIGHT, opacity = 0 })
+  right_fade:spacer({ flex = 1 })
+  for index = 1, 8 do
+    left_fade:shape({ width = 3, height = BAR_HEIGHT, fill = with_alpha(theme.bg, (9 - index) / 8) })
+    right_fade:shape({ width = 3, height = BAR_HEIGHT, fill = with_alpha(theme.bg, index / 8) })
+  end
 
   local right = bar:row({ height = BAR_HEIGHT })
-  right:spacer({ flex = 1 })
 
   local cpu = section(right, 112, theme.blend(theme.yellow))
   local update_cpu_spark = sparkline(cpu, theme.yellow)
@@ -156,10 +178,8 @@ local function build(parent)
   local function update_desktop(values)
     state.selected = math.floor(tonumber(values[1]) or state.selected)
     state.occupied = type(values[2]) == "table" and values[2] or state.occupied
-    state.focused_output = values[3] ~= false
-    state.app_id = tostring(values[4] or "")
-    state.title = tostring(values[5] or "")
-    state.columns = type(values[6]) == "table" and values[6] or {}
+    state.tokens = type(values[3]) == "table" and values[3] or {}
+    while #window_tokens < #state.tokens do create_window_token() end
 
     for index, item in ipairs(workspace_cells) do
       local active = index == state.selected
@@ -169,26 +189,35 @@ local function build(parent)
       item.background:set("fill", active and theme.accent or CLEAR)
       item.label:set("text_color", active and theme.bg or theme.text)
     end
-    for index, item in ipairs(minimap_columns) do
-      local column = state.columns[index]
-      if column then
-        local width = math.max(4, math.min(28, math.floor((tonumber(column[1]) or 0.5) * 18)))
-        local leaves = math.max(1, math.min(4, math.floor(tonumber(column[2]) or 1)))
-        item.column:set("width", width)
-        item.column:set("opacity", 1)
-        for leaf, piece in ipairs(item.pieces) do
-          piece:set("height", leaf <= leaves and math.max(2, math.floor((30 - 2 * (leaves - 1)) / leaves)) or 2)
-          piece:set("opacity", leaf <= leaves and 1 or 0)
-          piece:set("fill", column[3] and theme.accent or theme.overlay)
-        end
+    for index = 1, math.max(state.token_count, #state.tokens) do
+      local item = window_tokens[index]
+      local token = state.tokens[index]
+      if token then
+        local kind = math.floor(tonumber(token[1]) or 0)
+        local is_window = kind == 2
+        local focused = token[5] == true
+        local app_id = tostring(token[3] or "")
+        local title = tostring(token[4] or "")
+        item.cell:set("width", math.max(1, math.floor(tonumber(token[6]) or 1)))
+        item.cell:set("opacity", 1)
+        item.group_label:set("text", is_window and "" or tostring(token[2] or ""))
+        item.group_label:set("opacity", is_window and 0 or 1)
+        item.window:set("opacity", is_window and 1 or 0)
+        item.background:set("fill", focused and theme.blend(theme.accent, 72) or CLEAR)
+        item.icon:set("text", is_window and Icons.for_app(app_id) or "")
+        item.icon:set("text_color", focused and theme.bright or theme.accent)
+        item.title:set("text", is_window and ellipsis(title ~= "" and title or app_id, 11) or "")
+        item.title:set("text_color", focused and theme.bright or theme.text)
       else
-        item.column:set("width", 1)
-        item.column:set("opacity", 0)
+        item.cell:set("width", 1)
+        item.cell:set("opacity", 0)
       end
     end
-    local show_title = state.focused_output and state.title ~= ""
-    title_label:set("text", show_title and state.title or "")
-    app_label:set("text", show_title and state.app_id ~= state.title and state.app_id or "")
+    state.token_count = #state.tokens
+    strip_content:set("width", math.max(1, math.floor(tonumber(values[5]) or 1)))
+    strip_content:set("offset_x", -math.max(0, math.floor(tonumber(values[4]) or 0)))
+    left_fade:set("opacity", values[6] == true and 1 or 0)
+    right_fade:set("opacity", values[7] == true and 1 or 0)
   end
 
   local function update_status(values)

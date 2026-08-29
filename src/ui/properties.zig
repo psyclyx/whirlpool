@@ -51,6 +51,8 @@ pub const Snapshot = struct {
     text_color: Color = Color.white,
     font_size: u16 = 16,
     opacity: f32 = 1,
+    clip: bool = false,
+    offset_x: i32 = 0,
 };
 
 pub const Value = union(enum) {
@@ -65,6 +67,8 @@ pub const Value = union(enum) {
     text_color: Color,
     font_size: u16,
     opacity: f32,
+    clip: bool,
+    offset_x: i32,
 };
 
 pub const Error = error{
@@ -86,11 +90,11 @@ const paint = DirtyFlags{ .paint = true };
 /// avoids reflection-driven behavior.
 pub fn metadata(value: Value) Metadata {
     return switch (value) {
-        .width, .height, .gap, .padding, .flex => .{ .supported_by = .every_node, .dirty = layout_and_paint },
+        .width, .height, .gap, .padding, .flex, .offset_x => .{ .supported_by = .every_node, .dirty = layout_and_paint },
         .fill, .radius => .{ .supported_by = .shape, .dirty = paint },
         .text => .{ .supported_by = .text, .dirty = layout_and_paint, .owns_bytes = true },
         .text_color, .font_size => .{ .supported_by = .text, .dirty = paint },
-        .opacity => .{ .supported_by = .every_node, .dirty = paint },
+        .opacity, .clip => .{ .supported_by = .every_node, .dirty = paint },
     };
 }
 
@@ -140,6 +144,8 @@ pub const Owned = struct {
     text_color: Color = Color.white,
     font_size: u16 = 16,
     opacity: f32 = 1,
+    clip: bool = false,
+    offset_x: i32 = 0,
 
     pub fn snapshot(self: Owned) Snapshot {
         return .{
@@ -154,6 +160,8 @@ pub const Owned = struct {
             .text_color = self.text_color,
             .font_size = self.font_size,
             .opacity = self.opacity,
+            .clip = self.clip,
+            .offset_x = self.offset_x,
         };
     }
 
@@ -177,6 +185,8 @@ pub const Owned = struct {
             .text_color => |item| self.text_color = item,
             .font_size => |item| self.font_size = item,
             .opacity => |item| self.opacity = item,
+            .clip => |item| self.clip = item,
+            .offset_x => |item| self.offset_x = item,
         }
     }
 };

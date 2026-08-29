@@ -29,6 +29,7 @@ pub const Composition = struct {
             .{ .name = "whirlpool.workspace", .source = lua_stdlib.workspace },
             .{ .name = "whirlpool.theme", .source = lua_stdlib.theme },
             .{ .name = "whirlpool.status", .source = lua_stdlib.status },
+            .{ .name = "whirlpool.icons", .source = lua_stdlib.icons },
             .{ .name = "whirlpool.shell", .source = lua_stdlib.shell },
             .{ .name = "whirlpool.decorator", .source = lua_stdlib.decorator },
         };
@@ -105,6 +106,24 @@ test "surface composition exposes the workspace stdlib module" {
     try std.testing.expectEqual(@as(usize, 2), frame.node_count);
 }
 
+test "surface controllers can retain nodes created during later updates" {
+    var composition = try Composition.init(std.testing.allocator,
+        \\return function(root)
+        \\  local child
+        \\  return { update = function()
+        \\    if not child then child = root:text({ text = 'late' }) end
+        \\  end }
+        \\end
+    );
+    defer composition.deinit();
+
+    try composition.update(.{ .service = "grow", .values = &.{} });
+    try composition.update(.{ .service = "grow", .values = &.{} });
+    var frame = try composition.snapshotAndLower(.{ .width = 100, .height = 20 });
+    defer frame.deinit();
+    try std.testing.expectEqual(@as(usize, 2), frame.node_count);
+}
+
 test "sample shell and decoration modules mount as distinct compositions" {
     var shell = try Composition.init(std.testing.allocator,
         \\return require("whirlpool.shell")
@@ -119,21 +138,31 @@ test "sample shell and decoration modules mount as distinct compositions" {
             shell_background = rect.rect;
             break;
         },
-        .text => {},
+        .text, .push_clip, .pop_clip => {},
     };
     const background = shell_background orelse return error.MissingShellBackground;
     try std.testing.expectEqual(@as(f32, 0), background.x);
     try std.testing.expectEqual(@as(f32, 562), background.y);
 
+    const window_token = [_]script.program_loader.Value{
+        .{ .number = 2 },
+        .{ .string = "" },
+        .{ .string = "foot" },
+        .{ .string = "terminal" },
+        .{ .boolean = true },
+        .{ .number = 148 },
+    };
+    const tokens = [_]script.program_loader.Value{.{ .array = &window_token }};
     try shell.update(.{
         .service = "desktop",
         .values = &.{
             .{ .number = 1 },
             .{ .array = &.{} },
-            .{ .boolean = true },
-            .{ .string = "foot" },
-            .{ .string = "terminal" },
-            .{ .array = &.{} },
+            .{ .array = &tokens },
+            .{ .number = 0 },
+            .{ .number = 148 },
+            .{ .boolean = false },
+            .{ .boolean = false },
         },
     });
     var positioned = try shell.snapshotAndLower(.{ .width = 800, .height = 600 });
@@ -144,9 +173,10 @@ test "sample shell and decoration modules mount as distinct compositions" {
             title_x = text.x;
             break;
         },
-        .rect => {},
+        .rect, .push_clip, .pop_clip => {},
     };
-    try std.testing.expect((title_x orelse return error.MissingShellTitle) > 350);
+    const positioned_title = title_x orelse return error.MissingShellTitle;
+    try std.testing.expect(positioned_title > 100 and positioned_title < 300);
 
     var decoration = try Composition.init(std.testing.allocator,
         \\return require("whirlpool.decorator")

@@ -27,6 +27,10 @@ pub fn apply(composition: anytype, id: lua_program.NodeId, key: []const u8, valu
         try setFontSize(composition, handle, value);
     } else if (std.mem.eql(u8, key, "opacity")) {
         try setOpacity(composition, handle, value);
+    } else if (std.mem.eql(u8, key, "clip")) {
+        try setClip(composition, handle, value);
+    } else if (std.mem.eql(u8, key, "offset_x")) {
+        try setOffsetX(composition, handle, value);
     } else if (std.mem.eql(u8, key, "padding")) {
         try setPadding(composition, handle, value);
     } else if (std.mem.eql(u8, key, "radius")) {
@@ -73,6 +77,26 @@ fn setFontSize(composition: anytype, handle: ui.NodeHandle, value: lua_program.V
 
 fn setOpacity(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
     try composition.delta.setOpacity(handle, @floatCast(try finiteNumber(value)));
+    composition.stats.applied_properties += 1;
+}
+
+fn setClip(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
+    const enabled = switch (value) {
+        .boolean => |item| item,
+        else => return error.InvalidProperty,
+    };
+    try composition.delta.setClip(handle, enabled);
+    composition.stats.applied_properties += 1;
+}
+
+fn setOffsetX(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
+    const number = switch (value) {
+        .number => |item| item,
+        else => return error.InvalidProperty,
+    };
+    if (!std.math.isFinite(number) or @floor(number) != number or
+        number < std.math.minInt(i32) or number > std.math.maxInt(i32)) return error.InvalidProperty;
+    try composition.delta.setOffsetX(handle, @intFromFloat(number));
     composition.stats.applied_properties += 1;
 }
 

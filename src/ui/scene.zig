@@ -99,6 +99,14 @@ pub const SceneDelta = struct {
         try self.set(node, .{ .opacity = value });
     }
 
+    pub fn setClip(self: *SceneDelta, node: tree.NodeHandle, value: bool) !void {
+        try self.set(node, .{ .clip = value });
+    }
+
+    pub fn setOffsetX(self: *SceneDelta, node: tree.NodeHandle, value: i32) !void {
+        try self.set(node, .{ .offset_x = value });
+    }
+
     /// Validate and apply the complete batch atomically. Text replacements
     /// are allocated before the scene is touched, so allocation failure and
     /// every validation failure leave both values and dirty flags unchanged.
