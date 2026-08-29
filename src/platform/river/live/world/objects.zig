@@ -39,7 +39,11 @@ pub const OutputRecord = struct {
 };
 
 pub const LayerFocus = enum { exclusive, non_exclusive, none };
-pub const SeatRecord = struct { layer_focus: LayerFocus = .none };
+pub const SeatRecord = struct {
+    layer_focus: LayerFocus = .none,
+    applied_window_focus: ?wm.WindowId = null,
+    focus_needs_reassert: bool = false,
+};
 
 pub const Counts = struct {
     windows: usize,

@@ -339,8 +339,10 @@ pub const Runtime = struct {
         defer operations.deinit(self.allocator);
         for (cycle.frames.frames()) |frame| try operations.appendSlice(self.allocator, frame.plans.river_manage.operations.items);
         try self.adapter.appendServerDecorationRequests(&operations);
+        try self.adapter.appendSeatFocusRequests(&operations);
         try plans.applyManageTransport(transport.manage(Runtime, self), .{ .operations = operations.items });
         self.adapter.commitServerDecorationRequests();
+        self.adapter.commitSeatFocusRequests();
         // River guarantees at least one render sequence after every completed
         // manage sequence. Remember that credit so asynchronous surface work
         // does not request a redundant manage transaction in the interval.

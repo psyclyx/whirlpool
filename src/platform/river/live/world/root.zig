@@ -244,6 +244,44 @@ pub const Adapter = struct {
         }
     }
 
+    /// Bring River's keyboard focus into agreement with the WM model. Focus
+    /// is seat state rather than layout geometry, so it is appended at the
+    /// protocol edge after policy has produced the cycle's final world.
+    pub fn appendSeatFocusRequests(self: *const Adapter, operations: *std.ArrayList(types.ManageOperation)) !void {
+        const focused = self.focusedWindow();
+        const river_window = if (focused) |window|
+            self.objects.wm_to_window.get(window) orelse return error.UnknownWindow
+        else
+            null;
+
+        var seats = self.objects.seats.iterator();
+        while (seats.next()) |entry| {
+            const record = entry.value_ptr;
+            if (record.layer_focus == .exclusive) continue;
+            if (!record.focus_needs_reassert and record.applied_window_focus == focused) continue;
+            if (river_window) |window| {
+                try operations.append(self.allocator, .{ .focus_window = .{
+                    .seat = entry.key_ptr.*,
+                    .window = window,
+                } });
+            } else if (record.applied_window_focus != null) {
+                try operations.append(self.allocator, .{ .clear_focus = entry.key_ptr.* });
+            }
+        }
+    }
+
+    /// Record focus requests only after the complete manage plan has been
+    /// accepted. A failed transport therefore retries the transition.
+    pub fn commitSeatFocusRequests(self: *Adapter) void {
+        const focused = self.focusedWindow();
+        var seats = self.objects.seats.valueIterator();
+        while (seats.next()) |record| {
+            if (record.layer_focus == .exclusive) continue;
+            record.applied_window_focus = focused;
+            record.focus_needs_reassert = false;
+        }
+    }
+
     pub fn isPoisoned(self: *const Adapter) bool {
         return self.poisoned;
     }
@@ -461,6 +499,21 @@ pub const Adapter = struct {
         const window = self.objects.wm_to_window.get(id) orelse return error.UnknownWindow;
         return (self.objects.windows.get(window) orelse return error.UnknownWindow).node;
     }
+
+    fn focusedWindow(self: *const Adapter) ?wm.WindowId {
+        var focused: ?wm.WindowId = null;
+        var best_serial: u64 = 0;
+        for (self.objects.output_order.items) |river_output| {
+            const output = (self.objects.outputs.get(river_output) orelse continue).wm_id orelse continue;
+            const window_id = self.world.view().focusedWindow(output) orelse continue;
+            const window = self.world.getWindow(window_id) orelse continue;
+            if (focused == null or window.focus_serial > best_serial) {
+                focused = window_id;
+                best_serial = window.focus_serial;
+            }
+        }
+        return focused;
+    }
 };
 
 fn resolveSelectionOutput(raw: ?*anyopaque, id: types.OutputId) ?wm.OutputId {
@@ -635,6 +688,51 @@ test "server decoration requests are emitted only for policy transitions" {
     try adapter.appendServerDecorationRequests(&operations);
     try std.testing.expectEqual(@as(usize, 1), operations.items.len);
     try std.testing.expectEqual(window, operations.items[0].use_csd);
+}
+
+test "seat focus requests follow world focus and are edge triggered" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+
+    const seat_ref = fakeRef(0xf100);
+    const seat = try adapter.objects.bindSeat(seat_ref);
+    const output = try adapter.objects.bindOutput(fakeRef(0xf110));
+    try adapter.stageManageFact(.{ .output_position = .{ .output = output, .position = .{ .x = 0, .y = 0 } } });
+    try adapter.stageManageFact(.{ .output_dimensions = .{ .output = output, .size = .{ .width = 800, .height = 600 } } });
+    const first = try adapter.objects.bindWindow(fakeRef(0xf120), fakeRef(0xf121));
+    const second = try adapter.objects.bindWindow(fakeRef(0xf130), fakeRef(0xf131));
+
+    var initial = try adapter.beginManage(testPlanConfig());
+    initial.deinit();
+
+    var operations = std.ArrayList(types.ManageOperation).empty;
+    defer operations.deinit(std.testing.allocator);
+    try adapter.appendSeatFocusRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 1), operations.items.len);
+    try std.testing.expectEqual(seat, operations.items[0].focus_window.seat);
+    try std.testing.expectEqual(second, operations.items[0].focus_window.window);
+
+    adapter.commitSeatFocusRequests();
+    operations.clearRetainingCapacity();
+    try adapter.appendSeatFocusRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 0), operations.items.len);
+
+    try adapter.stageManageFact(.{ .seat_window_interaction = .{ .seat = seat, .window = first } });
+    var clicked = try adapter.beginManage(testPlanConfig());
+    clicked.deinit();
+    try adapter.appendSeatFocusRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 1), operations.items.len);
+    try std.testing.expectEqual(first, operations.items[0].focus_window.window);
+    adapter.commitSeatFocusRequests();
+
+    operations.clearRetainingCapacity();
+    try events.onLayerSeatFocus(&adapter, @ptrFromInt(seat_ref.value), .exclusive);
+    try adapter.appendSeatFocusRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 0), operations.items.len);
+    try events.onLayerSeatFocus(&adapter, @ptrFromInt(seat_ref.value), .none);
+    try adapter.appendSeatFocusRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 1), operations.items.len);
+    try std.testing.expectEqual(first, operations.items[0].focus_window.window);
 }
 
 test "fake River facts reconcile a WM world and compose one immutable frame epoch" {

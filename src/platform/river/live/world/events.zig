@@ -78,7 +78,10 @@ pub fn onLayerOutputArea(self: anytype, output: *wayland.client.river.OutputV1, 
 
 pub fn onLayerSeatFocus(self: anytype, seat: *wayland.client.river.SeatV1, focus: live_objects.LayerFocus) !void {
     const id = self.objects.maps.seats.idFor(live_objects.proxyRef(seat)) orelse return error.UnknownSeat;
-    self.objects.seats.getPtr(id).?.layer_focus = focus;
+    const record = self.objects.seats.getPtr(id).?;
+    if (record.layer_focus == .exclusive and focus != .exclusive)
+        record.focus_needs_reassert = true;
+    record.layer_focus = focus;
 }
 
 pub fn onSeat(self: anytype, seat: *wayland.client.river.SeatV1, event: wayland.client.river.SeatV1.Event) !void {
