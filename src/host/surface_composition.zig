@@ -125,6 +125,29 @@ test "sample shell and decoration modules mount as distinct compositions" {
     try std.testing.expectEqual(@as(f32, 0), background.x);
     try std.testing.expectEqual(@as(f32, 562), background.y);
 
+    try shell.update(.{
+        .service = "desktop",
+        .values = &.{
+            .{ .number = 1 },
+            .{ .array = &.{} },
+            .{ .boolean = true },
+            .{ .string = "foot" },
+            .{ .string = "terminal" },
+            .{ .array = &.{} },
+        },
+    });
+    var positioned = try shell.snapshotAndLower(.{ .width = 800, .height = 600 });
+    defer positioned.deinit();
+    var title_x: ?f32 = null;
+    for (positioned.drawList().ops) |operation| switch (operation) {
+        .text => |text| if (std.mem.eql(u8, text.text, "terminal")) {
+            title_x = text.x;
+            break;
+        },
+        .rect => {},
+    };
+    try std.testing.expect((title_x orelse return error.MissingShellTitle) > 350);
+
     var decoration = try Composition.init(std.testing.allocator,
         \\return require("whirlpool.decorator")
     );

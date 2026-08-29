@@ -62,9 +62,10 @@ local function build(parent)
   shell:spacer({ flex = 1 })
   local bar = shell:stack({ height = BAR_HEIGHT })
   bar:shape({ fill = theme.bg })
-  local bar_row = bar:row({ height = BAR_HEIGHT })
 
-  local left = bar_row:row({ flex = 1, height = BAR_HEIGHT, gap = 8, padding = { 0, 8, 0, 0 } })
+  -- Stack three full-width flows so each section is anchored independently:
+  -- fixed-width status widgets cannot push the title away from screen center.
+  local left = bar:row({ height = BAR_HEIGHT, gap = 8, padding = { 0, 8, 0, 0 } })
   local workspace_cells = {}
   for index = 1, 9 do
     local cell = left:stack({ width = index == 1 and 30 or 1, height = BAR_HEIGHT, opacity = index == 1 and 1 or 0 })
@@ -86,13 +87,14 @@ local function build(parent)
     minimap_columns[index] = { column = column, pieces = pieces }
   end
 
-  local center = bar_row:row({ flex = 1, height = BAR_HEIGHT, gap = 7 })
+  local center = bar:row({ height = BAR_HEIGHT, gap = 7 })
   center:spacer({ flex = 1 })
   local app_label = center:text({ text = "", font_size = 14, text_color = theme.muted, padding = { 10, 0, 0, 0 } })
   local title_label = center:text({ text = "", font_size = 17, text_color = theme.text, padding = { 8, 0, 0, 0 } })
   center:spacer({ flex = 1 })
 
-  local right = bar_row:row({ height = BAR_HEIGHT })
+  local right = bar:row({ height = BAR_HEIGHT })
+  right:spacer({ flex = 1 })
 
   local cpu = section(right, 112, theme.blend(theme.yellow))
   local update_cpu_spark = sparkline(cpu, theme.yellow)
