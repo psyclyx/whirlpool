@@ -37,6 +37,7 @@ const ShellRecord = struct {
 
 const DecorationRecord = struct {
     window: types.WindowId,
+    extent: types.Size,
     decoration: *wayland.client.river.DecorationV1,
     surface: *wayland.client.wl.Surface,
     id: types.DecorationId,
@@ -181,15 +182,33 @@ pub const Runtime = struct {
     /// never expose a half-created surface to a presenter.
     pub fn reconcile(self: *Runtime) !void {
         try self.reconcileShells();
+        try self.reconcileDecorationExtents();
         try self.advanceDecorationRetirements();
         var selection = try self.adapter.visibleTiledDecorationSelection();
         defer selection.deinit();
 
         var selected = std.ArrayList(types.WindowId).empty;
         defer selected.deinit(self.allocator);
-        for (selection.outputs.items) |output| try selected.appendSlice(self.allocator, output.windows);
+        for (selection.outputs.items) |output| for (output.windows) |window| {
+            // A window identity arrives before its first committed dimensions.
+            // Wait for that protocol fact instead of creating a guessed-size
+            // buffer which can never be resized in place.
+            if (try self.adapter.objects.actualWindowSize(window) != null)
+                try selected.append(self.allocator, window);
+        };
         try self.decoration_lifetime.reconcile(selected.items, self, createDecoration, destroyDecoration);
         try self.advanceDecorationRetirements();
+    }
+
+    fn reconcileDecorationExtents(self: *Runtime) !void {
+        for (self.decorations.items) |*record| {
+            if (record.state != .active) continue;
+            const extent = (try self.adapter.objects.actualWindowSize(record.window)) orelse continue;
+            if (!decorationExtentChanged(record.extent, extent)) continue;
+            const role_index = self.managerDecorationIndex(record.decoration) orelse
+                return error.RoleOwnershipLost;
+            try self.manager.requestDecorationRoleRetirement(role_index);
+        }
     }
 
     fn reconcileShells(self: *Runtime) !void {
@@ -260,6 +279,8 @@ pub const Runtime = struct {
     fn createDecoration(raw: ?*anyopaque, window: types.WindowId) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw.?));
         for (self.decorations.items) |record| if (record.window.value == window.value) return;
+        const extent = (try self.adapter.objects.actualWindowSize(window)) orelse
+            return error.WindowGeometryUnavailable;
         const proxy = try self.adapter.objects.windowProxy(window);
         const index = try self.manager.createDecorationRole(self.compositor, proxy, true);
         const role = self.manager.decoration_roles.items[index];
@@ -267,7 +288,7 @@ pub const Runtime = struct {
             self.rollbackDecoration(index);
             return err;
         };
-        self.decorations.append(self.allocator, .{ .window = window, .decoration = role.decoration, .surface = role.surface, .id = id }) catch |err| {
+        self.decorations.append(self.allocator, .{ .window = window, .extent = extent, .decoration = role.decoration, .surface = role.surface, .id = id }) catch |err| {
             self.rollbackDecoration(index);
             return err;
         };
@@ -372,6 +393,10 @@ fn shellExtentChanged(current: types.Size, next: types.Size) bool {
     return !std.meta.eql(current, next);
 }
 
+fn decorationExtentChanged(current: types.Size, next: types.Size) bool {
+    return current.width != next.width;
+}
+
 test "role lifecycle has explicit hook and ownership seams" {
     try std.testing.expect(@sizeOf(Runtime) > 0);
     _ = Runtime.reconcile;
@@ -385,5 +410,16 @@ test "shell extent changes require fresh presentation ownership" {
     try std.testing.expect(shellExtentChanged(
         .{ .width = 1920, .height = 1080 },
         .{ .width = 2560, .height = 1440 },
+    ));
+}
+
+test "decoration extent follows width but not content height" {
+    try std.testing.expect(!decorationExtentChanged(
+        .{ .width = 800, .height = 600 },
+        .{ .width = 800, .height = 720 },
+    ));
+    try std.testing.expect(decorationExtentChanged(
+        .{ .width = 800, .height = 600 },
+        .{ .width = 1024, .height = 600 },
     ));
 }

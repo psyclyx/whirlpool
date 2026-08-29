@@ -81,10 +81,17 @@ pub fn translateRender(
             .node = node,
             .position = .{ .x = entry.screen.x, .y = entry.screen.y },
         } });
-        try result.operations.append(allocator, .{ .set_clip_box = .{
-            .window = window,
-            .box = try box(entry.clip),
-        } });
+        try result.operations.append(allocator, .{
+            .set_clip_box = .{
+                .window = window,
+                // The layout clip is a content-space viewport. Using it as the
+                // whole-window clip removes every border outside the content box
+                // and every title surface placed above it. Output composition
+                // already clips the complete window; keep only content clipping
+                // here so River can draw the surrounding chrome.
+                .box = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+            },
+        });
         try result.operations.append(allocator, .{ .set_content_clip_box = .{
             .window = window,
             .box = try box(entry.clip),
@@ -171,4 +178,8 @@ test "render translation maps screen geometry and rejects overflow" {
     defer translated.deinit();
     try std.testing.expectEqual(@as(usize, 4), translated.operations.items.len);
     try std.testing.expectEqual(@as(i32, 4), translated.operations.items[1].set_position.position.x);
+    try std.testing.expectEqual(@as(i32, 0), translated.operations.items[2].set_clip_box.box.width);
+    try std.testing.expectEqual(@as(i32, 0), translated.operations.items[2].set_clip_box.box.height);
+    try std.testing.expectEqual(@as(i32, 4), translated.operations.items[3].set_content_clip_box.box.x);
+    try std.testing.expectEqual(@as(i32, 10), translated.operations.items[3].set_content_clip_box.box.width);
 }
