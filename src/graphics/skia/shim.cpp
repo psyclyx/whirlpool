@@ -1,6 +1,7 @@
 #include "shim.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <cstdlib>
 #include <cstdio>
@@ -54,6 +55,62 @@ static bool initialize_fonts(WhirlpoolSkia *renderer) {
     if (!renderer->font_manager)
         renderer->font_manager = SkFontMgr_New_Custom_Empty();
     return renderer->font_manager != nullptr;
+}
+
+static SkUnichar next_utf8(const char **cursor, const char *end) {
+    const auto *bytes = reinterpret_cast<const uint8_t *>(*cursor);
+    const size_t available = static_cast<size_t>(end - *cursor);
+    if (available == 0) return 0xfffd;
+
+    uint32_t codepoint = bytes[0];
+    size_t count = 1;
+    if ((bytes[0] & 0xe0) == 0xc0) {
+        codepoint = bytes[0] & 0x1f;
+        count = 2;
+    } else if ((bytes[0] & 0xf0) == 0xe0) {
+        codepoint = bytes[0] & 0x0f;
+        count = 3;
+    } else if ((bytes[0] & 0xf8) == 0xf0) {
+        codepoint = bytes[0] & 0x07;
+        count = 4;
+    } else if (bytes[0] >= 0x80) {
+        *cursor += 1;
+        return 0xfffd;
+    }
+
+    if (count > available) {
+        *cursor += 1;
+        return 0xfffd;
+    }
+    for (size_t index = 1; index < count; ++index) {
+        if ((bytes[index] & 0xc0) != 0x80) {
+            *cursor += 1;
+            return 0xfffd;
+        }
+        codepoint = (codepoint << 6) | (bytes[index] & 0x3f);
+    }
+    *cursor += count;
+    return static_cast<SkUnichar>(codepoint);
+}
+
+static sk_sp<SkTypeface> typeface_for(WhirlpoolSkia *renderer,
+                                      const sk_sp<SkTypeface>& primary,
+                                      SkUnichar character) {
+    if (primary && primary->unicharToGlyph(character) != 0) return primary;
+    auto fallback = renderer->font_manager->matchFamilyStyleCharacter(
+        nullptr, primary ? primary->fontStyle() : SkFontStyle(), nullptr, 0, character);
+    if (fallback && fallback->unicharToGlyph(character) != 0) return fallback;
+    return primary;
+}
+
+static float draw_text_run(WhirlpoolSkia *renderer, const char *text, size_t length,
+                           float x, float baseline, float size, const SkPaint& paint,
+                           const sk_sp<SkTypeface>& typeface) {
+    if (!typeface || length == 0) return x;
+    SkFont font(typeface, size);
+    renderer->canvas->drawSimpleText(text, length, SkTextEncoding::kUTF8, x, baseline,
+                                     font, paint);
+    return x + font.measureText(text, length, SkTextEncoding::kUTF8);
 }
 
 extern "C" WhirlpoolSkia *whirlpool_skia_create(int bgra) {
@@ -198,9 +255,26 @@ extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *te
     paint.setColor4f(SkColor4f{r, g, b, a}, nullptr);
     auto typeface = renderer->font_manager->legacyMakeTypeface(nullptr, SkFontStyle());
     if (!typeface) return;
-    SkFont font(std::move(typeface), size);
-    renderer->canvas->drawSimpleText(text, length, SkTextEncoding::kUTF8, x, baseline,
-                                     font, paint);
+    const char *end = text + length;
+    const char *cursor = text;
+    const char *run_start = text;
+    sk_sp<SkTypeface> run_typeface;
+    while (cursor < end) {
+        const char *character_start = cursor;
+        const SkUnichar character = next_utf8(&cursor, end);
+        auto character_typeface = typeface_for(renderer, typeface, character);
+        if (!run_typeface) {
+            run_typeface = std::move(character_typeface);
+        } else if (character_typeface && character_typeface->uniqueID() != run_typeface->uniqueID()) {
+            x = draw_text_run(renderer, run_start,
+                              static_cast<size_t>(character_start - run_start),
+                              x, baseline, size, paint, run_typeface);
+            run_start = character_start;
+            run_typeface = std::move(character_typeface);
+        }
+    }
+    draw_text_run(renderer, run_start, static_cast<size_t>(end - run_start),
+                  x, baseline, size, paint, run_typeface);
 }
 
 extern "C" void whirlpool_skia_push_clip(WhirlpoolSkia *renderer,

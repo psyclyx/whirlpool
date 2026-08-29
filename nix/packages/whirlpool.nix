@@ -45,7 +45,6 @@ stdenv.mkDerivation (finalAttrs: {
 
   postInstall = ''
     wrapProgram $out/bin/whirlpool \
-      --set WHIRLPOOL_FONT_DIR ${dejavu_fonts}/share/fonts/truetype \
       --set-default WHIRLPOOL_CONFIG "$out/share/whirlpool/config/whirlpool.lua" \
       --set LUA_PATH "$out/share/whirlpool/lua/?.lua;$out/share/whirlpool/lua/?/init.lua;$out/share/whirlpool/lua/?/?.lua;;"
     install -Dm755 scripts/compositor-free-smoke.sh $out/bin/whirlpool-compositor-free-smoke

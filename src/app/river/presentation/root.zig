@@ -248,7 +248,7 @@ pub const Context = struct {
         const selected = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
         const workspace_width = self.workspaceWidth(world, selected);
         if (x >= @as(f64, @floatFromInt(workspace_width))) {
-            const viewport = self.stripViewport(output.bounds.width, workspace_width);
+            const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
             const right_edge = workspace_width + viewport;
             if (x >= @as(f64, @floatFromInt(right_edge))) return;
             const focused = world.view().focusedWindow(wm_output);
@@ -282,7 +282,7 @@ pub const Context = struct {
         const current = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
         const workspace_width = self.workspaceWidth(world, current);
         if (x >= @as(f64, @floatFromInt(workspace_width))) {
-            const viewport = self.stripViewport(output.bounds.width, workspace_width);
+            const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
             if (x >= @as(f64, @floatFromInt(workspace_width + viewport))) return;
             const strip = window_strip.build(world, output.active_tag, world.view().focusedWindow(wm_output));
             const state = try self.stripState(output_id);
@@ -309,7 +309,7 @@ pub const Context = struct {
         const focused = world.view().focusedWindow(wm_output);
         const strip = window_strip.build(world, output.active_tag, focused);
         const workspace_width = self.workspaceWidth(world, ordinal);
-        const viewport = self.stripViewport(output.bounds.width, workspace_width);
+        const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
         const strip_state = try self.stripState(output_id);
         const focused_x = if (strip.focused_index) |index| strip.tokens[index].x else null;
         if (strip_state.focused != focused or strip_state.focused_x != focused_x or strip_state.viewport_width != viewport) {
@@ -457,6 +457,12 @@ pub const Context = struct {
     fn stripViewport(self: *const Context, output_width: u32, workspace_width: u32) u32 {
         const right_width: u32 = if (self.status.battery_present) right_width_with_battery else right_width_without_battery;
         return @max(1, output_width -| workspace_width -| right_width);
+    }
+
+    fn presentationWidth(self: *const Context, output: host.types.OutputId) !u32 {
+        const size = (try self.roles.adapter.objects.outputSize(output)) orelse return error.OutputGeometryUnavailable;
+        if (size.width <= 0) return error.InvalidExtent;
+        return @intCast(size.width);
     }
 
     fn stripState(self: *Context, output: host.types.OutputId) !*StripState {

@@ -178,6 +178,44 @@ test "sample shell and decoration modules mount as distinct compositions" {
     const positioned_title = title_x orelse return error.MissingShellTitle;
     try std.testing.expect(positioned_title > 100 and positioned_title < 300);
 
+    const second_window_token = [_]script.program_loader.Value{
+        .{ .number = 2 },
+        .{ .string = "" },
+        .{ .string = "firefox" },
+        .{ .string = "browser" },
+        .{ .boolean = false },
+        .{ .number = 148 },
+    };
+    const two_tokens = [_]script.program_loader.Value{
+        .{ .array = &window_token },
+        .{ .array = &second_window_token },
+    };
+    try shell.update(.{
+        .service = "desktop",
+        .values = &.{
+            .{ .number = 1 },
+            .{ .array = &.{} },
+            .{ .array = &two_tokens },
+            .{ .number = 0 },
+            .{ .number = 300 },
+            .{ .boolean = false },
+            .{ .boolean = false },
+        },
+    });
+    var two_windows = try shell.snapshotAndLower(.{ .width = 1200, .height = 600 });
+    defer two_windows.deinit();
+    var first_x: ?f32 = null;
+    var second_x: ?f32 = null;
+    for (two_windows.drawList().ops) |operation| switch (operation) {
+        .text => |text| {
+            if (std.mem.eql(u8, text.text, "terminal")) first_x = text.x;
+            if (std.mem.eql(u8, text.text, "browser")) second_x = text.x;
+        },
+        .rect, .push_clip, .pop_clip => {},
+    };
+    try std.testing.expect((second_x orelse return error.MissingSecondShellWindow) >
+        (first_x orelse return error.MissingFirstShellWindow));
+
     var decoration = try Composition.init(std.testing.allocator,
         \\return require("whirlpool.decorator")
     );
