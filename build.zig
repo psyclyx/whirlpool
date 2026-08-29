@@ -310,6 +310,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const app_desktop_icons = b.addModule("whirlpool-app-desktop-icons", .{
+        .root_source_file = b.path("src/app/desktop_icons/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const app_river_configured = b.addModule("whirlpool-app-river-configured", .{
         .root_source_file = b.path("src/app/river/configured/root.zig"),
         .target = target,
@@ -338,6 +344,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "whirlpool-river-role-lifecycle", .module = river_role_lifecycle },
             .{ .name = "whirlpool-river-presenter-runtime", .module = river_presenter_runtime },
             .{ .name = "whirlpool-app-status", .module = app_status },
+            .{ .name = "whirlpool-app-desktop-icons", .module = app_desktop_icons },
         },
     });
     const app_river = b.addModule("whirlpool-app-river", .{
@@ -422,6 +429,7 @@ pub fn build(b: *std.Build) void {
         river_presentation,
         river_presenter_runtime,
         app_river_configured,
+        app_desktop_icons,
         app_river_presentation,
         app_river,
         app_layer_shell,
@@ -450,17 +458,21 @@ pub fn build(b: *std.Build) void {
 fn addSkia(b: *std.Build, module: *std.Build.Module) void {
     const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", "skia" });
     const fontconfig_cflags = b.run(&.{ "pkg-config", "--cflags-only-I", "fontconfig" });
+    const librsvg_cflags = b.run(&.{ "pkg-config", "--cflags-only-I", "librsvg-2.0" });
     const libstdcpp = std.mem.trim(u8, b.run(&.{ "g++", "-print-file-name=libstdc++.so" }), " \t\r\n");
     const compile = b.addSystemCommand(&.{ "g++", "-std=c++17", "-c", "-O2", "-fPIC", "-fno-rtti", "-fno-exceptions" });
     var tokens = std.mem.tokenizeAny(u8, cflags, " \t\r\n");
     while (tokens.next()) |token| compile.addArg(b.dupe(token));
     var fontconfig_tokens = std.mem.tokenizeAny(u8, fontconfig_cflags, " \t\r\n");
     while (fontconfig_tokens.next()) |token| compile.addArg(b.dupe(token));
+    var librsvg_tokens = std.mem.tokenizeAny(u8, librsvg_cflags, " \t\r\n");
+    while (librsvg_tokens.next()) |token| compile.addArg(b.dupe(token));
     compile.addFileArg(b.path("src/graphics/skia/shim.cpp"));
     compile.addArg("-o");
     const object = compile.addOutputFileArg("whirlpool_skia_shim.o");
     module.addObjectFile(object);
     module.linkSystemLibrary("skia", .{});
     module.linkSystemLibrary("fontconfig", .{});
+    module.linkSystemLibrary("rsvg-2", .{});
     module.addObjectFile(.{ .cwd_relative = libstdcpp });
 }

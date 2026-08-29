@@ -15,6 +15,7 @@ extern fn whirlpool_skia_begin(renderer: *Native, width: u32, height: u32) c_int
 extern fn whirlpool_skia_clear(renderer: *Native, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_rect(renderer: *Native, x: f32, y: f32, width: f32, height: f32, radius: f32, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_text(renderer: *Native, text: [*]const u8, length: usize, x: f32, baseline: f32, size: f32, r: f32, g: f32, b: f32, a: f32) void;
+extern fn whirlpool_skia_draw_icon(renderer: *Native, source: [*]const u8, length: usize, x: f32, y: f32, width: f32, height: f32, opacity: f32) void;
 extern fn whirlpool_skia_push_clip(renderer: *Native, x: f32, y: f32, width: f32, height: f32) void;
 extern fn whirlpool_skia_pop_clip(renderer: *Native) void;
 extern fn whirlpool_skia_end(renderer: *Native, row_bytes: *usize) ?[*]const u8;
@@ -59,6 +60,10 @@ pub const Renderer = struct {
         whirlpool_skia_draw_text(self.native, text.ptr, text.len, x, baseline, size, color.r, color.g, color.b, color.a);
     }
 
+    pub fn drawIcon(self: *Renderer, source: []const u8, rect: Rect, opacity: f32) void {
+        whirlpool_skia_draw_icon(self.native, source.ptr, source.len, rect.x, rect.y, rect.width, rect.height, opacity);
+    }
+
     /// Consume renderer-neutral operations emitted by the retained UI host.
     /// The list owns neither text nor renderer resources; callers keep it
     /// alive until this function returns.
@@ -66,6 +71,7 @@ pub const Renderer = struct {
         for (list.ops) |op| switch (op) {
             .rect => |rect| self.drawRect(rect.rect, rect.radius, rect.color),
             .text => |item| self.drawText(item.text, item.x, item.baseline, item.size, item.color),
+            .icon => |item| self.drawIcon(item.source, item.rect, item.opacity),
             .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
             .pop_clip => whirlpool_skia_pop_clip(self.native),
         };
@@ -127,6 +133,7 @@ pub const GpuRenderer = struct {
         for (list.ops) |op| switch (op) {
             .rect => |rect| whirlpool_skia_draw_rect(self.native, rect.rect.x, rect.rect.y, rect.rect.width, rect.rect.height, rect.radius, rect.color.r, rect.color.g, rect.color.b, rect.color.a),
             .text => |item| whirlpool_skia_draw_text(self.native, item.text.ptr, item.text.len, item.x, item.baseline, item.size, item.color.r, item.color.g, item.color.b, item.color.a),
+            .icon => |item| whirlpool_skia_draw_icon(self.native, item.source.ptr, item.source.len, item.rect.x, item.rect.y, item.rect.width, item.rect.height, item.opacity),
             .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
             .pop_clip => whirlpool_skia_pop_clip(self.native),
         };
@@ -181,6 +188,11 @@ pub const DrawOp = union(enum) {
         size: f32,
         color: Color,
     },
+    icon: struct {
+        source: []const u8,
+        rect: Rect,
+        opacity: f32,
+    },
 };
 
 test "Skia binding keeps protocol ownership outside the C++ membrane" {
@@ -194,6 +206,21 @@ test "CPU renderer resolves a system font and rasterizes text" {
     defer renderer.deinit();
     try renderer.begin(160, 40, .{ 0, 0, 0, 0 });
     renderer.drawText("Whirlpool", 4, 28, 20, .{ .r = 1, .g = 1, .b = 1, .a = 1 });
+    const frame = try renderer.end();
+    const pixels = frame.pixels[0 .. frame.row_bytes * frame.height];
+    var painted = false;
+    for (pixels) |value| if (value != 0) {
+        painted = true;
+        break;
+    };
+    try std.testing.expect(painted);
+}
+
+test "CPU renderer decodes and rasterizes an SVG icon" {
+    var renderer = try Renderer.init(true);
+    defer renderer.deinit();
+    try renderer.begin(32, 32, .{ 0, 0, 0, 0 });
+    renderer.drawIcon("src/graphics/skia/testdata/icon.svg", .{ .x = 4, .y = 4, .width = 24, .height = 24 }, 1);
     const frame = try renderer.end();
     const pixels = frame.pixels[0 .. frame.row_bytes * frame.height];
     var painted = false;

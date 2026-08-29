@@ -4,7 +4,8 @@ const wm = @import("whirlpool-wm");
 
 pub const max_tokens = 96;
 pub const gap: u32 = 4;
-pub const window_width: u32 = 148;
+pub const window_min_width: u32 = 104;
+pub const window_max_width: u32 = 220;
 pub const group_open_width: u32 = 34;
 pub const group_close_width: u32 = 12;
 
@@ -35,7 +36,22 @@ pub const Strip = struct {
         }
         return null;
     }
+
+    pub fn reflow(self: *Strip) void {
+        var cursor: u32 = 0;
+        for (self.tokens[0..self.len]) |*token| {
+            if (cursor != 0) cursor +|= gap;
+            token.x = cursor;
+            cursor +|= token.width;
+        }
+        self.content_width = @max(1, cursor);
+    }
 };
+
+pub fn widthForAppId(app_id: []const u8) u32 {
+    const text_width = @as(u32, @intCast(@min(app_id.len, 64))) * 7;
+    return @min(window_max_width, @max(window_min_width, 48 + text_width));
+}
 
 pub fn build(world: *const wm.World, tag_id: wm.TagId, focused: ?wm.WindowId) Strip {
     var builder = Builder{ .world = world, .focused = focused };
@@ -97,7 +113,7 @@ const Builder = struct {
         if (node.window) |window_id| {
             const window = self.world.getWindow(window_id) orelse return false;
             if (window.lifecycle != .managed or window.placement == .scratchpad) return false;
-            return self.append(.window, window_width, "", window_id);
+            return self.append(.window, window_min_width, "", window_id);
         }
 
         const saved = self.checkpoint();
@@ -178,9 +194,16 @@ test "projection exposes tag and nested group modes around fixed-width windows" 
     try std.testing.expectEqualStrings("(:h", strip.tokens[0].label);
     try std.testing.expectEqualStrings("(:v", strip.tokens[1].label);
     try std.testing.expectEqual(Kind.window, strip.tokens[2].kind);
-    try std.testing.expectEqual(window_width, strip.tokens[2].width);
+    try std.testing.expectEqual(window_min_width, strip.tokens[2].width);
     try std.testing.expectEqual(Kind.window, strip.tokens[3].kind);
     try std.testing.expect(strip.tokens[3].focused);
     try std.testing.expectEqualStrings(")", strip.tokens[4].label);
     try std.testing.expectEqualStrings(")", strip.tokens[5].label);
+}
+
+test "application id determines a bounded window item width" {
+    const std = @import("std");
+    try std.testing.expectEqual(window_min_width, widthForAppId("foot"));
+    try std.testing.expect(widthForAppId("org.gnu.Emacs") > widthForAppId("foot"));
+    try std.testing.expectEqual(window_max_width, widthForAppId("org.example.AnExtremelyLongApplicationIdentifierThatMustBeBounded"));
 }

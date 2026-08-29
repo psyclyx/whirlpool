@@ -5,6 +5,7 @@
   lua5_4,
   libdrm,
   libgbm,
+  librsvg,
   pkg-config,
   shellcheck,
   shfmt,
@@ -24,6 +25,7 @@ mkShell {
     lua5_4
     libdrm
     libgbm
+    librsvg
     pkg-config
     shellcheck
     shfmt

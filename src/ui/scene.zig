@@ -87,6 +87,10 @@ pub const SceneDelta = struct {
         try self.set(node, .{ .text = value });
     }
 
+    pub fn setIconSource(self: *SceneDelta, node: tree.NodeHandle, value: []const u8) !void {
+        try self.set(node, .{ .icon_source = value });
+    }
+
     pub fn setTextColor(self: *SceneDelta, node: tree.NodeHandle, value: tree.Color) !void {
         try self.set(node, .{ .text_color = value });
     }
@@ -118,27 +122,27 @@ pub const SceneDelta = struct {
         const prepared = try scene.allocator.alloc(Prepared, self.mutations.items.len);
         for (prepared) |*item| item.* = .{};
         errdefer {
-            for (prepared) |item| if (item.text) |text| scene.allocator.free(text);
+            for (prepared) |item| if (item.bytes) |bytes| scene.allocator.free(bytes);
             scene.allocator.free(prepared);
         }
 
         for (self.mutations.items, 0..) |mutation, index| {
-            if (!isText(mutation.value)) continue;
+            const requested = ownedBytes(mutation.value) orelse continue;
             const current = scene.node(mutation.node) orelse return error.StaleNode;
-            const requested = mutation.value.text;
-            if (std.mem.eql(u8, current.properties.text, requested)) continue;
-            prepared[index].text = try scene.allocator.dupe(u8, requested);
+            if (std.mem.eql(u8, currentBytes(current, mutation.value), requested)) continue;
+            prepared[index].bytes = try scene.allocator.dupe(u8, requested);
         }
 
         for (self.mutations.items, 0..) |mutation, index| {
-            if (isText(mutation.value) and prepared[index].text == null) continue;
-            const owned_text = if (prepared[index].text) |text| blk: {
-                prepared[index].text = null;
-                break :blk text;
-            } else if (isText(mutation.value)) blk: {
+            const owns_bytes = ownedBytes(mutation.value) != null;
+            if (owns_bytes and prepared[index].bytes == null) continue;
+            const owned_bytes = if (prepared[index].bytes) |bytes| blk: {
+                prepared[index].bytes = null;
+                break :blk bytes;
+            } else if (owns_bytes) blk: {
                 break :blk @as(?[]u8, null);
             } else null;
-            scene.commitProperty(mutation.node, mutation.value, owned_text);
+            scene.commitProperty(mutation.node, mutation.value, owned_bytes);
         }
 
         scene.allocator.free(prepared);
@@ -146,7 +150,7 @@ pub const SceneDelta = struct {
     }
 
     const Prepared = struct {
-        text: ?[]u8 = null,
+        bytes: ?[]u8 = null,
     };
 };
 
@@ -162,8 +166,20 @@ fn freeValue(allocator: Allocator, value: tree.PropertyValue) void {
     properties.freeValue(allocator, value);
 }
 
-fn isText(value: tree.PropertyValue) bool {
-    return properties.metadata(value).owns_bytes;
+fn ownedBytes(value: tree.PropertyValue) ?[]const u8 {
+    return switch (value) {
+        .text => |bytes| bytes,
+        .icon_source => |bytes| bytes,
+        else => null,
+    };
+}
+
+fn currentBytes(snapshot: tree.NodeSnapshot, value: tree.PropertyValue) []const u8 {
+    return switch (value) {
+        .text => snapshot.properties.text,
+        .icon_source => snapshot.properties.icon_source,
+        else => unreachable,
+    };
 }
 
 test "scene delta coalesces each property and applies the final values" {

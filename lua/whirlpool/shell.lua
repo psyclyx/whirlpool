@@ -4,7 +4,6 @@
 
 local theme = require("whirlpool.theme")
 local Status = require("whirlpool.status")
-local Icons = require("whirlpool.icons")
 
 local BAR_HEIGHT = 38
 local SPARK_COUNT = 15
@@ -115,15 +114,18 @@ local function build(parent)
     local cell = strip_content:stack({ width = 1, height = BAR_HEIGHT, opacity = 0, clip = true })
     local background = cell:shape({ fill = CLEAR, radius = 3 })
     local group_label = cell:text({ text = "", font_size = 14, text_color = theme.muted, padding = { 10, 3, 0, 3 } })
-    local window = cell:row({ gap = 5, padding = { 0, 7, 0, 7 }, opacity = 0 })
-    local icon = window:text({ text = "", width = 20, font_size = 15, text_color = theme.accent, padding = { 10, 0, 0, 0 } })
-    local title = window:text({ text = "", width = 108, font_size = 14, text_color = theme.text, padding = { 10, 0, 0, 0 } })
+    local window = cell:row({ gap = 6, padding = { 7, 7, 7, 7 }, opacity = 0 })
+    local icon = window:icon({ icon_source = "", width = 20, height = 20 })
+    local labels = window:column({ gap = 1 })
+    local app_id = labels:text({ text = "", height = 12, font_size = 11, text_color = theme.text })
+    local title = labels:text({ text = "", height = 10, font_size = 9, text_color = theme.muted })
     window_tokens[#window_tokens + 1] = {
       cell = cell,
       background = background,
       group_label = group_label,
       window = window,
       icon = icon,
+      app_id = app_id,
       title = title,
     }
   end
@@ -224,10 +226,14 @@ local function build(parent)
         item.group_label:set("opacity", is_window and 0 or 1)
         item.window:set("opacity", is_window and 1 or 0)
         item.background:set("fill", focused and theme.blend(theme.accent, 72) or CLEAR)
-        item.icon:set("text", is_window and Icons.for_app(app_id) or "")
-        item.icon:set("text_color", focused and theme.bright or theme.accent)
-        item.title:set("text", is_window and ellipsis(title ~= "" and title or app_id, 11) or "")
-        item.title:set("text_color", focused and theme.bright or theme.text)
+        local width = math.max(1, math.floor(tonumber(token[6]) or 1))
+        local app_limit = math.max(4, math.floor((width - 48) / 7))
+        local title_limit = math.max(5, math.floor((width - 48) / 6))
+        item.icon:set("icon_source", is_window and tostring(token[7] or "") or "")
+        item.app_id:set("text", is_window and ellipsis(app_id, app_limit) or "")
+        item.app_id:set("text_color", focused and theme.bright or theme.text)
+        item.title:set("text", is_window and ellipsis(title, title_limit) or "")
+        item.title:set("text_color", focused and theme.text or theme.muted)
       else
         item.cell:set("width", 1)
         item.cell:set("opacity", 0)

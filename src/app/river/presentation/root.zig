@@ -10,6 +10,7 @@ const river_host_runtime = @import("whirlpool-river-host-runtime");
 const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
 const river_presenter_runtime = @import("whirlpool-river-presenter-runtime");
 const status_app = @import("whirlpool-app-status");
+const desktop_icons = @import("whirlpool-app-desktop-icons");
 const window_strip = @import("window_strip.zig");
 
 /// Owns the optional graphics runtime and its River role callback context.
@@ -17,6 +18,7 @@ pub const Bridge = struct {
     allocator: std.mem.Allocator = undefined,
     graphics: ?*river_presenter_runtime.Runtime = null,
     status: ?*status_app.Service = null,
+    icons: ?*desktop_icons.Service = null,
     status_revision: u64 = 0,
     context: Context = undefined,
     input_seats: std.ArrayList(*InputSeat) = .empty,
@@ -48,8 +50,13 @@ pub const Bridge = struct {
             self.status.?.deinit();
             self.status = null;
         }
+        self.icons = try desktop_icons.Service.init(allocator, io);
+        errdefer {
+            self.icons.?.deinit();
+            self.icons = null;
+        }
         try runtime.setSurfaceHooks(self.graphics.?.surfaceHooks());
-        self.context = .{ .allocator = allocator, .runtime = runtime, .roles = undefined, .graphics = self.graphics.? };
+        self.context = .{ .allocator = allocator, .runtime = runtime, .roles = undefined, .graphics = self.graphics.?, .icons = self.icons.? };
         try self.bindInputSeats(client);
         return self.context.hooks();
     }
@@ -64,10 +71,12 @@ pub const Bridge = struct {
     pub fn setWake(self: *Bridge, wake: river_presenter_runtime.Wake) void {
         if (self.graphics) |graphics| graphics.setWake(wake);
         if (self.status) |status| status.setWake(.{ .context = wake.context, .run = wake.run });
+        if (self.icons) |icons| icons.setWake(.{ .context = wake.context, .run = wake.run });
     }
 
     pub fn clearWake(self: *Bridge) void {
         if (self.status) |status| status.clearWake();
+        if (self.icons) |icons| icons.clearWake();
         if (self.graphics) |graphics| graphics.clearWake();
     }
 
@@ -106,6 +115,7 @@ pub const Bridge = struct {
         for (self.input_seats.items) |seat| seat.deinit();
         self.input_seats.deinit(self.allocator);
         if (self.status) |status| status.deinit();
+        if (self.icons) |icons| icons.deinit();
         if (self.graphics) |graphics| {
             self.context.deinit();
             try graphics.deinit();
@@ -119,6 +129,8 @@ pub const Bridge = struct {
         self.input_seats.deinit(self.allocator);
         if (self.status) |status| status.deinit();
         self.status = null;
+        if (self.icons) |icons| icons.deinit();
+        self.icons = null;
         if (self.graphics) |graphics| {
             self.context.deinit();
             graphics.abandon();
@@ -210,6 +222,7 @@ pub const Context = struct {
     runtime: *river_host_runtime.Runtime,
     roles: *river_role_lifecycle.Runtime,
     graphics: *river_presenter_runtime.Runtime,
+    icons: *desktop_icons.Service,
     status: status_app.Snapshot = .{},
     strip_states: std.AutoHashMapUnmanaged(u64, StripState) = .empty,
 
@@ -252,7 +265,7 @@ pub const Context = struct {
             const right_edge = workspace_width + viewport;
             if (x >= @as(f64, @floatFromInt(right_edge))) return;
             const focused = world.view().focusedWindow(wm_output);
-            const strip = window_strip.build(world, output.active_tag, focused);
+            const strip = try self.buildWindowStrip(world, output.active_tag, focused);
             const state = try self.stripState(output_id);
             const local = x - @as(f64, @floatFromInt(workspace_width)) + @as(f64, @floatFromInt(state.offset));
             if (local < 0 or local > std.math.maxInt(u32)) return;
@@ -284,7 +297,7 @@ pub const Context = struct {
         if (x >= @as(f64, @floatFromInt(workspace_width))) {
             const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
             if (x >= @as(f64, @floatFromInt(workspace_width + viewport))) return;
-            const strip = window_strip.build(world, output.active_tag, world.view().focusedWindow(wm_output));
+            const strip = try self.buildWindowStrip(world, output.active_tag, world.view().focusedWindow(wm_output));
             const state = try self.stripState(output_id);
             const amount: i32 = if (delta > 0) 96 else if (delta < 0) -96 else 0;
             state.offset = window_strip.pan(state.offset, amount, viewport, strip.content_width);
@@ -294,6 +307,18 @@ pub const Context = struct {
         const target = if (next) @min(@as(usize, 8), current + 1) else if (current == 0) 0 else current - 1;
         if (target == current) return;
         try self.runtime.queueIntent(.{ .set_active_tag = .{ .output = wm_output, .tag = world.tagAt(target) orelse return } });
+    }
+
+    fn buildWindowStrip(self: *Context, world: *const wm.World, tag: wm.TagId, focused: ?wm.WindowId) !window_strip.Strip {
+        var strip = window_strip.build(world, tag, focused);
+        for (strip.tokens[0..strip.len]) |*token| if (token.window) |window| {
+            if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
+                const record = try self.runtime.adapter.objects.windowRecord(live_window);
+                token.width = window_strip.widthForAppId(record.app_id);
+            }
+        };
+        strip.reflow();
+        return strip;
     }
 
     pub fn updateShellServices(raw: ?*anyopaque, output_id: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
@@ -307,7 +332,8 @@ pub const Context = struct {
         for (&occupied_storage, 0..) |*item, index| item.* = .{ .boolean = self.tagOccupied(world, world.tagAt(index)) };
 
         const focused = world.view().focusedWindow(wm_output);
-        const strip = window_strip.build(world, output.active_tag, focused);
+        const strip = try self.buildWindowStrip(world, output.active_tag, focused);
+
         const workspace_width = self.workspaceWidth(world, ordinal);
         const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
         const strip_state = try self.stripState(output_id);
@@ -321,15 +347,17 @@ pub const Context = struct {
             strip_state.offset = window_strip.pan(strip_state.offset, 0, viewport, strip.content_width);
         }
 
-        var token_storage: [window_strip.max_tokens][6]script.program_loader.Value = undefined;
+        var token_storage: [window_strip.max_tokens][7]script.program_loader.Value = undefined;
         var tokens: [window_strip.max_tokens]script.program_loader.Value = undefined;
         for (strip.slice(), 0..) |token, index| {
             var app_id: []const u8 = "";
             var title: []const u8 = "";
+            var icon_source: []const u8 = "";
             if (token.window) |window| if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
                 const record = try self.runtime.adapter.objects.windowRecord(live_window);
                 app_id = record.app_id;
                 title = record.title;
+                icon_source = try self.icons.pathFor(app_id);
             };
             token_storage[index] = .{
                 .{ .number = @floatFromInt(@intFromEnum(token.kind)) },
@@ -338,6 +366,7 @@ pub const Context = struct {
                 .{ .string = title },
                 .{ .boolean = token.focused },
                 .{ .number = @floatFromInt(token.width) },
+                .{ .string = icon_source },
             };
             tokens[index] = .{ .array = &token_storage[index] };
         }

@@ -39,10 +39,20 @@ pub fn apply(composition: anytype, id: lua_program.NodeId, key: []const u8, valu
         try setColor(composition, snapshot.kind, handle, value);
     } else if (std.mem.eql(u8, key, "text_color")) {
         try setTextColor(composition, handle, value);
+    } else if (std.mem.eql(u8, key, "icon_source")) {
+        try setIconSource(composition, handle, value);
     } else {
         return error.InvalidProperty;
     }
     std.debug.assert(composition.stats.applied_properties > 0);
+}
+
+fn setIconSource(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
+    switch (value) {
+        .string => |source| try composition.delta.setIconSource(handle, source),
+        else => return error.InvalidProperty,
+    }
+    composition.stats.applied_properties += 1;
 }
 
 const U32Property = enum { width, height, gap, flex };
@@ -121,6 +131,7 @@ fn setColor(composition: anytype, kind: ui.NodeKind, handle: ui.NodeHandle, valu
     switch (kind) {
         .shape => try composition.delta.setFill(handle, color),
         .text => try composition.delta.setTextColor(handle, color),
+        .icon => return error.InvalidProperty,
         else => return error.InvalidProperty,
     }
     composition.stats.applied_properties += 1;

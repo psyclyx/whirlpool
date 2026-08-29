@@ -11,6 +11,7 @@ pub const NodeKind = enum {
     spacer,
     shape,
     text,
+    icon,
 };
 
 pub const Edges = struct {
@@ -48,6 +49,7 @@ pub const Snapshot = struct {
     fill: Color = Color.transparent,
     radius: f32 = 0,
     text: []const u8 = &.{},
+    icon_source: []const u8 = &.{},
     text_color: Color = Color.white,
     font_size: u16 = 16,
     opacity: f32 = 1,
@@ -64,6 +66,7 @@ pub const Value = union(enum) {
     fill: Color,
     radius: f32,
     text: []const u8,
+    icon_source: []const u8,
     text_color: Color,
     font_size: u16,
     opacity: f32,
@@ -77,7 +80,7 @@ pub const Error = error{
 };
 
 pub const Metadata = struct {
-    supported_by: enum { every_node, spacer, shape, text },
+    supported_by: enum { every_node, spacer, shape, text, icon },
     dirty: DirtyFlags,
     owns_bytes: bool = false,
 };
@@ -93,6 +96,7 @@ pub fn metadata(value: Value) Metadata {
         .width, .height, .gap, .padding, .flex, .offset_x => .{ .supported_by = .every_node, .dirty = layout_and_paint },
         .fill, .radius => .{ .supported_by = .shape, .dirty = paint },
         .text => .{ .supported_by = .text, .dirty = layout_and_paint, .owns_bytes = true },
+        .icon_source => .{ .supported_by = .icon, .dirty = paint, .owns_bytes = true },
         .text_color, .font_size => .{ .supported_by = .text, .dirty = paint },
         .opacity, .clip => .{ .supported_by = .every_node, .dirty = paint },
     };
@@ -105,6 +109,7 @@ pub fn validate(kind: NodeKind, value: Value) Error!void {
         .spacer => if (kind != .spacer) return error.PropertyNotSupported,
         .shape => if (kind != .shape) return error.PropertyNotSupported,
         .text => if (kind != .text) return error.PropertyNotSupported,
+        .icon => if (kind != .icon) return error.PropertyNotSupported,
     }
 
     switch (value) {
@@ -124,12 +129,18 @@ pub fn validColor(color: Color) bool {
 }
 
 pub fn cloneValue(allocator: Allocator, value: Value) !Value {
-    if (metadata(value).owns_bytes) return .{ .text = try allocator.dupe(u8, value.text) };
-    return value;
+    return switch (value) {
+        .text => |bytes| .{ .text = try allocator.dupe(u8, bytes) },
+        .icon_source => |bytes| .{ .icon_source = try allocator.dupe(u8, bytes) },
+        else => value,
+    };
 }
 
 pub fn freeValue(allocator: Allocator, value: Value) void {
-    if (metadata(value).owns_bytes and value.text.len != 0) allocator.free(value.text);
+    switch (value) {
+        .text, .icon_source => |bytes| if (bytes.len != 0) allocator.free(bytes),
+        else => {},
+    }
 }
 
 pub const Owned = struct {
@@ -141,6 +152,7 @@ pub const Owned = struct {
     fill: Color = Color.transparent,
     radius: f32 = 0,
     text: []u8 = &.{},
+    icon_source: []u8 = &.{},
     text_color: Color = Color.white,
     font_size: u16 = 16,
     opacity: f32 = 1,
@@ -157,6 +169,7 @@ pub const Owned = struct {
             .fill = self.fill,
             .radius = self.radius,
             .text = self.text,
+            .icon_source = self.icon_source,
             .text_color = self.text_color,
             .font_size = self.font_size,
             .opacity = self.opacity,
@@ -165,7 +178,7 @@ pub const Owned = struct {
         };
     }
 
-    pub fn commit(self: *Owned, allocator: Allocator, value: Value, owned_text: ?[]u8) void {
+    pub fn commit(self: *Owned, allocator: Allocator, value: Value, owned_bytes: ?[]u8) void {
         switch (value) {
             .width => |item| self.width = item,
             .height => |item| self.height = item,
@@ -175,12 +188,20 @@ pub const Owned = struct {
             .fill => |item| self.fill = item,
             .radius => |item| self.radius = item,
             .text => {
-                const replacement = owned_text orelse {
+                const replacement = owned_bytes orelse {
                     std.debug.assert(std.mem.eql(u8, self.text, value.text));
                     return;
                 };
                 if (self.text.len != 0) allocator.free(self.text);
                 self.text = replacement;
+            },
+            .icon_source => {
+                const replacement = owned_bytes orelse {
+                    std.debug.assert(std.mem.eql(u8, self.icon_source, value.icon_source));
+                    return;
+                };
+                if (self.icon_source.len != 0) allocator.free(self.icon_source);
+                self.icon_source = replacement;
             },
             .text_color => |item| self.text_color = item,
             .font_size => |item| self.font_size = item,
@@ -195,5 +216,7 @@ test "property metadata is the shared applicability and invalidation schema" {
     try std.testing.expectError(error.PropertyNotSupported, validate(.text, .{ .fill = Color.white }));
     try std.testing.expect(metadata(.{ .text = "value" }).owns_bytes);
     try std.testing.expect(metadata(.{ .text = "value" }).dirty.layout);
+    try std.testing.expect(metadata(.{ .icon_source = "icon.svg" }).owns_bytes);
+    try std.testing.expect(!metadata(.{ .icon_source = "icon.svg" }).dirty.layout);
     try std.testing.expect(!metadata(.{ .opacity = 1 }).dirty.layout);
 }

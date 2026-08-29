@@ -6,6 +6,7 @@
   lua5_4,
   libdrm,
   libgbm,
+  librsvg,
   lib,
   makeWrapper,
   pkg-config,
@@ -73,6 +74,7 @@ stdenv.mkDerivation (finalAttrs: {
     lua5_4
     libdrm
     libgbm
+    librsvg
     wayland
     wayland-protocols
     vulkan-headers

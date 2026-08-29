@@ -83,6 +83,14 @@ const Lowerer = struct {
                     .color = colorWithOpacity(properties.text_color, opacity),
                 } });
             },
+            .icon => if (properties.icon_source.len != 0 and box.width > 0 and box.height > 0) {
+                const source = try self.arena.allocator().dupe(u8, properties.icon_source);
+                try self.ops.append(self.allocator, .{ .icon = .{
+                    .source = source,
+                    .rect = toRect(inset(box, properties.padding)),
+                    .opacity = opacity,
+                } });
+            },
             .row => try self.layoutFlow(index, box, .horizontal, opacity),
             .column => try self.layoutFlow(index, box, .vertical, opacity),
             .stack => try self.layoutStack(index, box, opacity),
@@ -174,7 +182,7 @@ const Lowerer = struct {
                 before + after + @ceil(@as(f32, @floatFromInt(properties.text.len)) * try fontSize(properties.font_size) * 0.62)
             else
                 before + after + try fontSize(properties.font_size),
-            .shape, .spacer => 0,
+            .icon, .shape, .spacer => 0,
             .row, .column, .stack => blk: {
                 var total: f32 = 0;
                 var maximum: f32 = 0;
@@ -308,6 +316,25 @@ test "stack stretches auto-sized paint nodes to its box" {
     defer result.deinit();
     try std.testing.expectEqual(@as(f32, 80), result.ops[0].rect.rect.width);
     try std.testing.expectEqual(@as(f32, 24), result.ops[0].rect.rect.height);
+}
+
+test "icon nodes lower to a renderer-neutral image operation" {
+    const snapshot = fixture(.icon, 0, null, .{
+        .width = 24,
+        .height = 20,
+        .padding = .{ .top = 2, .right = 3, .bottom = 2, .left = 3 },
+        .icon_source = "/icons/example.svg",
+        .opacity = 0.75,
+    });
+    var result = try lower(std.testing.allocator, &.{snapshot}, .{ .width = 100, .height = 30 });
+    defer result.deinit();
+    const icon = result.ops[0].icon;
+    try std.testing.expectEqualStrings("/icons/example.svg", icon.source);
+    try std.testing.expectEqual(@as(f32, 3), icon.rect.x);
+    try std.testing.expectEqual(@as(f32, 2), icon.rect.y);
+    try std.testing.expectEqual(@as(f32, 18), icon.rect.width);
+    try std.testing.expectEqual(@as(f32, 16), icon.rect.height);
+    try std.testing.expectEqual(@as(f32, 0.75), icon.opacity);
 }
 
 test "flows stretch auto-sized children across their box" {

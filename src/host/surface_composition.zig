@@ -29,7 +29,6 @@ pub const Composition = struct {
             .{ .name = "whirlpool.workspace", .source = lua_stdlib.workspace },
             .{ .name = "whirlpool.theme", .source = lua_stdlib.theme },
             .{ .name = "whirlpool.status", .source = lua_stdlib.status },
-            .{ .name = "whirlpool.icons", .source = lua_stdlib.icons },
             .{ .name = "whirlpool.shell", .source = lua_stdlib.shell },
             .{ .name = "whirlpool.decorator", .source = lua_stdlib.decorator },
         };
@@ -138,7 +137,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
             shell_background = rect.rect;
             break;
         },
-        .text, .push_clip, .pop_clip => {},
+        .text, .icon, .push_clip, .pop_clip => {},
     };
     const background = shell_background orelse return error.MissingShellBackground;
     try std.testing.expectEqual(@as(f32, 0), background.x);
@@ -151,6 +150,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
         .{ .string = "terminal" },
         .{ .boolean = true },
         .{ .number = 148 },
+        .{ .string = "/icons/foot.svg" },
     };
     const tokens = [_]script.program_loader.Value{.{ .array = &window_token }};
     try shell.update(.{
@@ -168,15 +168,17 @@ test "sample shell and decoration modules mount as distinct compositions" {
     var positioned = try shell.snapshotAndLower(.{ .width = 800, .height = 600 });
     defer positioned.deinit();
     var title_x: ?f32 = null;
+    var icon_source: ?[]const u8 = null;
     for (positioned.drawList().ops) |operation| switch (operation) {
         .text => |text| if (std.mem.eql(u8, text.text, "terminal")) {
             title_x = text.x;
-            break;
         },
+        .icon => |icon| icon_source = icon.source,
         .rect, .push_clip, .pop_clip => {},
     };
     const positioned_title = title_x orelse return error.MissingShellTitle;
     try std.testing.expect(positioned_title > 100 and positioned_title < 300);
+    try std.testing.expectEqualStrings("/icons/foot.svg", icon_source orelse return error.MissingShellIcon);
 
     const second_window_token = [_]script.program_loader.Value{
         .{ .number = 2 },
@@ -185,6 +187,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
         .{ .string = "abcdefghijklm" },
         .{ .boolean = false },
         .{ .number = 148 },
+        .{ .string = "/icons/firefox.svg" },
     };
     const two_tokens = [_]script.program_loader.Value{
         .{ .array = &window_token },
@@ -204,17 +207,25 @@ test "sample shell and decoration modules mount as distinct compositions" {
     });
     var two_windows = try shell.snapshotAndLower(.{ .width = 1200, .height = 600 });
     defer two_windows.deinit();
-    var first_x: ?f32 = null;
-    var second_x: ?f32 = null;
+    var first_app_x: ?f32 = null;
+    var second_app_x: ?f32 = null;
+    var first_app_baseline: ?f32 = null;
+    var first_title_baseline: ?f32 = null;
     for (two_windows.drawList().ops) |operation| switch (operation) {
         .text => |text| {
-            if (std.mem.eql(u8, text.text, "terminal")) first_x = text.x;
-            if (std.mem.eql(u8, text.text, "abcdefghijk…")) second_x = text.x;
+            if (std.mem.eql(u8, text.text, "foot")) {
+                first_app_x = text.x;
+                first_app_baseline = text.baseline;
+            }
+            if (std.mem.eql(u8, text.text, "terminal")) first_title_baseline = text.baseline;
+            if (std.mem.eql(u8, text.text, "firefox")) second_app_x = text.x;
         },
-        .rect, .push_clip, .pop_clip => {},
+        .rect, .icon, .push_clip, .pop_clip => {},
     };
-    try std.testing.expect((second_x orelse return error.MissingSecondShellWindow) >
-        (first_x orelse return error.MissingFirstShellWindow));
+    try std.testing.expect((second_app_x orelse return error.MissingSecondShellWindow) >
+        (first_app_x orelse return error.MissingFirstShellWindow));
+    try std.testing.expect((first_title_baseline orelse return error.MissingFirstShellTitle) >
+        (first_app_baseline orelse return error.MissingFirstShellAppId));
 
     var decoration = try Composition.init(std.testing.allocator,
         \\return require("whirlpool.decorator")

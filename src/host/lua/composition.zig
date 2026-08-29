@@ -139,6 +139,7 @@ pub const Composition = struct {
         defer {
             for (snapshots.items) |snapshot| {
                 if (snapshot.properties.text.len != 0) self.allocator.free(snapshot.properties.text);
+                if (snapshot.properties.icon_source.len != 0) self.allocator.free(snapshot.properties.icon_source);
             }
             snapshots.deinit(self.allocator);
         }
@@ -156,8 +157,17 @@ pub const Composition = struct {
             var snapshot = self.scene.node(handle) orelse return error.StaleNode;
             if (snapshot.properties.text.len != 0)
                 snapshot.properties.text = try self.allocator.dupe(u8, snapshot.properties.text);
-            errdefer if (snapshot.properties.text.len != 0) self.allocator.free(snapshot.properties.text);
-            try output.append(self.allocator, snapshot);
+            if (snapshot.properties.icon_source.len != 0) {
+                snapshot.properties.icon_source = self.allocator.dupe(u8, snapshot.properties.icon_source) catch |err| {
+                    if (snapshot.properties.text.len != 0) self.allocator.free(snapshot.properties.text);
+                    return err;
+                };
+            }
+            output.append(self.allocator, snapshot) catch |err| {
+                if (snapshot.properties.text.len != 0) self.allocator.free(snapshot.properties.text);
+                if (snapshot.properties.icon_source.len != 0) self.allocator.free(snapshot.properties.icon_source);
+                return err;
+            };
             try self.collectSnapshots(handle, output);
         }
     }
@@ -188,10 +198,7 @@ pub const Composition = struct {
             .spacer => .spacer,
             .shape => .shape,
             .text => .text,
-            // Icons remain a retained text node at this scalar UI boundary.
-            // The package's name/size/color properties still retain their
-            // meaning through sinkSet.
-            .icon => .text,
+            .icon => .icon,
         };
         const handle = try self.mount_context.create(ui_kind, parent_handle);
         self.nodes.items[id] = handle;

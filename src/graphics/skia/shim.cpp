@@ -1,11 +1,17 @@
 #include "shim.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <cstdlib>
 #include <cstdio>
+#include <string>
+#include <unordered_map>
 #include <vector>
+
+#include <librsvg/rsvg.h>
 
 #include "core/SkCanvas.h"
 #include "core/SkColor.h"
@@ -13,8 +19,11 @@
 #include "core/SkFont.h"
 #include "core/SkFontMgr.h"
 #include "core/SkFontScanner.h"
+#include "core/SkData.h"
+#include "core/SkImage.h"
 #include "core/SkImageInfo.h"
 #include "core/SkPaint.h"
+#include "core/SkSamplingOptions.h"
 #include "core/SkSurface.h"
 #include "gpu/ganesh/GrBackendSurface.h"
 #include "gpu/ganesh/GrDirectContext.h"
@@ -40,6 +49,7 @@ struct WhirlpoolSkia {
     SkCanvas *canvas = nullptr;
     sk_sp<SkFontMgr> font_manager;
     sk_sp<GrDirectContext> gpu_context;
+    std::unordered_map<std::string, sk_sp<SkImage>> icon_cache;
 };
 
 static SkImageInfo frame_info(const WhirlpoolSkia *renderer) {
@@ -275,6 +285,84 @@ extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *te
     }
     draw_text_run(renderer, run_start, static_cast<size_t>(end - run_start),
                   x, baseline, size, paint, run_typeface);
+}
+
+static bool ends_with_case_insensitive(const std::string& value, const char *suffix) {
+    const size_t suffix_length = std::strlen(suffix);
+    if (value.size() < suffix_length) return false;
+    const size_t start = value.size() - suffix_length;
+    for (size_t index = 0; index < suffix_length; ++index) {
+        const unsigned char left = static_cast<unsigned char>(value[start + index]);
+        const unsigned char right = static_cast<unsigned char>(suffix[index]);
+        if (std::tolower(left) != std::tolower(right)) return false;
+    }
+    return true;
+}
+
+static sk_sp<SkImage> load_svg_icon(const std::string& path) {
+    GError *error = nullptr;
+    RsvgHandle *handle = rsvg_handle_new_from_file(path.c_str(), &error);
+    if (!handle) {
+        if (error) g_error_free(error);
+        return nullptr;
+    }
+    constexpr int raster_size = 64;
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                           raster_size, raster_size);
+    cairo_t *context = cairo_create(surface);
+    const RsvgRectangle viewport{0, 0, raster_size, raster_size};
+    const gboolean rendered = rsvg_handle_render_document(handle, context, &viewport, &error);
+    cairo_destroy(context);
+    g_object_unref(handle);
+    if (!rendered || cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        if (error) g_error_free(error);
+        cairo_surface_destroy(surface);
+        return nullptr;
+    }
+    cairo_surface_flush(surface);
+    const size_t stride = static_cast<size_t>(cairo_image_surface_get_stride(surface));
+    auto pixels = SkData::MakeWithCopy(cairo_image_surface_get_data(surface),
+                                       stride * raster_size);
+    cairo_surface_destroy(surface);
+    if (error) g_error_free(error);
+    if (!pixels) return nullptr;
+    const auto info = SkImageInfo::MakeN32Premul(raster_size, raster_size);
+    return SkImages::RasterFromData(info, std::move(pixels), stride);
+}
+
+static sk_sp<SkImage> load_icon(const std::string& path) {
+    if (ends_with_case_insensitive(path, ".svg") ||
+        ends_with_case_insensitive(path, ".svgz"))
+        return load_svg_icon(path);
+    auto encoded = SkData::MakeFromFileName(path.c_str());
+    return encoded ? SkImages::DeferredFromEncodedData(std::move(encoded)) : nullptr;
+}
+
+extern "C" void whirlpool_skia_draw_icon(WhirlpoolSkia *renderer,
+                                            const char *source, size_t length,
+                                            float x, float y, float width, float height,
+                                            float opacity) {
+    if (!renderer || !renderer->canvas || !source || length == 0 ||
+        width <= 0 || height <= 0 || opacity <= 0) return;
+    const std::string key(source, length);
+    auto found = renderer->icon_cache.find(key);
+    if (found == renderer->icon_cache.end())
+        found = renderer->icon_cache.emplace(key, load_icon(key)).first;
+    const auto& image = found->second;
+    if (!image || image->width() <= 0 || image->height() <= 0) return;
+
+    const float scale = std::min(width / image->width(), height / image->height());
+    const float drawn_width = image->width() * scale;
+    const float drawn_height = image->height() * scale;
+    const SkRect destination = SkRect::MakeXYWH(
+        x + (width - drawn_width) * 0.5f,
+        y + (height - drawn_height) * 0.5f,
+        drawn_width, drawn_height);
+    SkPaint paint;
+    paint.setAntiAlias(true);
+    paint.setAlphaf(std::min(1.0f, opacity));
+    renderer->canvas->drawImageRect(image, destination,
+        SkSamplingOptions(SkFilterMode::kLinear), &paint);
 }
 
 extern "C" void whirlpool_skia_push_clip(WhirlpoolSkia *renderer,

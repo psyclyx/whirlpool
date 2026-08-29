@@ -184,7 +184,7 @@ pub const Scene = struct {
         const snapshots = try allocator.alloc(NodeSnapshot, count);
         var written: usize = 0;
         errdefer {
-            for (snapshots[0..written]) |snapshot| freeSnapshotText(allocator, snapshot);
+            for (snapshots[0..written]) |snapshot| freeSnapshotBytes(allocator, snapshot);
             allocator.free(snapshots);
         }
 
@@ -203,7 +203,7 @@ pub const Scene = struct {
 
     /// Release snapshots returned by snapshotDirtyAlloc.
     pub fn freeSnapshots(allocator: Allocator, snapshots: []NodeSnapshot) void {
-        for (snapshots) |snapshot| freeSnapshotText(allocator, snapshot);
+        for (snapshots) |snapshot| freeSnapshotBytes(allocator, snapshot);
         allocator.free(snapshots);
     }
 
@@ -216,29 +216,34 @@ pub const Scene = struct {
 
     /// Apply one already-validated property. SceneDelta performs the
     /// transaction-level validation and allocation before calling this.
-    pub fn applyProperty(self: *Scene, handle: NodeHandle, value: PropertyValue, owned_text: ?[]u8) NodeError!void {
+    pub fn applyProperty(self: *Scene, handle: NodeHandle, value: PropertyValue, owned_bytes: ?[]u8) NodeError!void {
         self.assertValid();
         const stored = self.lookupNodeMut(handle) orelse return error.StaleNode;
         try properties.validate(stored.kind, value);
         switch (value) {
             .text => |requested| {
-                if (owned_text == null and !std.mem.eql(u8, stored.properties.text, requested)) {
+                if (owned_bytes == null and !std.mem.eql(u8, stored.properties.text, requested)) {
+                    return error.InvalidValue;
+                }
+            },
+            .icon_source => |requested| {
+                if (owned_bytes == null and !std.mem.eql(u8, stored.properties.icon_source, requested)) {
                     return error.InvalidValue;
                 }
             },
             else => {},
         }
-        self.commitProperty(handle, value, owned_text);
+        self.commitProperty(handle, value, owned_bytes);
         self.assertValid();
     }
 
     /// Commit a property after the caller has validated the node and prepared
     /// all fallible allocations. Keeping this phase infallible is what makes a
     /// SceneDelta's mutation phase atomic.
-    pub fn commitProperty(self: *Scene, handle: NodeHandle, value: PropertyValue, owned_text: ?[]u8) void {
+    pub fn commitProperty(self: *Scene, handle: NodeHandle, value: PropertyValue, owned_bytes: ?[]u8) void {
         self.assertValid();
         const stored = self.lookupNodeMut(handle) orelse unreachable;
-        stored.properties.commit(self.allocator, value, owned_text);
+        stored.properties.commit(self.allocator, value, owned_bytes);
 
         const dirty = properties.metadata(value).dirty;
         stored.dirty.layout = stored.dirty.layout or dirty.layout;
@@ -263,6 +268,7 @@ pub const Scene = struct {
     fn releaseNodeSlot(self: *Scene, handle: NodeHandle) void {
         const slot = &self.nodes.slots.items[handle.slot];
         if (slot.value.properties.text.len != 0) self.allocator.free(slot.value.properties.text);
+        if (slot.value.properties.icon_source.len != 0) self.allocator.free(slot.value.properties.icon_source);
         self.nodes.release(handle);
     }
 
@@ -394,6 +400,11 @@ pub const Scene = struct {
         if (stored.properties.text.len != 0) {
             const text = try allocator.dupe(u8, stored.properties.text);
             snapshot.properties.text = text;
+        }
+        errdefer if (snapshot.properties.text.len != 0) allocator.free(snapshot.properties.text);
+        if (stored.properties.icon_source.len != 0) {
+            const source = try allocator.dupe(u8, stored.properties.icon_source);
+            snapshot.properties.icon_source = source;
         }
         return snapshot;
     }
@@ -621,8 +632,9 @@ fn isDirty(flags: DirtyFlags) bool {
     return flags.layout or flags.paint;
 }
 
-fn freeSnapshotText(allocator: Allocator, snapshot: NodeSnapshot) void {
+fn freeSnapshotBytes(allocator: Allocator, snapshot: NodeSnapshot) void {
     if (snapshot.properties.text.len != 0) allocator.free(snapshot.properties.text);
+    if (snapshot.properties.icon_source.len != 0) allocator.free(snapshot.properties.icon_source);
 }
 
 fn removeOwnedNode(mount: *Mount, target: NodeHandle) void {
