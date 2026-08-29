@@ -90,8 +90,8 @@ pub fn Execution(comptime Program: type) type {
             try self.installFunction("whirlpool_native_update_value", nativeUpdateValueCallback);
             self.api.set_top(state, 0);
             if (self.api.load_buffer(state, bootstrap_source.ptr, bootstrap_source.len, "=whirlpool.bootstrap", null) != 0)
-                return error.LuaCallbackFailed;
-            if (self.api.protectedCall(self.vm, 0, 0) != 0) return error.LuaCallbackFailed;
+                return self.callbackFailed("bootstrap load");
+            if (self.api.protectedCall(self.vm, 0, 0) != 0) return self.callbackFailed("bootstrap");
             std.debug.assert(self.api.get_top(state) == 0);
         }
 
@@ -129,8 +129,8 @@ pub fn Execution(comptime Program: type) type {
             const state = self.api.state;
             self.api.set_top(state, 0);
             if (self.api.load_buffer(state, entry_source.ptr, entry_source.len, "=whirlpool.entry", null) != 0)
-                return error.LuaCallbackFailed;
-            if (self.api.protectedCall(self.vm, 0, 0) != 0) return error.LuaCallbackFailed;
+                return self.callbackFailed("entry load");
+            if (self.api.protectedCall(self.vm, 0, 0) != 0) return self.callbackFailed("entry");
             self.assertValid();
         }
 
@@ -141,9 +141,19 @@ pub fn Execution(comptime Program: type) type {
             const state = self.api.state;
             self.api.set_top(state, 0);
             if (self.api.load_buffer(state, update_source.ptr, update_source.len, "=whirlpool.update", null) != 0)
-                return error.LuaCallbackFailed;
-            if (self.api.protectedCall(self.vm, 0, 0) != 0) return error.LuaCallbackFailed;
+                return self.callbackFailed("update load");
+            if (self.api.protectedCall(self.vm, 0, 0) != 0) return self.callbackFailed("update");
             self.assertValid();
+        }
+
+        fn callbackFailed(self: *Bridge, phase: []const u8) error{LuaCallbackFailed} {
+            var length: usize = 0;
+            const message = if (self.api.to_lstring(self.api.state, -1, &length)) |pointer|
+                pointer[0..length]
+            else
+                "unknown Lua error";
+            std.log.err("Lua retained-program {s} failed: {s}", .{ phase, message });
+            return error.LuaCallbackFailed;
         }
 
         fn nativeUpdateService(self: *Bridge) c_int {

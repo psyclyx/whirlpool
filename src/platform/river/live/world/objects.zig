@@ -16,6 +16,7 @@ pub const WindowRecord = struct {
     actual_size: ?types.Size = null,
     decoration_hint: ?types.DecorationHint = null,
     decoration_ssd_applied: ?bool = null,
+    borders_applied: ?types.WindowBorders = null,
     app_id: []u8 = &.{},
     title: []u8 = &.{},
     closed: bool = false,

@@ -16,10 +16,30 @@ end
 
 local function ellipsis(text, limit)
   text = tostring(text or "")
-  local length = utf8.len(text)
-  if not length or length <= limit then return text end
-  local boundary = utf8.offset(text, limit + 1)
-  return string.sub(text, 1, boundary - 1) .. "…"
+  local byte_length = #text
+  local byte_index = 1
+  local characters = 0
+  local function continuation(index)
+    local byte = string.byte(text, index)
+    return byte and byte >= 0x80 and byte <= 0xbf
+  end
+  while byte_index <= byte_length and characters < limit do
+    local byte = string.byte(text, byte_index)
+    local width = 1
+    if byte >= 0xc2 and byte <= 0xdf and continuation(byte_index + 1) then
+      width = 2
+    elseif byte >= 0xe0 and byte <= 0xef
+      and continuation(byte_index + 1) and continuation(byte_index + 2) then
+      width = 3
+    elseif byte >= 0xf0 and byte <= 0xf4
+      and continuation(byte_index + 1) and continuation(byte_index + 2) and continuation(byte_index + 3) then
+      width = 4
+    end
+    byte_index = byte_index + width
+    characters = characters + 1
+  end
+  if byte_index > byte_length then return text end
+  return string.sub(text, 1, byte_index - 1) .. "…"
 end
 
 local function meter(parent, color, initial)

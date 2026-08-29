@@ -372,10 +372,12 @@ pub const Runtime = struct {
         var operations = std.ArrayList(types.RenderOperation).empty;
         defer operations.deinit(self.allocator);
         for (frames.frames()) |frame| try operations.appendSlice(self.allocator, frame.plans.river_render.operations.items);
+        try self.adapter.appendWindowBorderRequests(&operations);
         var commits = std.ArrayList(coordinator.SubmittedCommit).empty;
         defer commits.deinit(self.allocator);
         try self.surface_queue.appendReady(self.allocator, &commits);
         try coordinator.runRender(.{ .operations = operations.items }, commits.items, transport.renderEmitter(Runtime, self));
+        self.adapter.commitWindowBorderRequests();
     }
 
     fn runShell(self: *Runtime) !void {
@@ -599,13 +601,13 @@ test "compositor-free coordinator runs policy and retained commits only after bo
     runtime.requestShellPhase();
     try runtime.stageRenderBoundary();
     try runtime.afterDispatch();
-    try std.testing.expectEqualSlices(u8, "pmMascrrrrRblk", trace.events.items);
+    try std.testing.expectEqualSlices(u8, "pmMascrrrrrRblk", trace.events.items);
     try std.testing.expectEqual(@as(u64, 1), runtime.stats.committed_surfaces);
     try std.testing.expectEqual(@as(u64, 1), runtime.stats.shell_callbacks);
 
     try runtime.stageRenderBoundary();
     try runtime.afterDispatch();
-    try std.testing.expectEqualSlices(u8, "pmMascrrrrRblkrrrrR", trace.events.items);
+    try std.testing.expectEqualSlices(u8, "pmMascrrrrrRblkrrrrR", trace.events.items);
 }
 
 test "surface retirement discards queued work before presenter teardown" {

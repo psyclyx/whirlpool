@@ -182,7 +182,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
         .{ .number = 2 },
         .{ .string = "" },
         .{ .string = "firefox" },
-        .{ .string = "browser" },
+        .{ .string = "abcdefghijklm" },
         .{ .boolean = false },
         .{ .number = 148 },
     };
@@ -209,7 +209,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
     for (two_windows.drawList().ops) |operation| switch (operation) {
         .text => |text| {
             if (std.mem.eql(u8, text.text, "terminal")) first_x = text.x;
-            if (std.mem.eql(u8, text.text, "browser")) second_x = text.x;
+            if (std.mem.eql(u8, text.text, "abcdefghijk…")) second_x = text.x;
         },
         .rect, .push_clip, .pop_clip => {},
     };

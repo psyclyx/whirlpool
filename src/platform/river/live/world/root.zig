@@ -282,6 +282,29 @@ pub const Adapter = struct {
         }
     }
 
+    /// Match the active Tidepool profile: four-pixel borders on every edge,
+    /// white for the globally focused window and gray for every other window.
+    /// River retains border state, so render sequences carry only transitions.
+    pub fn appendWindowBorderRequests(self: *const Adapter, operations: *std.ArrayList(types.RenderOperation)) !void {
+        const focused = self.focusedWindow();
+        for (self.objects.window_order.items) |window| {
+            const record = self.objects.windows.get(window) orelse continue;
+            const desired = windowBorders(window, record.wm_id != null and record.wm_id == focused);
+            if (record.borders_applied != null and std.meta.eql(record.borders_applied.?, desired)) continue;
+            try operations.append(self.allocator, .{ .set_borders = desired });
+        }
+    }
+
+    /// Record border requests only once the complete render transaction was
+    /// accepted, leaving failed transitions eligible for retry.
+    pub fn commitWindowBorderRequests(self: *Adapter) void {
+        const focused = self.focusedWindow();
+        for (self.objects.window_order.items) |window| {
+            const record = self.objects.windows.getPtr(window) orelse continue;
+            record.borders_applied = windowBorders(window, record.wm_id != null and record.wm_id == focused);
+        }
+    }
+
     pub fn isPoisoned(self: *const Adapter) bool {
         return self.poisoned;
     }
@@ -516,6 +539,20 @@ pub const Adapter = struct {
     }
 };
 
+fn windowBorders(window: types.WindowId, focused: bool) types.WindowBorders {
+    const component_max = std.math.maxInt(u32);
+    const normal = @as(u32, 0x64) * @as(u32, 0x01010101);
+    return .{
+        .window = window,
+        .edges = 0xf,
+        .width = 4,
+        .rgba = if (focused)
+            .{ component_max, component_max, component_max, component_max }
+        else
+            .{ normal, normal, normal, component_max },
+    };
+}
+
 fn resolveSelectionOutput(raw: ?*anyopaque, id: types.OutputId) ?wm.OutputId {
     const self: *const Adapter = @ptrCast(@alignCast(raw.?));
     return self.objects.outputs.get(id).?.wm_id;
@@ -733,6 +770,43 @@ test "seat focus requests follow world focus and are edge triggered" {
     try adapter.appendSeatFocusRequests(&operations);
     try std.testing.expectEqual(@as(usize, 1), operations.items.len);
     try std.testing.expectEqual(first, operations.items[0].focus_window.window);
+}
+
+test "window border requests follow focus and are edge triggered" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+
+    const seat = try adapter.objects.bindSeat(fakeRef(0xf200));
+    const output = try adapter.objects.bindOutput(fakeRef(0xf210));
+    try adapter.stageManageFact(.{ .output_position = .{ .output = output, .position = .{ .x = 0, .y = 0 } } });
+    try adapter.stageManageFact(.{ .output_dimensions = .{ .output = output, .size = .{ .width = 800, .height = 600 } } });
+    const first = try adapter.objects.bindWindow(fakeRef(0xf220), fakeRef(0xf221));
+    const second = try adapter.objects.bindWindow(fakeRef(0xf230), fakeRef(0xf231));
+    var initial = try adapter.beginManage(testPlanConfig());
+    initial.deinit();
+
+    var operations = std.ArrayList(types.RenderOperation).empty;
+    defer operations.deinit(std.testing.allocator);
+    try adapter.appendWindowBorderRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 2), operations.items.len);
+    try std.testing.expectEqual(@as(u32, 0x64646464), operations.items[0].set_borders.rgba[0]);
+    try std.testing.expectEqual(std.math.maxInt(u32), operations.items[1].set_borders.rgba[0]);
+    try std.testing.expectEqual(@as(i32, 4), operations.items[1].set_borders.width);
+
+    adapter.commitWindowBorderRequests();
+    operations.clearRetainingCapacity();
+    try adapter.appendWindowBorderRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 0), operations.items.len);
+
+    try adapter.stageManageFact(.{ .seat_window_interaction = .{ .seat = seat, .window = first } });
+    var focused = try adapter.beginManage(testPlanConfig());
+    focused.deinit();
+    try adapter.appendWindowBorderRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 2), operations.items.len);
+    try std.testing.expectEqual(first, operations.items[0].set_borders.window);
+    try std.testing.expectEqual(std.math.maxInt(u32), operations.items[0].set_borders.rgba[0]);
+    try std.testing.expectEqual(second, operations.items[1].set_borders.window);
+    try std.testing.expectEqual(@as(u32, 0x64646464), operations.items[1].set_borders.rgba[0]);
 }
 
 test "fake River facts reconcile a WM world and compose one immutable frame epoch" {
