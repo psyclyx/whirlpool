@@ -33,6 +33,17 @@ test "world builds a generation-checked column tree with reciprocal links" {
     try std.testing.expectEqual(first, world.getNode(world.nodeForWindow(first).?).?.window.?);
 }
 
+test "columns can be inserted immediately after the focused structure" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const first = try world.createColumn(tag, .{});
+    const third = try world.createColumn(tag, .{});
+    const second = try world.createColumnAfter(tag, first, .{});
+    try std.testing.expectEqualSlices(ColumnId, &.{ first, second, third }, world.tagColumns(tag).?);
+    try world.validate();
+}
+
 test "failed command batches are atomic" {
     var world = World.init(std.testing.allocator);
     defer world.deinit();

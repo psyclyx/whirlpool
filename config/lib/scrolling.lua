@@ -4,7 +4,9 @@
 
 local peek = 16
 local inner_gap = 8
-local outer_gap = 12
+local outer_gap = 4
+local border_width = 4
+local decoration_height = 28
 local min_column_width = 0.05
 local max_column_width = 4
 
@@ -20,7 +22,10 @@ local function walk(node, column, rect, active, entries, node_columns)
       window = window.id,
       column = column.id,
       placement = window.placement,
-      virtual = rect,
+      virtual = {
+        x = rect.x, y = rect.y + decoration_height,
+        width = rect.width, height = math.max(1, rect.height - decoration_height),
+      },
       visible = active and window.lifecycle == "managed"
         and window.placement ~= "floating" and window.placement ~= "scratchpad",
       focus_serial = window.focus_serial,
@@ -69,21 +74,23 @@ return function(snapshot, sampled_camera)
   local usable = snapshot.output.usable
   assert(usable.width > 0 and usable.height > 0, "empty usable output")
   local entries, metrics, node_columns = {}, {}, {}
+  local base_width = math.max(1, usable.width
+    - 2 * (outer_gap + peek + border_width + inner_gap))
   local virtual_x = outer_gap
   for index, column in ipairs(snapshot.tag.columns) do
-    local width = math.max(1, usable.width * clamp(column.width, min_column_width, max_column_width))
-    if index ~= 1 then virtual_x = virtual_x + outer_gap end
+    local width = math.max(1, base_width * clamp(column.width, min_column_width, max_column_width))
     metrics[#metrics + 1] = { id = column.id, x = virtual_x, width = width }
-    local content_height = usable.height - outer_gap * 2
+    local content_height = usable.height - outer_gap * 2 - border_width
     assert(content_height > 0, "layout bounds too small")
     if column.root then
       walk(column.root, column, {
-        x = virtual_x, y = outer_gap, width = width, height = content_height,
+        x = virtual_x, y = outer_gap + border_width, width = width, height = content_height,
       }, true, entries, node_columns)
     end
-    virtual_x = virtual_x + width
+    virtual_x = virtual_x + width + inner_gap
   end
-  local strip_width = virtual_x + outer_gap
+  local strip_width = #metrics == 0 and outer_gap * 2
+    or virtual_x - inner_gap + outer_gap
 
   local fullscreen, fullscreen_serial
   for _, entry in ipairs(entries) do
@@ -102,20 +109,32 @@ return function(snapshot, sampled_camera)
   end
 
   local focused_column = snapshot.tag.focused and node_columns[snapshot.tag.focused] or nil
-  local focused_metric = metrics[1]
-  for _, metric in ipairs(metrics) do
-    if metric.id == focused_column then focused_metric = metric break end
+  local focused_metric, focused_index
+  for index, metric in ipairs(metrics) do
+    if metric.id == focused_column then
+      focused_metric, focused_index = metric, index
+      break
+    end
   end
-  local target = 0
+  local target = snapshot.tag.camera.current
   if focused_metric then
-    local minimum = focused_metric.x + focused_metric.width - (usable.width - peek)
-    local maximum = focused_metric.x - peek
-    if minimum <= maximum then
-      target = clamp(snapshot.tag.camera.current, minimum, maximum)
-    else
+    local peek_total = peek + border_width
+    local required_left = focused_index > 1
+      and focused_metric.x - inner_gap - peek_total or focused_metric.x
+    local required_right = focused_index < #metrics
+      and focused_metric.x + focused_metric.width + inner_gap + peek_total
+      or focused_metric.x + focused_metric.width
+    local needed_left = required_left - outer_gap
+    local needed_right = required_right + outer_gap
+    if needed_right - needed_left > usable.width then
       target = focused_metric.x + (focused_metric.width - usable.width) / 2
+    else
+      if target + usable.width < needed_right then target = needed_right - usable.width end
+      if target > needed_left then target = needed_left end
     end
     target = clamp(target, 0, math.max(0, strip_width - usable.width))
+  else
+    target = 0
   end
 
   for _, entry in ipairs(entries) do

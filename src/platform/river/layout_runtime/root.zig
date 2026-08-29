@@ -420,8 +420,8 @@ test "sample scrolling provider lays out columns, focuses camera, and clips view
 
     try std.testing.expectEqual(@as(usize, 3), plans.render.entries.items.len);
     try std.testing.expect(plans.render.context.camera.target > 0);
-    try std.testing.expect(plans.render.context.camera.strip_width > 1200);
-    try std.testing.expectEqual(@as(u32, 388), plans.render.entries.items[0].clip.width);
+    try std.testing.expectEqual(@as(f32, 1032), plans.render.context.camera.strip_width);
+    try std.testing.expectEqual(@as(u32, 336), plans.render.entries.items[0].clip.width);
     try std.testing.expectEqual(@as(u32, 0), plans.render.entries.items[2].clip.width);
 }
 
@@ -456,7 +456,7 @@ test "sample scrolling provider preserves split geometry and tab visibility" {
         try std.testing.expectEqual(@as(usize, 2), plans.render.entries.items.len);
         const first_width = plans.render.entries.items[0].target_virtual.width;
         const second_width = plans.render.entries.items[1].target_virtual.width;
-        try std.testing.expectApproxEqAbs(@as(f32, 992), first_width + second_width, 0.01);
+        try std.testing.expectApproxEqAbs(@as(f32, 928), first_width + second_width, 0.01);
         try std.testing.expect(first_width > second_width * 2.9);
     }
     _ = try world.applyAtomically(&.{

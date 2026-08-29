@@ -43,7 +43,7 @@ fn destroyClosedWindows(self: anytype) !void {
     while (iterator.next()) |entry| {
         if (!entry.value_ptr.closed) continue;
         if (entry.value_ptr.wm_id) |id| {
-            _ = try self.world.applyAtomically(&.{.{ .window = .{ .destroy = id } }});
+            try destroyWindowAndEmptyColumn(self, id);
             std.debug.assert(self.objects.wm_to_window.remove(id));
             entry.value_ptr.wm_id = null;
         }
@@ -116,7 +116,7 @@ fn removeRetiredOutputs(self: anytype) !void {
                 const window_id = entry.wm_id orelse continue;
                 const value = self.world.getWindow(window_id) orelse return error.UnknownWindow;
                 if (value.output != removed_output) continue;
-                _ = try self.world.applyAtomically(&.{.{ .window = .{ .destroy = window_id } }});
+                try destroyWindowAndEmptyColumn(self, window_id);
                 std.debug.assert(self.objects.wm_to_window.remove(window_id));
                 entry.wm_id = null;
             }
@@ -148,11 +148,17 @@ fn materializeWindows(self: anytype) !void {
             .placement = entry.desired_placement,
         } });
         const window_id = result.announced_window.?;
-        const column = if (self.world.tagColumns(active_tag)) |columns|
-            if (columns.len != 0) columns[0] else try self.world.createColumn(active_tag, .{})
+        const tag = self.world.getTag(active_tag) orelse return error.UnknownTag;
+        const focused_column = if (tag.focused) |node|
+            (self.world.getNode(node) orelse return error.InvalidInvariant).column
         else
-            return error.UnknownOutput;
+            null;
+        // Tidepool's scrolling policy gives every newly tiled window its own
+        // 50% column immediately after the focused column. Structural absorb
+        // actions are what intentionally combine windows later.
+        const column = try self.world.createColumnAfter(active_tag, focused_column, .{ .width = 0.5 });
         _ = try wm.lifecycle.applyEvent(&self.world, .{ .window_managed = .{ .window = window_id, .column = column } });
+        _ = try self.world.applyAtomically(&.{.{ .focus = .{ .window = window_id } }});
         entry.wm_id = window_id;
         try self.objects.wm_to_window.put(window_id, window);
     }
@@ -167,9 +173,23 @@ fn moveWindowsToPreferredOutputs(self: anytype) !void {
         const window_id = entry.wm_id orelse continue;
         const current = self.world.getWindow(window_id) orelse return error.UnknownWindow;
         if (current.output == destination_wm) continue;
-        _ = try self.world.applyAtomically(&.{.{ .window = .{ .destroy = window_id } }});
+        try destroyWindowAndEmptyColumn(self, window_id);
         std.debug.assert(self.objects.wm_to_window.remove(window_id));
         entry.wm_id = null;
+    }
+}
+
+fn destroyWindowAndEmptyColumn(self: anytype, window_id: wm.WindowId) !void {
+    const node_id = self.world.nodeForWindow(window_id) orelse return error.UnknownWindow;
+    const node = self.world.getNode(node_id) orelse return error.InvalidInvariant;
+    const column = self.world.getColumn(node.column) orelse return error.InvalidInvariant;
+    if (column.root == node_id) {
+        _ = try self.world.applyAtomically(&.{
+            .{ .window = .{ .destroy = window_id } },
+            .{ .tree = .{ .remove_column = node.column } },
+        });
+    } else {
+        _ = try self.world.applyAtomically(&.{.{ .window = .{ .destroy = window_id } }});
     }
 }
 

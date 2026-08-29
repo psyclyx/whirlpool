@@ -705,6 +705,42 @@ test "output reconciliation preserves workspace changes and places new windows t
     try std.testing.expectEqual(second, adapter.world.getWindow(try adapter.objects.wmWindowId(window)).?.tag);
 }
 
+test "new windows become focused half-width columns after current focus" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+
+    const output = try adapter.objects.bindOutput(fakeRef(0x1250));
+    try adapter.stageManageFact(.{ .output_position = .{ .output = output, .position = .{ .x = 0, .y = 0 } } });
+    try adapter.stageManageFact(.{ .output_dimensions = .{ .output = output, .size = .{ .width = 1000, .height = 600 } } });
+    const first = try adapter.objects.bindWindow(fakeRef(0x2250), fakeRef(0x2251));
+    const second = try adapter.objects.bindWindow(fakeRef(0x2260), fakeRef(0x2261));
+
+    var manage = try adapter.beginManage(testPlanConfig());
+    defer manage.deinit();
+
+    const first_id = try adapter.objects.wmWindowId(first);
+    const second_id = try adapter.objects.wmWindowId(second);
+    const first_node = adapter.world.nodeForWindow(first_id).?;
+    const second_node = adapter.world.nodeForWindow(second_id).?;
+    const first_column = adapter.world.getNode(first_node).?.column;
+    const second_column = adapter.world.getNode(second_node).?.column;
+    try std.testing.expect(first_column != second_column);
+    const tag = adapter.world.getWindow(first_id).?.tag;
+    const columns = adapter.world.tagColumns(tag).?;
+    try std.testing.expectEqual(@as(usize, 2), columns.len);
+    try std.testing.expectEqual(first_column, columns[0]);
+    try std.testing.expectEqual(second_column, columns[1]);
+    try std.testing.expectEqual(@as(f32, 0.5), adapter.world.getColumn(first_column).?.width);
+    try std.testing.expectEqual(@as(f32, 0.5), adapter.world.getColumn(second_column).?.width);
+    try std.testing.expectEqual(second_node, adapter.world.getTag(tag).?.focused.?);
+
+    try adapter.stageManageFact(.{ .window_closed = first });
+    var closed = try adapter.beginManage(testPlanConfig());
+    defer closed.deinit();
+    const remaining = adapter.world.tagColumns(tag).?;
+    try std.testing.expectEqualSlices(wm.ColumnId, &.{second_column}, remaining);
+}
+
 test "all output plans in a manage cycle share one world epoch" {
     var adapter = Adapter.init(std.testing.allocator, .{});
     defer adapter.deinit();

@@ -156,6 +156,29 @@ pub const World = struct {
         return id;
     }
 
+    /// Insert a column immediately after another column on the same tag.
+    /// A null predecessor appends it. This is the semantic operation used by
+    /// scrolling policy when a newly managed window follows current focus.
+    pub fn createColumnAfter(self: *World, tag_id: TagId, predecessor: ?ColumnId, spec: ColumnSpec) !ColumnId {
+        self.assertValid();
+        const tag = self.tags.getConst(tag_id) orelse return error.UnknownTag;
+        var index = tag.columns.items.len;
+        if (predecessor) |wanted| {
+            const column = self.columns.getConst(wanted) orelse return error.UnknownColumn;
+            if (column.tag != tag_id) return error.TagMismatch;
+            for (tag.columns.items, 0..) |candidate, ordinal| {
+                if (candidate == wanted) {
+                    index = ordinal + 1;
+                    break;
+                }
+            } else return error.InvalidInvariant;
+        }
+        const id = try world_tree.createColumnAt(self, tag_id, index, spec, true);
+        self.advanceEpoch();
+        self.assertValid();
+        return id;
+    }
+
     /// Announce a window without inserting it into the layout tree.
     pub fn createWindow(self: *World, spec: WindowSpec) !WindowId {
         self.assertValid();
