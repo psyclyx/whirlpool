@@ -80,11 +80,14 @@ pub const Runtime = struct {
     /// River requires binding enable/disable requests to occur in a manage
     /// sequence. The host calls this from its manage-start hook.
     pub fn enablePending(self: *Runtime) !void {
-        std.log.info("Enabling {d} River XKB bindings", .{self.entries.items.len});
+        var enabled: usize = 0;
         for (self.entries.items) |*entry| if (!entry.enabled) {
             entry.proxy.enable();
             entry.enabled = true;
+            enabled += 1;
         };
+        if (enabled != 0)
+            std.log.info("Enabled {d} River XKB bindings", .{enabled});
     }
 
     pub fn takeActions(self: *Runtime) ![]usize {
