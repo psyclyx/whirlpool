@@ -520,7 +520,13 @@ pub const Context = struct {
     fn decorationExtent(self: *const Context, window: host.types.WindowId) !river_presenter_runtime.Extent {
         const size = (try self.roles.adapter.objects.actualWindowSize(window)) orelse
             return error.WindowGeometryUnavailable;
-        return extent(size.width, 28);
+        const border_width = self.roles.adapter.windowBorderWidth();
+        const framed_width = try std.math.add(
+            i32,
+            size.width,
+            try std.math.mul(i32, border_width, 2),
+        );
+        return extent(framed_width, 28);
     }
 };
 

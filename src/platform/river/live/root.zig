@@ -12,6 +12,7 @@ const river_layer_shell = LayerShell;
 const ListenerCallbacks = @import("listeners.zig").Callbacks(Manager);
 
 pub const ShellPosition = struct { x: i32, y: i32 };
+pub const DecorationPosition = struct { x: i32, y: i32 };
 
 pub const State = enum { claimed, managing, rendering, stopping, finished, unavailable, destroyed };
 pub const Error = error{ MissingManagerGlobal, BindFailed, InvalidState, Disconnected, RolesStillLive };
@@ -207,8 +208,9 @@ pub const Manager = struct {
         }
     }
 
-    pub fn placeDecorationRoles(self: *Manager, height: i32) void {
-        for (self.decoration_roles.items) |role| role.decoration.setOffset(0, -height);
+    pub fn placeDecorationRoles(self: *Manager, height: i32, border_width: i32) !void {
+        const position = try decorationPosition(height, border_width);
+        for (self.decoration_roles.items) |role| role.decoration.setOffset(position.x, position.y);
     }
 
     /// Create a compositor-owned surface and assign it a River decoration
@@ -468,6 +470,21 @@ pub const Manager = struct {
         }
     }
 };
+
+fn decorationPosition(height: i32, border_width: i32) !DecorationPosition {
+    if (height < 0 or border_width < 0) return error.InvalidDecorationGeometry;
+    return .{
+        .x = try std.math.sub(i32, 0, border_width),
+        .y = try std.math.sub(i32, 0, try std.math.add(i32, height, border_width)),
+    };
+}
+
+test "decoration spans the border and sits above its top edge" {
+    try std.testing.expectEqual(
+        DecorationPosition{ .x = -4, .y = -32 },
+        try decorationPosition(28, 4),
+    );
+}
 
 test "live manager type-checks generated River v5 lifecycle without a socket" {
     try std.testing.expect(@sizeOf(Manager) > 0);

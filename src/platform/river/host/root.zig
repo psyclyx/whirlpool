@@ -362,7 +362,7 @@ pub const Runtime = struct {
         self.render = render_cycle;
         if (self.manager) |manager| {
             manager.placeOutputShellRoles(self, resolveShellPosition);
-            manager.placeDecorationRoles(28);
+            try manager.placeDecorationRoles(28, self.adapter.windowBorderWidth());
         }
         defer {
             self.render.?.deinit();

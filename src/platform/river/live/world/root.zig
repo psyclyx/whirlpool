@@ -21,6 +21,7 @@ const types = host.types;
 const staged_facts = host.staged_facts;
 const composition = host.composition;
 const wm_bridge = host.wm_bridge;
+const window_border_width: i32 = 4;
 pub const input_intents = @import("input.zig");
 pub const live_objects = @import("objects.zig");
 pub const events = @import("events.zig");
@@ -192,6 +193,10 @@ pub const Adapter = struct {
         if (self.objects.outputs.count() != 0 or self.world.liveOutputCount() != 0)
             return error.OutputsAlreadyAnnounced;
         self.reserved_bottom = height;
+    }
+
+    pub fn windowBorderWidth(_: *const Adapter) i32 {
+        return window_border_width;
     }
 
     pub fn takeInputIntents(self: *Adapter) ![]input_intents.Intent {
@@ -545,7 +550,7 @@ fn windowBorders(window: types.WindowId, focused: bool) types.WindowBorders {
     return .{
         .window = window,
         .edges = 0xf,
-        .width = 4,
+        .width = window_border_width,
         .rgba = if (focused)
             .{ component_max, component_max, component_max, component_max }
         else
