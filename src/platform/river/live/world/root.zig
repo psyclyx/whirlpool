@@ -493,6 +493,12 @@ pub const Adapter = struct {
                 dimensions_changed = dimensions_changed or record.actual_size == null or
                     !std.meta.eql(record.actual_size.?, value.size);
                 record.actual_size = value.size;
+                if (record.last_proposed_size) |proposed| {
+                    if (value.size.width > proposed.width)
+                        record.confirmed_minimum.width = @max(record.confirmed_minimum.width, @as(u32, @intCast(value.size.width)));
+                    if (value.size.height > proposed.height)
+                        record.confirmed_minimum.height = @max(record.confirmed_minimum.height, @as(u32, @intCast(value.size.height)));
+                }
             },
         };
         return .{ .revision = frames.revision, .epoch = frames.epoch, .facts = facts, .dimensions_changed = dimensions_changed };
@@ -1065,6 +1071,44 @@ test "late dimensions for a window closed in the preceding manage cycle are igno
     var render = try adapter.beginRender(&closed.frames);
     defer render.deinit();
     try std.testing.expect(!render.dimensions_changed);
+}
+
+test "dimensions response promotes only confirmed resize mismatches into layout floors" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+
+    const output = try adapter.objects.bindOutput(fakeRef(0x12c0));
+    try adapter.stageManageFact(.{ .output_position = .{
+        .output = output,
+        .position = .{ .x = 0, .y = 0 },
+    } });
+    try adapter.stageManageFact(.{ .output_dimensions = .{
+        .output = output,
+        .size = .{ .width = 500, .height = 400 },
+    } });
+    const window = try adapter.objects.bindWindow(fakeRef(0x22c0), fakeRef(0x22c1));
+    var initial = try adapter.beginManage(testPlanConfig());
+    defer initial.deinit();
+
+    try adapter.commitDimensionProposal(.{
+        .window = window,
+        .size = .{ .width = 200, .height = 100 },
+    });
+    try adapter.stageRenderFact(.{ .window_dimensions = .{
+        .window = window,
+        .size = .{ .width = 360, .height = 100 },
+    } });
+    var render = try adapter.beginRender(&initial.frames);
+    defer render.deinit();
+    try std.testing.expect(render.dimensions_changed);
+
+    var reconciled = try adapter.beginManage(testPlanConfig());
+    defer reconciled.deinit();
+    const wm_window = try adapter.objects.wmWindowId(window);
+    const sizing = adapter.world.getWindow(wm_window).?;
+    try std.testing.expectEqual(@as(u32, 360), sizing.size_hints.min.width);
+    try std.testing.expectEqual(@as(u32, 0), sizing.size_hints.min.height);
+    try std.testing.expectEqual(@as(?wm.Size, .{ .width = 360, .height = 100 }), sizing.actual_size);
 }
 
 test "all output plans in a manage cycle share one world epoch" {

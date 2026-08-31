@@ -595,7 +595,70 @@ test "sample scrolling provider preserves split geometry and tab visibility" {
     try std.testing.expect(plans.render.entries.items[1].visible);
 }
 
-test "sample scrolling provider animates tiled movement while proposing final sizes" {
+test "camera pan preserves configured widths despite stale actual sizes" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 400, .height = 240 },
+        .usable = .{ .x = 0, .y = 0, .width = 400, .height = 240 },
+    });
+    var windows: [3]wm.WindowId = undefined;
+    for (&windows, 0..) |*window, index| {
+        const column = try world.createColumn(tag, .{ .width = 0.5 });
+        window.* = try world.createWindow(.{
+            .tag = tag,
+            .output = output,
+            .actual_size = .{ .width = if (index == 0) 500 else 156, .height = 200 },
+            .proposed_size = .{ .width = 156, .height = 200 },
+        });
+        try world.manageWindow(window.*, column);
+    }
+    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = windows[0] } }});
+    const source = try loadScrollingSource(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 0);
+        defer plans.deinit();
+        try std.testing.expect(!plans.needs_frame);
+        try expectConfiguredColumnsPacked(&plans);
+    }
+    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = windows[2] } }});
+
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 10);
+        defer plans.deinit();
+        try std.testing.expect(plans.needs_frame);
+        try expectConfiguredColumnsPacked(&plans);
+    }
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 100);
+        defer plans.deinit();
+        try std.testing.expect(plans.needs_frame);
+        try std.testing.expect(plans.render.context.camera.current > 0);
+        try expectConfiguredColumnsPacked(&plans);
+    }
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 190);
+        defer plans.deinit();
+        try std.testing.expect(!plans.needs_frame);
+        try std.testing.expectEqual(
+            plans.render.context.camera.target,
+            plans.render.context.camera.current,
+        );
+        try expectConfiguredColumnsPacked(&plans);
+    }
+}
+
+test "tiled vertical motion animates without changing camera-driven x" {
     var world = wm.World.init(std.testing.allocator);
     defer world.deinit();
     const tag = try world.createTag();
@@ -615,12 +678,12 @@ test "sample scrolling provider animates tiled movement while proposing final si
     var runtime = try Runtime.init(std.testing.allocator, source, .{});
     defer runtime.deinit();
 
-    var initial_position: wm.Rect = undefined;
+    var initial_y: i32 = undefined;
     {
         var snapshot = world.view();
         var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 0);
         defer plans.deinit();
-        initial_position = plans.render.entries.items[1].screen;
+        initial_y = plans.render.entries.items[1].screen.y;
         try std.testing.expect(!plans.needs_frame);
     }
     _ = try world.applyAtomically(&.{.{ .tree = .{ .set_container_mode = .{
@@ -636,31 +699,51 @@ test "sample scrolling provider animates tiled movement while proposing final si
         defer plans.deinit();
         const entry = plans.render.entries.items[1];
         target = entry.target_virtual;
-        try std.testing.expectEqual(initial_position.x, entry.screen.x);
-        try std.testing.expectEqual(initial_position.y, entry.screen.y);
-        try std.testing.expect(plans.needs_frame);
         try std.testing.expectEqual(
-            @as(u32, @intFromFloat(@ceil(target.width))),
-            plans.manage.dimensions.items[1].size.width,
+            @as(i32, @intFromFloat(@floor(target.x - plans.render.context.camera.current))),
+            entry.screen.x,
         );
+        try std.testing.expectEqual(initial_y, entry.screen.y);
+        try std.testing.expect(plans.needs_frame);
     }
     {
         var snapshot = world.view();
         var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 100);
         defer plans.deinit();
-        const position = plans.render.entries.items[1].screen;
-        try std.testing.expect(position.x > initial_position.x);
-        try std.testing.expect(position.x < @as(i32, @intFromFloat(@floor(target.x))));
+        const entry = plans.render.entries.items[1];
+        try std.testing.expectEqual(
+            @as(i32, @intFromFloat(@floor(target.x - plans.render.context.camera.current))),
+            entry.screen.x,
+        );
+        try std.testing.expect(entry.screen.y > @as(i32, @intFromFloat(@floor(target.y))));
+        try std.testing.expect(entry.screen.y < initial_y);
         try std.testing.expect(plans.needs_frame);
     }
     {
         var snapshot = world.view();
         var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 190);
         defer plans.deinit();
-        const position = plans.render.entries.items[1].screen;
-        try std.testing.expectEqual(@as(i32, @intFromFloat(@floor(target.x))), position.x);
-        try std.testing.expectEqual(@as(i32, @intFromFloat(@floor(target.y))), position.y);
+        try std.testing.expectEqual(
+            @as(i32, @intFromFloat(@floor(target.y))),
+            plans.render.entries.items[1].screen.y,
+        );
         try std.testing.expect(!plans.needs_frame);
+    }
+}
+
+fn expectConfiguredColumnsPacked(plans: *const wm.LayoutPlans) !void {
+    const camera = plans.render.context.camera.current;
+    const entries = plans.render.entries.items;
+    for (entries) |entry| {
+        try std.testing.expectEqual(
+            @as(i32, @intFromFloat(@floor(entry.target_virtual.x - camera))),
+            entry.screen.x,
+        );
+        try std.testing.expectEqual(entries[0].target_virtual.width, entry.target_virtual.width);
+    }
+    for (entries[0 .. entries.len - 1], entries[1..]) |left, right| {
+        const virtual_gap = right.target_virtual.x - (left.target_virtual.x + left.target_virtual.width);
+        try std.testing.expectEqual(@as(f32, 16), virtual_gap);
     }
 }
 
@@ -699,7 +782,7 @@ test "sample scrolling provider keeps configured gaps between adjacent columns" 
     try std.testing.expectEqual(@as(f32, 0), plans.render.context.camera.target);
 }
 
-test "confirmed reluctant width expands every window in a vertical column" {
+test "confirmed width floor expands every window in a vertical column" {
     var world = wm.World.init(std.testing.allocator);
     defer world.deinit();
     const tag = try world.createTag();
@@ -712,6 +795,7 @@ test "confirmed reluctant width expands every window in a vertical column" {
     const reluctant = try world.createWindow(.{
         .tag = tag,
         .output = output,
+        .size_hints = .{ .min = .{ .width = 360, .height = 0 } },
         .actual_size = .{ .width = 360, .height = 100 },
         .proposed_size = .{ .width = 200, .height = 100 },
     });

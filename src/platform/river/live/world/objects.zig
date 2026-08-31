@@ -17,6 +17,7 @@ pub const WindowRecord = struct {
     actual_size: ?types.Size = null,
     dimensions_hint: wm.SizeHints = .{},
     last_proposed_size: ?types.Size = null,
+    confirmed_minimum: wm.Size = .{ .width = 0, .height = 0 },
     parent: ?types.WindowId = null,
     decoration_hint: ?types.DecorationHint = null,
     decoration_ssd_applied: ?bool = null,

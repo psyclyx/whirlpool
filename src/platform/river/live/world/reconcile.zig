@@ -180,12 +180,19 @@ fn syncWindowSizing(self: anytype) !void {
         const current = self.world.getWindow(id) orelse return error.UnknownWindow;
         const actual = wmSize(entry.value_ptr.actual_size);
         const proposed = wmSize(entry.value_ptr.last_proposed_size);
-        if (std.meta.eql(current.size_hints, entry.value_ptr.dimensions_hint) and
+        var effective_hints = entry.value_ptr.dimensions_hint;
+        effective_hints.min.width = @max(effective_hints.min.width, entry.value_ptr.confirmed_minimum.width);
+        effective_hints.min.height = @max(effective_hints.min.height, entry.value_ptr.confirmed_minimum.height);
+        if (effective_hints.max.width != 0)
+            effective_hints.max.width = @max(effective_hints.max.width, effective_hints.min.width);
+        if (effective_hints.max.height != 0)
+            effective_hints.max.height = @max(effective_hints.max.height, effective_hints.min.height);
+        if (std.meta.eql(current.size_hints, effective_hints) and
             std.meta.eql(current.actual_size, actual) and
             std.meta.eql(current.proposed_size, proposed)) continue;
         _ = try self.world.applyAtomically(&.{.{ .window = .{ .update_sizing = .{
             .window = id,
-            .hints = entry.value_ptr.dimensions_hint,
+            .hints = effective_hints,
             .actual = actual,
             .proposed = proposed,
         } } }});

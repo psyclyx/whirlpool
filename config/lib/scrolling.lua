@@ -14,7 +14,7 @@ local animation_duration_ms = 180
 -- Motion is layout policy. Whirlpool supplies only monotonic time and another
 -- transaction when this provider asks for one.
 local camera_motion = {}
-local window_motion = {}
+local window_y_motion = {}
 
 local function clamp(value, low, high)
   return math.max(low, math.min(high, value))
@@ -44,35 +44,13 @@ local function animate_number(motion, target, now)
   return sample_number(motion, now)
 end
 
-local function sample_point(motion, now)
-  if motion.from_x == motion.to_x and motion.from_y == motion.to_y then
-    return motion.to_x, motion.to_y, false
-  end
-  local progress = clamp((now - motion.started) / animation_duration_ms, 0, 1)
-  if progress >= 1 then
-    motion.from_x, motion.from_y = motion.to_x, motion.to_y
-    return motion.to_x, motion.to_y, false
-  end
-  local eased = ease_out_cubic(progress)
-  return motion.from_x + (motion.to_x - motion.from_x) * eased,
-    motion.from_y + (motion.to_y - motion.from_y) * eased, true
-end
-
-local function animate_point(motions, id, target, now, enabled)
+local function animate_window_y(motions, id, target, now, enabled)
   local motion = motions[id]
   if not motion or not enabled then
-    motions[id] = {
-      from_x = target.x, from_y = target.y,
-      to_x = target.x, to_y = target.y, started = now,
-    }
-    return target.x, target.y, false
+    motions[id] = { from = target, to = target, started = now }
+    return target, false
   end
-  local current_x, current_y = sample_point(motion, now)
-  if target.x ~= motion.to_x or target.y ~= motion.to_y then
-    motion.from_x, motion.from_y = current_x, current_y
-    motion.to_x, motion.to_y, motion.started = target.x, target.y, now
-  end
-  return sample_point(motion, now)
+  return animate_number(motion, target, now)
 end
 
 local function leaf_minimum(window)
@@ -80,15 +58,6 @@ local function leaf_minimum(window)
   local hints = window.size_hints or {}
   local width = math.max(0, hints.min_width or 0)
   local height = math.max(0, hints.min_height or 0)
-  local actual, proposed = window.actual, window.proposed
-  -- An actual size larger than the proposal is a confirmed lower bound, not
-  -- merely the stale size from before a resize. Each axis is independent.
-  if actual and (not proposed or actual.width > proposed.width) then
-    width = math.max(width, actual.width)
-  end
-  if actual and (not proposed or actual.height > proposed.height) then
-    height = math.max(height, actual.height)
-  end
   return {
     width = width > 0 and width + 2 * border_width or 0,
     height = height > 0 and height + decoration_height + 2 * border_width or 0,
@@ -309,21 +278,23 @@ return function(snapshot, sampled_camera)
     camera_current, camera_active = animate_number(camera, target, now)
   end
 
-  local motions = window_motion[snapshot.tag.id]
+  local motions = window_y_motion[snapshot.tag.id]
   if not motions then
     motions = {}
-    window_motion[snapshot.tag.id] = motions
+    window_y_motion[snapshot.tag.id] = motions
   end
   local seen, window_active = {}, false
   for _, entry in ipairs(entries) do
     local virtual = entry.virtual
     local floating = entry.placement == "floating"
     seen[entry.window] = true
-    local animated_x, animated_y, active = animate_point(
-      motions, entry.window, virtual, now,
+    local animated_y, active = animate_window_y(
+      motions, entry.window, virtual.y, now,
       entry.visible and entry.placement == "tiled")
     window_active = window_active or active
-    local left = floating and virtual.x or usable.x + animated_x - camera_current
+    -- Tidepool's horizontal position is camera-driven: configured columns stay
+    -- packed while the whole strip shifts beneath the output clip.
+    local left = floating and virtual.x or usable.x + virtual.x - camera_current
     local top = floating and virtual.y or usable.y + animated_y
     local rendered = entry.actual or virtual
     entry.screen = {
@@ -340,7 +311,6 @@ return function(snapshot, sampled_camera)
   for id in pairs(motions) do
     if not seen[id] then motions[id] = nil end
   end
-
   return {
     epoch = snapshot.epoch,
     tag = snapshot.tag.id,
