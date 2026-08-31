@@ -15,7 +15,14 @@ pub fn run(runtime: anytype, draft: anytype) !void {
     if (runtime.options.policy != null or runtime.configured_actions.items.len != 0) {
         var snapshot = runtime.adapter.worldView().view();
         if (runtime.configured_actions.items.len != 0)
-            try configured_actions.append(runtime.config_program.?, runtime.configured_actions.items, &snapshot, &policy_intents, runtime.options.spawn);
+            try configured_actions.append(
+                runtime.config_program.?,
+                runtime.configured_actions.items,
+                &snapshot,
+                &policy_intents,
+                runtime.options.spawn,
+                if (runtime.options.layout) |layout| layout.action else null,
+            );
         runtime.configured_actions.clearRetainingCapacity();
         if (runtime.options.policy) |hook| {
             var callback: script.Callback = .{};

@@ -27,6 +27,10 @@ pub const RenderEntry = struct {
     target_virtual: FRect,
     screen: types.Rect,
     clip: types.Rect,
+    /// Optional whole-window clip relative to the content origin. Layouts
+    /// that know their chrome extents can preserve true border geometry while
+    /// clipping the complete framed window to a viewport.
+    window_clip: ?types.Rect = null,
     visible: bool,
 };
 pub const PlanContext = struct {

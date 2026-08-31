@@ -29,6 +29,13 @@ pub const PolicyHook = struct {
 
 pub const LayoutHook = struct {
     context: ?*anyopaque = null,
+    action: ?configured_actions.Layout = null,
+    project: ?*const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        *const wm.WorldView,
+        wm.OutputId,
+    ) anyerror!?script.LayoutProjection = null,
     build: *const fn (
         ?*anyopaque,
         std.mem.Allocator,
@@ -171,6 +178,15 @@ pub const Runtime = struct {
 
     pub fn configureTags(self: *Runtime, names: []const []const u8) !void {
         try self.adapter.configureTags(names);
+    }
+
+    /// Borrow the world once and ask the configured layout for its own
+    /// structural projection. The host does not interpret that structure.
+    pub fn layoutProjection(self: *Runtime, allocator: std.mem.Allocator, output: wm.OutputId) !?script.LayoutProjection {
+        const layout = self.options.layout orelse return null;
+        const project = layout.project orelse return null;
+        var snapshot = self.adapter.worldView().view();
+        return project(layout.context, allocator, &snapshot, output);
     }
 
     /// Queue one configured binding action for the next manage cycle.

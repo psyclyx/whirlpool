@@ -17,7 +17,7 @@ local alt_ctrl_shift = { "alt", "ctrl", "shift" }
 local bindings = {
   { modifiers = alt, key = "Return", action = action("spawn", "foot") },
   { modifiers = alt, key = "d", action = action("spawn", "fuzzel") },
-  { modifiers = { "alt", "shift" }, key = "q", action = action("close-focused") },
+  { modifiers = { "alt", "shift" }, key = "q", action = action("close-selection") },
 
   -- Directional focus
   { modifiers = alt, key = "h", action = action("focus-left") },
@@ -30,6 +30,15 @@ local bindings = {
   { modifiers = { "alt", "shift" }, key = "l", action = action("swap-right") },
   { modifiers = { "alt", "shift" }, key = "j", action = action("swap-down") },
   { modifiers = { "alt", "shift" }, key = "k", action = action("swap-up") },
+
+  -- Paredit-style structural selection. Focus normally remains on leaves;
+  -- these bindings promote/demote the target used by move, close, and mark.
+  { modifiers = alt, key = "g", action = action("select-parent") },
+  { modifiers = { "alt", "shift" }, key = "g", action = action("select-child") },
+  { modifiers = alt, key = "Escape", action = action("clear-selection") },
+  { modifiers = alt, key = "m", action = action("mark", "primary") },
+  { modifiers = { "alt", "shift" }, key = "m", action = action("summon", "primary") },
+  { modifiers = alt_ctrl, key = "m", action = action("focus-mark", "primary") },
 
   -- Absorb / eject / expel
   { modifiers = alt_ctrl, key = "h", action = action("absorb-left") },
@@ -59,6 +68,16 @@ local bindings = {
   { modifiers = { "alt", "shift" }, key = "3", action = Workspace.send(3) },
   { modifiers = { "alt", "shift" }, key = "4", action = Workspace.send(4) },
   { modifiers = { "alt", "shift" }, key = "5", action = Workspace.send(5) },
+  { modifiers = alt_ctrl, key = "1", action = action("mark", "1") },
+  { modifiers = alt_ctrl, key = "2", action = action("mark", "2") },
+  { modifiers = alt_ctrl, key = "3", action = action("mark", "3") },
+  { modifiers = alt_ctrl, key = "4", action = action("mark", "4") },
+  { modifiers = alt_ctrl, key = "5", action = action("mark", "5") },
+  { modifiers = alt_ctrl_shift, key = "1", action = action("summon", "1") },
+  { modifiers = alt_ctrl_shift, key = "2", action = action("summon", "2") },
+  { modifiers = alt_ctrl_shift, key = "3", action = action("summon", "3") },
+  { modifiers = alt_ctrl_shift, key = "4", action = action("summon", "4") },
+  { modifiers = alt_ctrl_shift, key = "5", action = action("summon", "5") },
 
   -- Fullscreen and floating windows
   { modifiers = alt, key = "slash", action = action("toggle-fullscreen") },

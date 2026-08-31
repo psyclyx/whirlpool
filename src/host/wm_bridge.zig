@@ -84,17 +84,18 @@ pub fn translateRender(
         try result.operations.append(allocator, .{
             .set_clip_box = .{
                 .window = window,
-                // The layout clip is a content-space viewport. Using it as the
-                // whole-window clip removes every border outside the content box
-                // and every title surface placed above it. Output composition
-                // already clips the complete window; keep only content clipping
-                // here so River can draw the surrounding chrome.
-                .box = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+                // A provider may describe a chrome-aware whole-window clip.
+                // Otherwise its ordinary clip is content-relative and must not
+                // be reused here: that would remove title and border extents.
+                .box = if (entry.window_clip) |clip| try box(clip) else .{ .x = 0, .y = 0, .width = 0, .height = 0 },
             },
         });
         try result.operations.append(allocator, .{ .set_content_clip_box = .{
             .window = window,
-            .box = try box(entry.clip),
+            .box = if (entry.window_clip != null)
+                .{ .x = 0, .y = 0, .width = 0, .height = 0 }
+            else
+                try box(entry.clip),
         } });
     }
     return result;
@@ -182,4 +183,34 @@ test "render translation maps screen geometry and rejects overflow" {
     try std.testing.expectEqual(@as(i32, 0), translated.operations.items[2].set_clip_box.box.height);
     try std.testing.expectEqual(@as(i32, 4), translated.operations.items[3].set_content_clip_box.box.x);
     try std.testing.expectEqual(@as(i32, 10), translated.operations.items[3].set_content_clip_box.box.width);
+}
+
+test "whole-window clipping preserves chrome geometry instead of shrinking content borders" {
+    const allocator = std.testing.allocator;
+    var plan = wm.RenderPlan{
+        .context = .{
+            .allocator = allocator,
+            .epoch = 1,
+            .output = wm.OutputId.init(1, 1),
+            .camera = .{ .tag = wm.TagId.init(1, 1), .current = 0, .target = 0, .strip_width = 1 },
+        },
+    };
+    defer plan.deinit();
+    try plan.entries.append(allocator, .{
+        .window = wm.WindowId.init(2, 1),
+        .column = wm.ColumnId.init(1, 1),
+        .placement = .tiled,
+        .target_virtual = .{ .x = 0, .y = 0, .width = 100, .height = 80 },
+        .screen = .{ .x = 4, .y = 32, .width = 100, .height = 80 },
+        .clip = .{ .x = 0, .y = 0, .width = 100, .height = 80 },
+        .window_clip = .{ .x = -4, .y = -32, .width = 108, .height = 116 },
+        .visible = true,
+    });
+    const resolver = Resolver{ .window = FixtureResolver.window, .output = FixtureResolver.output, .node = FixtureResolver.node };
+    var translated = try translateRender(allocator, &plan, resolver);
+    defer translated.deinit();
+    try std.testing.expectEqual(@as(i32, -4), translated.operations.items[2].set_clip_box.box.x);
+    try std.testing.expectEqual(@as(i32, -32), translated.operations.items[2].set_clip_box.box.y);
+    try std.testing.expectEqual(@as(i32, 108), translated.operations.items[2].set_clip_box.box.width);
+    try std.testing.expectEqual(@as(i32, 0), translated.operations.items[3].set_content_clip_box.box.width);
 }

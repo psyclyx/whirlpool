@@ -265,7 +265,7 @@ pub const Context = struct {
             const right_edge = workspace_width + viewport;
             if (x >= @as(f64, @floatFromInt(right_edge))) return;
             const focused = world.view().focusedWindow(wm_output);
-            const strip = try self.buildWindowStrip(world, output.active_tag, focused);
+            const strip = try self.buildWindowStrip(world, wm_output, output.active_tag, focused);
             const state = try self.stripState(output_id);
             const local = x - @as(f64, @floatFromInt(workspace_width)) + @as(f64, @floatFromInt(state.offset));
             if (local < 0 or local > std.math.maxInt(u32)) return;
@@ -297,7 +297,7 @@ pub const Context = struct {
         if (x >= @as(f64, @floatFromInt(workspace_width))) {
             const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
             if (x >= @as(f64, @floatFromInt(workspace_width + viewport))) return;
-            const strip = try self.buildWindowStrip(world, output.active_tag, world.view().focusedWindow(wm_output));
+            const strip = try self.buildWindowStrip(world, wm_output, output.active_tag, world.view().focusedWindow(wm_output));
             const state = try self.stripState(output_id);
             const amount: i32 = if (delta > 0) 96 else if (delta < 0) -96 else 0;
             state.offset = window_strip.pan(state.offset, amount, viewport, strip.content_width);
@@ -309,8 +309,13 @@ pub const Context = struct {
         try self.runtime.queueIntent(.{ .set_active_tag = .{ .output = wm_output, .tag = world.tagAt(target) orelse return } });
     }
 
-    fn buildWindowStrip(self: *Context, world: *const wm.World, tag: wm.TagId, focused: ?wm.WindowId) !window_strip.Strip {
-        var strip = window_strip.build(world, tag, focused);
+    fn buildWindowStrip(self: *Context, world: *const wm.World, output: wm.OutputId, tag: wm.TagId, focused: ?wm.WindowId) !window_strip.Strip {
+        var projection = try self.runtime.layoutProjection(self.allocator, output);
+        defer if (projection) |*value| value.deinit();
+        var strip = if (projection) |*value|
+            window_strip.fromProjection(value)
+        else
+            window_strip.build(world, tag, focused);
         for (strip.tokens[0..strip.len]) |*token| if (token.window) |window| {
             if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
                 const record = try self.runtime.adapter.objects.windowRecord(live_window);
@@ -332,7 +337,7 @@ pub const Context = struct {
         for (&occupied_storage, 0..) |*item, index| item.* = .{ .boolean = self.tagOccupied(world, world.tagAt(index)) };
 
         const focused = world.view().focusedWindow(wm_output);
-        const strip = try self.buildWindowStrip(world, output.active_tag, focused);
+        const strip = try self.buildWindowStrip(world, wm_output, output.active_tag, focused);
 
         const workspace_width = self.workspaceWidth(world, ordinal);
         const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
@@ -347,7 +352,7 @@ pub const Context = struct {
             strip_state.offset = window_strip.pan(strip_state.offset, 0, viewport, strip.content_width);
         }
 
-        var token_storage: [window_strip.max_tokens][7]script.program_loader.Value = undefined;
+        var token_storage: [window_strip.max_tokens][9]script.program_loader.Value = undefined;
         var tokens: [window_strip.max_tokens]script.program_loader.Value = undefined;
         for (strip.slice(), 0..) |token, index| {
             var app_id: []const u8 = "";
@@ -361,12 +366,14 @@ pub const Context = struct {
             };
             token_storage[index] = .{
                 .{ .number = @floatFromInt(@intFromEnum(token.kind)) },
-                .{ .string = token.label },
+                .{ .string = token.labelSlice() },
                 .{ .string = app_id },
                 .{ .string = title },
                 .{ .boolean = token.focused },
                 .{ .number = @floatFromInt(token.width) },
                 .{ .string = icon_source },
+                .{ .boolean = token.selected },
+                .{ .string = token.mark.slice() },
             };
             tokens[index] = .{ .array = &token_storage[index] };
         }

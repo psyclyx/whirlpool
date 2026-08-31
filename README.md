@@ -84,6 +84,16 @@ widgets, an audio OSD, and title/tab decorations. The same retained shell
 content is used by River's integrated shell role and the portable layer-shell
 adapter; River additionally supplies live desktop state and bar interaction.
 
+The sample layout normally focuses leaf windows. `Alt+g` selects the containing
+group (repeat to walk outward), `Alt+Shift+g` walks inward, and `Alt+Escape`
+returns to leaf targeting. Directional `Alt+Shift+h/j/k/l` moves the selected
+window, subtree, or strip; `Alt+Shift+q` closes the selection. `Alt+m` marks it
+and `Alt+Shift+m` summons it to the current strip. Five persistent mark slots
+are available with `Alt+Ctrl+1..5`, summoned with
+`Alt+Ctrl+Shift+1..5`. The bar highlights structural selection, prints mark
+badges, separates every strip and non-tiled placement group, and shows `+` at
+the insertion point for newly opened windows.
+
 ## Testing strategy
 
 Window behavior is tested at three layers:

@@ -9,9 +9,20 @@ pub const MaxArguments: usize = 16;
 
 pub const TabStep = enum { previous, next };
 
+pub const LayoutAction = struct {
+    name: []u8,
+    args: [][]u8,
+
+    pub fn deinit(self: *LayoutAction, allocator: std.mem.Allocator) void {
+        for (self.args) |arg| allocator.free(arg);
+        allocator.free(self.args);
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
 pub const Action = union(enum) {
-    focus: wm.Direction,
-    swap: wm.Direction,
+    layout: LayoutAction,
     absorb: wm.Direction,
     eject,
     expel: wm.Direction,
@@ -28,6 +39,7 @@ pub const Action = union(enum) {
 
     pub fn deinit(self: *Action, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .layout => |*value| value.deinit(allocator),
             .spawn => |args| {
                 for (args) |arg| allocator.free(arg);
                 allocator.free(args);
@@ -136,10 +148,9 @@ fn parseAction(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!Action {
         return .{ .focus_tag = try parseTagArgument(vm, base, count) };
     if (std.mem.eql(u8, name, "send-to-tag"))
         return .{ .send_to_tag = try parseTagArgument(vm, base, count) };
+    if (isDirectionalLayoutAction(name)) return .{ .layout = try parseLayoutAction(allocator, vm, base, name, count) };
     if (count != 0) return error.InvalidAction;
 
-    if (directionAction(name, "focus-")) |direction| return .{ .focus = direction };
-    if (directionAction(name, "swap-")) |direction| return .{ .swap = direction };
     if (directionAction(name, "absorb-")) |direction| {
         return .{ .absorb = direction };
     }
@@ -159,6 +170,31 @@ fn parseAction(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!Action {
     if (std.mem.eql(u8, name, "focus-output-next")) return .{ .focus_output = .next };
     if (std.mem.eql(u8, name, "focus-output-prev")) return .{ .focus_output = .previous };
     return error.InvalidAction;
+}
+
+fn parseLayoutAction(
+    allocator: std.mem.Allocator,
+    vm: *lua_vm.Vm,
+    base: c_int,
+    name: []const u8,
+    count: usize,
+) Error!LayoutAction {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    return .{
+        .name = owned_name,
+        .args = try parseStringArguments(allocator, vm, base, count),
+    };
+}
+
+fn isDirectionalLayoutAction(name: []const u8) bool {
+    inline for (.{
+        "focus-left",    "focus-right",  "focus-up",        "focus-down",
+        "swap-left",     "swap-right",   "swap-up",         "swap-down",
+        "select-parent", "select-child", "clear-selection", "close-selection",
+        "mark",          "summon",       "focus-mark",
+    }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return false;
 }
 
 fn parseStringArguments(allocator: std.mem.Allocator, vm: *lua_vm.Vm, base: c_int, count: usize) Error![][]u8 {
@@ -210,12 +246,58 @@ fn modifierBits(name: []const u8) ?u32 {
 fn keyToKeysym(key: []const u8) ?u32 {
     if (key.len == 1) return key[0];
     const named = std.StaticStringMap(u32).initComptime(.{
-        .{ "Return", 0xff0d },            .{ "Tab", 0xff09 },                      .{ "space", 0x20 },
-        .{ "comma", ',' },                .{ "period", '.' },                      .{ "slash", '/' },
-        .{ "Left", 0xff51 },              .{ "Up", 0xff52 },                       .{ "Right", 0xff53 },
-        .{ "Down", 0xff54 },              .{ "XF86AudioRaiseVolume", 0x1008ff13 }, .{ "XF86AudioLowerVolume", 0x1008ff11 },
-        .{ "XF86AudioMute", 0x1008ff12 }, .{ "XF86AudioPlay", 0x1008ff14 },        .{ "XF86AudioNext", 0x1008ff17 },
-        .{ "XF86AudioPrev", 0x1008ff16 }, .{ "XF86AudioStop", 0x1008ff15 },
+        .{ "Return", 0xff0d },                   .{ "Tab", 0xff09 },               .{ "Escape", 0xff1b },
+        .{ "space", 0x20 },                      .{ "comma", ',' },                .{ "period", '.' },
+        .{ "slash", '/' },                       .{ "Left", 0xff51 },              .{ "Up", 0xff52 },
+        .{ "Right", 0xff53 },                    .{ "Down", 0xff54 },              .{ "XF86AudioRaiseVolume", 0x1008ff13 },
+        .{ "XF86AudioLowerVolume", 0x1008ff11 }, .{ "XF86AudioMute", 0x1008ff12 }, .{ "XF86AudioPlay", 0x1008ff14 },
+        .{ "XF86AudioNext", 0x1008ff17 },        .{ "XF86AudioPrev", 0x1008ff16 }, .{ "XF86AudioStop", 0x1008ff15 },
     });
     return named.get(key);
+}
+
+test "directional layout actions cross the config boundary opaquely" {
+    var vm = try lua_vm.Vm.init(true);
+    defer vm.deinit();
+    try vm.evalValue(
+        "return {{ key = 'j', modifiers = {'alt'}, " ++
+            "action = { name = 'focus-down', args = {'kept-verbatim'} } }}",
+        "=bindings-test",
+    );
+    const bindings = try parse(std.testing.allocator, &vm);
+    defer {
+        for (bindings) |*binding| binding.deinit(std.testing.allocator);
+        std.testing.allocator.free(bindings);
+    }
+    switch (bindings[0].action) {
+        .layout => |value| {
+            try std.testing.expectEqualStrings("focus-down", value.name);
+            try std.testing.expectEqual(@as(usize, 1), value.args.len);
+            try std.testing.expectEqualStrings("kept-verbatim", value.args[0]);
+        },
+        else => return error.ExpectedLayoutAction,
+    }
+}
+
+test "structural layout actions retain mark names and named escape key" {
+    var vm = try lua_vm.Vm.init(true);
+    defer vm.deinit();
+    try vm.evalValue(
+        "return {{ key = 'Escape', modifiers = {'alt'}, " ++
+            "action = { name = 'mark', args = {'3'} } }}",
+        "=structural-bindings-test",
+    );
+    const bindings = try parse(std.testing.allocator, &vm);
+    defer {
+        for (bindings) |*binding| binding.deinit(std.testing.allocator);
+        std.testing.allocator.free(bindings);
+    }
+    try std.testing.expectEqual(@as(u32, 0xff1b), bindings[0].keysym);
+    switch (bindings[0].action) {
+        .layout => |value| {
+            try std.testing.expectEqualStrings("mark", value.name);
+            try std.testing.expectEqualStrings("3", value.args[0]);
+        },
+        else => return error.ExpectedLayoutAction,
+    }
 }

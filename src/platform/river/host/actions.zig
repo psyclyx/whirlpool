@@ -9,18 +9,33 @@ pub const Spawn = struct {
     run: *const fn (?*anyopaque, []const []const u8) anyerror!void,
 };
 
+/// Invoke one opaque configured action in the retained layout controller.
+pub const Layout = struct {
+    context: ?*anyopaque = null,
+    run: *const fn (
+        ?*anyopaque,
+        *const script.Snapshot,
+        wm.OutputId,
+        []const u8,
+        []const []const u8,
+        *script.IntentBatch,
+    ) anyerror!void,
+};
+
 pub fn append(
     config: *const script.config.Config,
     action_indices: []const usize,
     snapshot: *const script.Snapshot,
     intents: *script.IntentBatch,
     spawn: ?Spawn,
+    layout: ?Layout,
 ) !void {
     var runner = Runner{
         .config = config,
         .snapshot = snapshot,
         .intents = intents,
         .spawn = spawn,
+        .layout = layout,
         .focus_output = focusedOutput(snapshot),
     };
     try runner.appendAll(action_indices);
@@ -31,6 +46,7 @@ const Runner = struct {
     snapshot: *const script.Snapshot,
     intents: *script.IntentBatch,
     spawn: ?Spawn,
+    layout: ?Layout,
     focus_output: ?wm.OutputId,
 
     fn appendAll(self: *Runner, indices: []const usize) !void {
@@ -42,8 +58,9 @@ const Runner = struct {
 
     fn appendOne(self: *Runner, action: script.config.Action) !void {
         switch (action) {
-            .focus => |direction| if (self.focus_output) |output| try self.intents.append(.{ .focus_direction = .{ .output = output, .direction = direction } }),
-            .swap => |direction| if (self.focus_output) |output| try self.intents.append(.{ .swap_direction = .{ .output = output, .direction = direction } }),
+            .layout => |value| if (self.focus_output) |output| if (self.layout) |hook|
+                hook.run(hook.context, self.snapshot, output, value.name, value.args, self.intents) catch |err|
+                    std.log.warn("layout action '{s}' failed: {s}", .{ value.name, @errorName(err) }),
             .absorb => |direction| if (self.focus_output) |output| try self.intents.append(.{ .absorb = .{ .output = output, .direction = direction } }),
             .eject => if (focusedNode(self.snapshot)) |node| try self.intents.append(.{ .eject = node }),
             .expel => |direction| if (focusedNode(self.snapshot)) |node| try self.intents.append(.{ .expel = .{ .node = node, .direction = direction } }),

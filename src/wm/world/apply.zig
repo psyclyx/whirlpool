@@ -80,6 +80,7 @@ fn transfer(world: anytype, item: command.Transfer) !void {
         .send_focused => |value| try world_policy.sendFocusedWindowInPlace(world, value.source_output, value.tag, value.output),
         .summon_window => |value| try world_policy.summonWindowInPlace(world, value.window, value.output),
         .summon_mark => |value| try world_policy.summonMarkInPlace(world, value.name, value.output),
+        .summon_node => |value| try world_policy.summonNodeInPlace(world, value.node, value.output),
     }
 }
 

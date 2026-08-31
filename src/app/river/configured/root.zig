@@ -70,7 +70,9 @@ pub const Services = struct {
         };
         if (self.layout) |*layout| options.layout = .{
             .context = @ptrCast(layout),
+            .action = .{ .context = @ptrCast(layout), .run = river_layout.Runtime.actionHook },
             .build = river_layout.Runtime.buildHook,
+            .project = river_layout.Runtime.projectHook,
         };
         return options;
     }

@@ -6,6 +6,7 @@
 const std = @import("std");
 pub const lua_vm = @import("lua_vm.zig");
 pub const wm_bridge = @import("wm_bridge.zig");
+pub const layout_projection = @import("layout_projection.zig");
 pub const program_loader = @import("program/loader.zig");
 pub const config = @import("config.zig");
 
@@ -39,6 +40,7 @@ pub const Callback = struct {
 pub const Snapshot = wm_bridge.Snapshot;
 pub const Intent = wm_bridge.Intent;
 pub const IntentBatch = wm_bridge.IntentBatch;
+pub const LayoutProjection = layout_projection.Projection;
 
 test "callbacks are bounded and cannot nest safe points" {
     var callback: Callback = .{};
@@ -63,6 +65,7 @@ test "intent allocation is accounted at the callback boundary" {
 
 test {
     _ = wm_bridge;
+    _ = layout_projection;
     _ = program_loader;
     _ = config;
 }

@@ -58,6 +58,8 @@ pub const Transfer = union(enum) {
     send_focused: struct { source_output: ids.OutputId, tag: ids.TagId, output: ?ids.OutputId = null },
     summon_window: struct { window: ids.WindowId, output: ids.OutputId },
     summon_mark: struct { name: []const u8, output: ids.OutputId },
+    /// Move an arbitrary subtree intact to the active tag of an output.
+    summon_node: struct { node: ids.NodeId, output: ids.OutputId },
 };
 
 pub const Output = union(enum) {

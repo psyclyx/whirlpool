@@ -113,8 +113,9 @@ local function build(parent)
   local function create_window_token()
     local cell = strip_content:stack({ width = 1, height = BAR_HEIGHT, opacity = 0, clip = true })
     local background = cell:shape({ fill = CLEAR, radius = 3 })
-    local group_label = cell:text({ text = "", font_size = 14, text_color = theme.muted, padding = { 10, 3, 0, 3 } })
+    local group_label = cell:text({ text = "", font_size = 17, text_color = theme.bright, padding = { 8, 5, 0, 5 } })
     local window = cell:row({ gap = 6, padding = { 7, 7, 7, 7 }, opacity = 0 })
+    local mark = window:text({ text = "", width = 1, font_size = 11, text_color = theme.accent, opacity = 0 })
     local icon = window:icon({ icon_source = "", width = 20, height = 20 })
     local labels = window:column({ gap = 1 })
     local app_id = labels:text({ text = "", height = 12, font_size = 11, text_color = theme.text })
@@ -124,6 +125,7 @@ local function build(parent)
       background = background,
       group_label = group_label,
       window = window,
+      mark = mark,
       icon = icon,
       app_id = app_id,
       title = title,
@@ -217,19 +219,35 @@ local function build(parent)
       if token then
         local kind = math.floor(tonumber(token[1]) or 0)
         local is_window = kind == 2
+        local is_insertion = kind == 3
         local focused = token[5] == true
+        local selected = token[8] == true
+        local mark_text = tostring(token[9] or "")
+        local marked = mark_text ~= ""
         local app_id = tostring(token[3] or "")
         local title = tostring(token[4] or "")
         item.cell:set("width", math.max(1, math.floor(tonumber(token[6]) or 1)))
         item.cell:set("opacity", 1)
-        item.group_label:set("text", is_window and "" or tostring(token[2] or ""))
+        local group_text = ""
+        if kind == 0 then group_text = "( " .. tostring(token[2] or "") .. (marked and " " .. mark_text or "")
+        elseif kind == 1 then group_text = ")"
+        elseif is_insertion then group_text = "+"
+        end
+        item.group_label:set("text", group_text)
         item.group_label:set("opacity", is_window and 0 or 1)
         item.window:set("opacity", is_window and 1 or 0)
-        item.background:set("fill", focused and theme.blend(theme.accent, 72) or CLEAR)
+        item.background:set("fill", selected and theme.blend(theme.accent, 112)
+          or focused and theme.blend(theme.accent, 72)
+          or is_insertion and theme.blend(theme.accent, 48)
+          or (kind == 0 or kind == 1) and theme.blend(theme.blue, 26)
+          or CLEAR)
         local width = math.max(1, math.floor(tonumber(token[6]) or 1))
         local app_limit = math.max(4, math.floor((width - 48) / 7))
         local title_limit = math.max(5, math.floor((width - 48) / 6))
         item.icon:set("icon_source", is_window and tostring(token[7] or "") or "")
+        item.mark:set("text", mark_text)
+        item.mark:set("width", marked and math.max(10, #mark_text * 7) or 1)
+        item.mark:set("opacity", marked and 1 or 0)
         item.app_id:set("text", is_window and ellipsis(app_id, app_limit) or "")
         item.app_id:set("text_color", focused and theme.bright or theme.text)
         item.title:set("text", is_window and ellipsis(title, title_limit) or "")

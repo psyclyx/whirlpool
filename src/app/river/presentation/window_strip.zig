@@ -1,23 +1,31 @@
 //! Pure window-tree projection and camera geometry for the shell window strip.
 
 const wm = @import("whirlpool-wm");
+const script = @import("whirlpool-script");
 
 pub const max_tokens = 96;
 pub const gap: u32 = 4;
 pub const window_min_width: u32 = 104;
 pub const window_max_width: u32 = 220;
-pub const group_open_width: u32 = 34;
-pub const group_close_width: u32 = 12;
+pub const group_open_width: u32 = 46;
+pub const group_close_width: u32 = 18;
+pub const insertion_width: u32 = 18;
 
-pub const Kind = enum { group_open, group_close, window };
+pub const Kind = enum { group_open, group_close, window, insertion };
 
 pub const Token = struct {
     kind: Kind,
     x: u32,
     width: u32,
-    label: []const u8 = "",
+    label: script.layout_projection.Label = .{},
     window: ?wm.WindowId = null,
     focused: bool = false,
+    selected: bool = false,
+    mark: script.layout_projection.Label = .{},
+
+    pub fn labelSlice(self: *const Token) []const u8 {
+        return self.label.slice();
+    }
 };
 
 pub const Strip = struct {
@@ -57,7 +65,7 @@ pub fn build(world: *const wm.World, tag_id: wm.TagId, focused: ?wm.WindowId) St
     var builder = Builder{ .world = world, .focused = focused };
     const tag = world.getTag(tag_id) orelse return builder.finish();
     const start = builder.checkpoint();
-    _ = builder.append(.group_open, group_open_width, "(:h", null);
+    _ = builder.append(.group_open, group_open_width, "h", null);
     var has_window = false;
     for (tag.columns.items) |column_id| {
         const column = world.getColumn(column_id) orelse continue;
@@ -69,6 +77,34 @@ pub fn build(world: *const wm.World, tag_id: wm.TagId, focused: ?wm.WindowId) St
         builder.restore(start);
     }
     return builder.finish();
+}
+
+pub fn fromProjection(projection: *const script.LayoutProjection) Strip {
+    var result: Strip = .{};
+    for (projection.tokens.items) |source| {
+        if (result.len == max_tokens) break;
+        const width: u32 = switch (source.kind) {
+            .group_open => @max(group_open_width, 24 + @as(u32, source.label.len) * 9),
+            .group_close => group_close_width,
+            .window => window_min_width,
+            .insertion => insertion_width,
+        };
+        const index = result.len;
+        result.tokens[index] = .{
+            .kind = @enumFromInt(@intFromEnum(source.kind)),
+            .x = 0,
+            .width = width,
+            .label = source.label,
+            .window = source.window,
+            .focused = source.focused,
+            .selected = source.selected,
+            .mark = source.mark,
+        };
+        if (source.focused) result.focused_index = index;
+        result.len += 1;
+    }
+    result.reflow();
+    return result;
 }
 
 pub fn reveal(offset: u32, viewport_width: u32, strip: *const Strip) u32 {
@@ -118,11 +154,11 @@ const Builder = struct {
 
         const saved = self.checkpoint();
         const label: []const u8 = if (node.mode == .tabbed)
-            "(:t"
+            "t"
         else if (node.axis == .horizontal)
-            "(:h"
+            "h"
         else
-            "(:v";
+            "v";
         if (!self.append(.group_open, group_open_width, label, null)) return false;
         var has_window = false;
         for (node.children.items) |child| has_window = self.appendNode(child.id) or has_window;
@@ -143,7 +179,7 @@ const Builder = struct {
             .kind = kind,
             .x = self.cursor,
             .width = width,
-            .label = label,
+            .label = script.layout_projection.Label.init(label) catch unreachable,
             .window = window,
             .focused = focused,
         };
@@ -191,14 +227,14 @@ test "projection exposes tag and nested group modes around fixed-width windows" 
     try world.manageWindow(second, column);
 
     const strip = build(&world, tag, second);
-    try std.testing.expectEqualStrings("(:h", strip.tokens[0].label);
-    try std.testing.expectEqualStrings("(:v", strip.tokens[1].label);
+    try std.testing.expectEqualStrings("h", strip.tokens[0].labelSlice());
+    try std.testing.expectEqualStrings("v", strip.tokens[1].labelSlice());
     try std.testing.expectEqual(Kind.window, strip.tokens[2].kind);
     try std.testing.expectEqual(window_min_width, strip.tokens[2].width);
     try std.testing.expectEqual(Kind.window, strip.tokens[3].kind);
     try std.testing.expect(strip.tokens[3].focused);
-    try std.testing.expectEqualStrings(")", strip.tokens[4].label);
-    try std.testing.expectEqualStrings(")", strip.tokens[5].label);
+    try std.testing.expectEqualStrings(")", strip.tokens[4].labelSlice());
+    try std.testing.expectEqualStrings(")", strip.tokens[5].labelSlice());
 }
 
 test "application id determines a bounded window item width" {

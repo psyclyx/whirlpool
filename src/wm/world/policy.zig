@@ -242,6 +242,42 @@ pub fn summonMarkInPlace(world: anytype, name: []const u8, output_id: OutputId) 
     try summonWindowInPlace(world, window_id, output_id);
 }
 
+pub fn summonNodeInPlace(world: anytype, node_id: NodeId, output_id: OutputId) !void {
+    const output = world.outputs.getConst(output_id) orelse return error.UnknownOutput;
+    const node = world.nodes.getConst(node_id) orelse return error.UnknownNode;
+    const source_column = world.columns.getConst(node.column) orelse return error.InvalidInvariant;
+    const source_tag = source_column.tag;
+    if (source_tag != output.active_tag) {
+        const destination = try world_tree.createColumnAt(
+            world,
+            output.active_tag,
+            world.tags.getConst(output.active_tag).?.columns.items.len,
+            .{ .width = source_column.width },
+            true,
+        );
+        try world_tree.detachNodeInPlace(world, node_id);
+        world_tree.setColumnRecursive(world, node_id, destination);
+        try world_tree.attachNodeInPlace(world, node_id, destination);
+    }
+    setNodeOutput(world, node_id, output_id);
+    world_tree.repairFocus(world, source_tag);
+    world_tree.repairFocus(world, output.active_tag);
+    if (activeWindow(world, node_id)) |window| try world_tree.focusWindowInPlace(world, window);
+}
+
+fn setNodeOutput(world: anytype, node_id: NodeId, output_id: OutputId) void {
+    const node = world.nodes.get(node_id).?;
+    if (node.window) |window| world.windows.get(window).?.output = output_id;
+    for (node.children.items) |child| setNodeOutput(world, child.id, output_id);
+}
+
+fn activeWindow(world: anytype, node_id: NodeId) ?WindowId {
+    const node = world.nodes.getConst(node_id) orelse return null;
+    if (node.window) |window| return window;
+    if (node.children.items.len == 0 or node.active_child >= node.children.items.len) return null;
+    return activeWindow(world, node.children.items[node.active_child].id);
+}
+
 pub fn windowForMark(world: anytype, name: []const u8) ?WindowId {
     for (world.windows.slots.items) |slot| {
         const window = slot.value orelse continue;

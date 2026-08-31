@@ -14,16 +14,37 @@ The sample configuration is a supported API example. Unknown fields, actions,
 or invalid action arity fail during loading rather than becoming inert
 configuration.
 
-Layouts are executable user modules. The host gives the selected module a
-bounded, immutable world snapshot and accepts a validated generic geometry
-plan. `config/lib/scrolling.lua` is the sample scrolling policy; it is not an
-installed stdlib algorithm and can be replaced without changing Zig.
+Layouts are executable user modules. A module may return a layout function or
+a retained controller with `layout(snapshot, camera)` and
+`action(snapshot, request)` entry points. The host gives the selected module a
+bounded, immutable world snapshot and accepts validated generic geometry and
+identity-based action plans. A controller may also provide
+`project(snapshot)`, a bounded sequence of group/window/insertion tokens used
+by shells to present that exact retained model. Directional and structural
+action names and arguments cross this boundary opaquely; Zig does not assign
+them spatial meaning.
+
+`config/lib/scrolling.lua` is the sample scrolling policy; it is not an
+installed stdlib algorithm and can be replaced without changing Zig. Its
+strips, main/cross-axis mapping, axis reversal, focus traversal, insertion
+policy, structural selection, marks, and two-dimensional camera state are
+retained Lua data. The bar consumes the controller's projection rather than
+reconstructing a second model from native columns: each strip is a group,
+floating/fullscreen/scratchpad windows have distinct groups, and an insertion
+token identifies the destination for a new window. Whirlpool has no strip
+identity or strip-aware command. It only validates concrete mechanisms such as
+focusing a window, extracting a subtree, closing leaves, or summoning a known
+subtree intact.
 
 Time-dependent layouts use the same boundary. Zig adds a monotonic timestamp
 to the snapshot and honors the plan's `needs_frame` flag at River's next safe
 transaction edge. Lua retains motion state and chooses duration, easing,
 retargeting, and which geometry changes animate. Client size proposals remain
 final layout targets because Wayland clients may apply resizes asynchronously.
+Layouts may additionally provide an optional whole-window clip relative to a
+window's content origin. This lets a provider include its own title and border
+extents so partially off-screen chrome is clipped away at its true geometry
+instead of redrawing a shrinking border around content.
 
 Workspace actions are likewise an ordinary Lua convention.
 `whirlpool.workspace` constructs semantic action values without exposing
