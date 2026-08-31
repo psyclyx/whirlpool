@@ -14,12 +14,22 @@ pub fn onWindow(self: anytype, window: *wayland.client.river.WindowV1, event: wa
     const id = self.objects.maps.windows.idFor(proxy) orelse return error.UnknownWindow;
     switch (event) {
         .closed => _ = try self.closeWindowRef(proxy),
-        .dimensions_hint,
         .unreliable_pid,
         .presentation_hint,
         .identifier,
         .capture_sessions,
         => {},
+        .dimensions_hint => |value| {
+            if (value.min_width < 0 or value.min_height < 0 or value.max_width < 0 or value.max_height < 0)
+                return error.InvalidDimensions;
+            if ((value.max_width != 0 and value.min_width > value.max_width) or
+                (value.max_height != 0 and value.min_height > value.max_height))
+                return error.InvalidDimensions;
+            try self.objects.setWindowDimensionsHint(id, .{
+                .min = .{ .width = @intCast(value.min_width), .height = @intCast(value.min_height) },
+                .max = .{ .width = @intCast(value.max_width), .height = @intCast(value.max_height) },
+            });
+        },
         .decoration_hint => |value| self.objects.windows.getPtr(id).?.decoration_hint =
             @enumFromInt(@as(u32, @intCast(@intFromEnum(value.hint)))),
         .app_id => |value| try self.objects.setWindowAppId(id, if (value.app_id) |text| std.mem.span(text) else ""),
@@ -28,11 +38,12 @@ pub fn onWindow(self: anytype, window: *wayland.client.river.WindowV1, event: wa
             .window = id,
             .size = .{ .width = value.width, .height = value.height },
         } }),
-        .parent => |value| if (value.parent) |parent| {
-            _ = self.objects.maps.windows.idFor(live_objects.proxyRef(parent)) orelse return error.UnknownWindow;
-        },
-        .pointer_move_requested => |value| _ = try requiredSeat(self, value.seat),
-        .pointer_resize_requested => |value| _ = try requiredSeat(self, value.seat),
+        .parent => |value| try self.objects.setWindowParent(id, if (value.parent) |parent|
+            self.objects.maps.windows.idFor(live_objects.proxyRef(parent)) orelse return error.UnknownWindow
+        else
+            null),
+        .pointer_move_requested => |value| try beginPointerOperation(self, id, try requiredSeat(self, value.seat), .move, null),
+        .pointer_resize_requested => |value| try beginPointerOperation(self, id, try requiredSeat(self, value.seat), .resize, @as(u32, @bitCast(value.edges))),
         .show_window_menu_requested => |value| try validateWindowMenuRequest(self, id, .{ .x = value.x, .y = value.y }),
         .maximize_requested => try self.stageManageFact(.{ .window_maximize_requested = id }),
         .unmaximize_requested => try self.stageManageFact(.{ .window_unmaximize_requested = id }),
@@ -89,7 +100,9 @@ pub fn onSeat(self: anytype, seat: *wayland.client.river.SeatV1, event: wayland.
     const id = self.objects.maps.seats.idFor(proxy) orelse return error.UnknownSeat;
     switch (event) {
         .removed => _ = try self.removeSeatRef(proxy),
-        .wl_seat, .pointer_leave, .op_delta, .op_release, .pointer_position => {},
+        .wl_seat, .pointer_leave, .pointer_position => {},
+        .op_delta => |value| try updatePointerOperation(self, id, .{ .x = value.dx, .y = value.dy }),
+        .op_release => markPointerOperationReleased(self, id),
         .pointer_enter => |value| _ = try requiredWindow(self, value.window),
         .window_interaction => |value| try self.stageManageFact(.{ .seat_window_interaction = .{
             .seat = id,
@@ -97,6 +110,36 @@ pub fn onSeat(self: anytype, seat: *wayland.client.river.SeatV1, event: wayland.
         } }),
         .shell_surface_interaction => |value| _ = try requiredShellSurface(self, value.shell_surface),
     }
+}
+
+fn beginPointerOperation(self: anytype, window: types.WindowId, seat: types.SeatId, kind: live_objects.PointerOperationKind, edges: ?u32) !void {
+    const record = self.objects.windows.getPtr(window) orelse return error.UnknownWindow;
+    record.requested_placement = .floating;
+    self.objects.seats.getPtr(seat).?.operation = .{ .window = window, .kind = kind, .edges = edges };
+}
+
+fn updatePointerOperation(self: anytype, seat: types.SeatId, total: types.Point) !void {
+    const seat_record = self.objects.seats.getPtr(seat) orelse return error.UnknownSeat;
+    if (seat_record.operation == null) return;
+    const operation = &seat_record.operation.?;
+    const delta = types.Point{
+        .x = try std.math.sub(i32, total.x, operation.last_delta.x),
+        .y = try std.math.sub(i32, total.y, operation.last_delta.y),
+    };
+    operation.last_delta = total;
+    try self.input_queue.append(.{
+        .action = if (operation.kind == .move) .move else .resize,
+        .source = .{ .window_request = operation.window },
+        .seat = seat,
+        .window = operation.window,
+        .delta = delta,
+        .edges = operation.edges,
+    });
+}
+
+fn markPointerOperationReleased(self: anytype, seat: types.SeatId) void {
+    const record = self.objects.seats.getPtr(seat) orelse return;
+    if (record.operation) |*operation| operation.end_pending = true;
 }
 
 pub fn onPointerBinding(self: anytype, binding: *wayland.client.river.PointerBindingV1, event: wayland.client.river.PointerBindingV1.Event) !void {
@@ -126,4 +169,38 @@ fn validateWindowMenuRequest(self: anytype, window: types.WindowId, position: ty
     const resolver = self.options.menu_seat orelse return;
     const seat = try resolver.resolve(resolver.context, window, position) orelse return error.MissingMenuSeat;
     if (!self.objects.seats.contains(seat)) return error.UnknownSeat;
+}
+
+test "pointer operations emit incremental geometry intents and explicit lifetime requests" {
+    const world = @import("root.zig");
+    var adapter = world.Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+    const window = try adapter.objects.bindWindow(try .init(0x1000), try .init(0x1001));
+    const seat = try adapter.objects.bindSeat(try .init(0x2000));
+
+    try beginPointerOperation(&adapter, window, seat, .resize, 0x5);
+    try std.testing.expectEqual(@import("whirlpool-wm").Placement.floating, adapter.objects.windows.get(window).?.requested_placement.?);
+    var operations = std.ArrayList(types.ManageOperation).empty;
+    defer operations.deinit(std.testing.allocator);
+    try adapter.appendPointerOperationRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 1), operations.items.len);
+    try std.testing.expectEqual(seat, operations.items[0].op_start_pointer);
+    adapter.commitPointerOperationRequests();
+
+    try updatePointerOperation(&adapter, seat, .{ .x = 10, .y = 20 });
+    try updatePointerOperation(&adapter, seat, .{ .x = 15, .y = 18 });
+    const intents = try adapter.takeInputIntents();
+    defer std.testing.allocator.free(intents);
+    try std.testing.expectEqual(@as(usize, 2), intents.len);
+    try std.testing.expectEqual(types.Point{ .x = 10, .y = 20 }, intents[0].delta);
+    try std.testing.expectEqual(types.Point{ .x = 5, .y = -2 }, intents[1].delta);
+    try std.testing.expectEqual(@as(?u32, 0x5), intents[1].edges);
+
+    markPointerOperationReleased(&adapter, seat);
+    operations.clearRetainingCapacity();
+    try adapter.appendPointerOperationRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 1), operations.items.len);
+    try std.testing.expectEqual(seat, operations.items[0].op_end);
+    adapter.commitPointerOperationRequests();
+    try std.testing.expect(adapter.objects.seats.get(seat).?.operation == null);
 }

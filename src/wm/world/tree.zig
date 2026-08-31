@@ -327,7 +327,10 @@ pub fn attachNodeInPlace(world: anytype, node_id: NodeId, column_id: ColumnId) !
         .id = undefined,
         .column = column_id,
         .mode = .split,
-        .axis = .horizontal,
+        // Top-level columns form the horizontal strip. The first grouping
+        // inside a column therefore stacks vertically; deeper wrappers may
+        // alternate from their containing split.
+        .axis = .vertical,
     });
     errdefer world.nodes.discard(parent_id) catch {};
     const parent = world.nodes.get(parent_id).?;

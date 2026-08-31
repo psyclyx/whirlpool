@@ -65,6 +65,8 @@ pub const RenderPlan = struct {
 pub const Plans = struct {
     manage: ManagePlan,
     render: RenderPlan,
+    /// True when the provider has more time-dependent layout work to sample.
+    needs_frame: bool = false,
 
     pub fn deinit(self: *Plans) void {
         self.render.deinit();

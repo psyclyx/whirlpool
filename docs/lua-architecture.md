@@ -19,6 +19,12 @@ bounded, immutable world snapshot and accepts a validated generic geometry
 plan. `config/lib/scrolling.lua` is the sample scrolling policy; it is not an
 installed stdlib algorithm and can be replaced without changing Zig.
 
+Time-dependent layouts use the same boundary. Zig adds a monotonic timestamp
+to the snapshot and honors the plan's `needs_frame` flag at River's next safe
+transaction edge. Lua retains motion state and chooses duration, easing,
+retargeting, and which geometry changes animate. Client size proposals remain
+final layout targets because Wayland clients may apply resizes asynchronously.
+
 Workspace actions are likewise an ordinary Lua convention.
 `whirlpool.workspace` constructs semantic action values without exposing
 compositor objects. The sample shell consumes the generic `desktop` service

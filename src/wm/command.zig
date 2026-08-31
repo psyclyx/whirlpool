@@ -76,6 +76,12 @@ pub const Window = union(enum) {
     set_output: struct { window: ids.WindowId, output: ?ids.OutputId },
     set_placement: struct { window: ids.WindowId, placement: types.Placement },
     transition_placement: struct { window: ids.WindowId, transition: types.PlacementTransition },
+    update_sizing: struct {
+        window: ids.WindowId,
+        hints: types.SizeHints,
+        actual: ?types.Size,
+        proposed: ?types.Size,
+    },
     begin_close: ids.WindowId,
     destroy: ids.WindowId,
 };

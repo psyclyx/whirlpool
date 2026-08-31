@@ -257,6 +257,22 @@ pub fn setWindowOutputInPlace(world: anytype, window_id: WindowId, output_id: ?O
     world_tree.repairFocus(world, window.tag);
 }
 
+pub fn updateWindowSizingInPlace(
+    world: anytype,
+    window_id: WindowId,
+    hints: types.SizeHints,
+    actual: ?types.Size,
+    proposed: ?types.Size,
+) !void {
+    const window = world.windows.get(window_id) orelse return error.UnknownWindow;
+    try validation.validateSizeHints(hints);
+    try validation.validateOptionalSize(actual);
+    try validation.validateOptionalSize(proposed);
+    window.size_hints = hints;
+    window.actual_size = actual;
+    window.proposed_size = proposed;
+}
+
 pub fn setPlacementInPlace(world: anytype, window_id: WindowId, placement: Placement) !void {
     const window = world.windows.get(window_id) orelse return error.UnknownWindow;
     if (window.lifecycle != .managed) return error.InvalidLifecycle;

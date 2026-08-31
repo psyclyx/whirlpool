@@ -15,12 +15,12 @@ pub fn run(self: anytype, facts: []const types.ManageFact) !void {
         .window_closed => |id| self.objects.windows.getPtr(id).?.closed = true,
         .window_fullscreen_requested => |value| {
             const record = self.objects.windows.getPtr(value.window).?;
-            record.desired_placement = .fullscreen;
+            record.requested_placement = .fullscreen;
             record.preferred_output = value.output;
         },
-        .window_exit_fullscreen_requested, .window_unmaximize_requested => |id| self.objects.windows.getPtr(id).?.desired_placement = .tiled,
-        .window_maximize_requested => |id| self.objects.windows.getPtr(id).?.desired_placement = .tiled,
-        .window_minimize_requested => |id| self.objects.windows.getPtr(id).?.desired_placement = .scratchpad,
+        .window_exit_fullscreen_requested, .window_unmaximize_requested => |id| self.objects.windows.getPtr(id).?.requested_placement = .tiled,
+        .window_maximize_requested => |id| self.objects.windows.getPtr(id).?.requested_placement = .tiled,
+        .window_minimize_requested => |id| self.objects.windows.getPtr(id).?.requested_placement = .scratchpad,
         .seat_window_interaction => |value| focus = value.window,
         else => {},
     };
@@ -30,6 +30,7 @@ pub fn run(self: anytype, facts: []const types.ManageFact) !void {
     try removeRetiredOutputs(self);
     try moveWindowsToPreferredOutputs(self);
     try materializeWindows(self);
+    try syncWindowSizing(self);
     try applyWindowPolicy(self);
     if (focus) |window| if (self.objects.windows.get(window)) |record| {
         if (record.wm_id) |id| _ = try self.world.applyAtomically(&.{.{ .focus = .{ .window = id } }});
@@ -141,11 +142,18 @@ fn materializeWindows(self: anytype) !void {
         if (entry.closed or entry.wm_id != null) continue;
         const destination = preferredOrFirstOutput(self, entry.preferred_output) orelse return;
         const output_record = self.objects.outputs.get(destination).?;
-        const active_tag = (self.world.getOutput(output_record.wm_id.?) orelse return error.UnknownOutput).active_tag;
+        const output_value = self.world.getOutput(output_record.wm_id.?) orelse return error.UnknownOutput;
+        const active_tag = output_value.active_tag;
+        const placement = entry.requested_placement orelse defaultPlacement(self, entry);
+        const floating_geometry = initialFloatingGeometry(entry, output_value.usable);
         const result = try wm.lifecycle.applyEvent(&self.world, .{ .window_announced = .{
             .tag = active_tag,
             .output = output_record.wm_id.?,
-            .placement = entry.desired_placement,
+            .placement = placement,
+            .floating_geometry = floating_geometry,
+            .size_hints = entry.dimensions_hint,
+            .actual_size = wmSize(entry.actual_size),
+            .proposed_size = wmSize(entry.last_proposed_size),
         } });
         const window_id = result.announced_window.?;
         const tag = self.world.getTag(active_tag) orelse return error.UnknownTag;
@@ -160,7 +168,27 @@ fn materializeWindows(self: anytype) !void {
         _ = try wm.lifecycle.applyEvent(&self.world, .{ .window_managed = .{ .window = window_id, .column = column } });
         _ = try self.world.applyAtomically(&.{.{ .focus = .{ .window = window_id } }});
         entry.wm_id = window_id;
+        entry.requested_placement = null;
         try self.objects.wm_to_window.put(window_id, window);
+    }
+}
+
+fn syncWindowSizing(self: anytype) !void {
+    var iterator = self.objects.windows.iterator();
+    while (iterator.next()) |entry| {
+        const id = entry.value_ptr.wm_id orelse continue;
+        const current = self.world.getWindow(id) orelse return error.UnknownWindow;
+        const actual = wmSize(entry.value_ptr.actual_size);
+        const proposed = wmSize(entry.value_ptr.last_proposed_size);
+        if (std.meta.eql(current.size_hints, entry.value_ptr.dimensions_hint) and
+            std.meta.eql(current.actual_size, actual) and
+            std.meta.eql(current.proposed_size, proposed)) continue;
+        _ = try self.world.applyAtomically(&.{.{ .window = .{ .update_sizing = .{
+            .window = id,
+            .hints = entry.value_ptr.dimensions_hint,
+            .actual = actual,
+            .proposed = proposed,
+        } } }});
     }
 }
 
@@ -197,13 +225,64 @@ fn applyWindowPolicy(self: anytype) !void {
     var iterator = self.objects.windows.iterator();
     while (iterator.next()) |entry| {
         const id = entry.value_ptr.wm_id orelse continue;
+        const requested = entry.value_ptr.requested_placement orelse continue;
         const current = self.world.getWindow(id) orelse return error.UnknownWindow;
-        if (current.placement == entry.value_ptr.desired_placement) continue;
-        _ = try self.world.applyAtomically(&.{.{ .window = .{ .set_placement = .{
+        if (current.placement != requested) _ = try self.world.applyAtomically(&.{.{ .window = .{ .set_placement = .{
             .window = id,
-            .placement = entry.value_ptr.desired_placement,
+            .placement = requested,
         } } }});
+        entry.value_ptr.requested_placement = null;
     }
+}
+
+fn defaultPlacement(self: anytype, record: anytype) wm.Placement {
+    if (record.parent) |parent| if (self.objects.windows.get(parent)) |value|
+        if (!value.closed) return .floating;
+    if (likelyFixedSize(record) or likelyConstrainedDialog(record)) return .floating;
+    return .tiled;
+}
+
+fn likelyFixedSize(record: anytype) bool {
+    if (record.dimensions_hint.fixed() != null) return true;
+    const actual = wmSize(record.actual_size) orelse return false;
+    const minimum = record.dimensions_hint.min;
+    return minimum.width > 0 and minimum.height > 0 and std.meta.eql(minimum, actual);
+}
+
+fn likelyConstrainedDialog(record: anytype) bool {
+    const hints = record.dimensions_hint;
+    if (hints.max.width > 0 and hints.max.height > 0) {
+        if (hints.max.width < 1600 and hints.max.height < 1200) return true;
+        if (hints.min.width > 0 and hints.min.height > 0 and
+            @as(u64, hints.min.width) * 2 >= hints.max.width and
+            @as(u64, hints.min.height) * 2 >= hints.max.height) return true;
+    }
+    const actual = wmSize(record.actual_size) orelse return false;
+    return record.decoration_hint == .only_supports_csd and
+        actual.width < 1200 and actual.height < 900;
+}
+
+fn initialFloatingGeometry(record: anytype, usable: wm.Rect) wm.Rect {
+    const fixed = record.dimensions_hint.fixed();
+    const actual = wmSize(record.actual_size);
+    const preferred = actual orelse fixed orelse wm.Size{
+        .width = if (record.dimensions_hint.max.width != 0) record.dimensions_hint.max.width else 640,
+        .height = if (record.dimensions_hint.max.height != 0) record.dimensions_hint.max.height else 480,
+    };
+    const width = @max(@as(u32, 1), @min(preferred.width, usable.width));
+    const height = @max(@as(u32, 1), @min(preferred.height, usable.height));
+    return .{
+        .x = usable.x + @as(i32, @intCast((usable.width - width) / 2)),
+        .y = usable.y + @as(i32, @intCast((usable.height - height) / 2)),
+        .width = width,
+        .height = height,
+    };
+}
+
+fn wmSize(value: ?types.Size) ?wm.Size {
+    const size = value orelse return null;
+    if (size.width <= 0 or size.height <= 0) return null;
+    return .{ .width = @intCast(size.width), .height = @intCast(size.height) };
 }
 
 fn removeRetiredSeats(self: anytype, facts: []const types.ManageFact) void {

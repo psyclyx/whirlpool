@@ -54,7 +54,7 @@ const Runner = struct {
                 const node = self.snapshot.getNode(node_id) orelse return;
                 try self.intents.append(.{ .cycle_column_width = .{ .column = node.column, .step = step } });
             },
-            .toggle_split_tabbed => try self.toggleContainerMode(),
+            .cycle_container_mode => try self.cycleContainerMode(),
             .focus_tab => |step| try self.focusTab(step),
             .focus_output => |step| try self.focusOutput(step),
             .focus_tag => |ordinal| try self.focusTag(ordinal),
@@ -77,12 +77,13 @@ const Runner = struct {
         } });
     }
 
-    fn toggleContainerMode(self: *Runner) !void {
+    fn cycleContainerMode(self: *Runner) !void {
         const parent = focusedParent(self.snapshot) orelse return;
+        const next = nextContainerState(parent.mode orelse return, parent.axis);
         try self.intents.append(.{ .set_container_mode = .{
             .node = parent.id,
-            .mode = if (parent.mode == .tabbed) .split else .tabbed,
-            .axis = parent.axis,
+            .mode = next.mode,
+            .axis = next.axis,
         } });
     }
 
@@ -172,6 +173,34 @@ fn focusedOutput(snapshot: *const script.Snapshot) ?wm.OutputId {
 fn focusedParent(snapshot: *const script.Snapshot) ?*const wm.Node {
     const node = snapshot.getNode(focusedNode(snapshot) orelse return null) orelse return null;
     return snapshot.getNode(node.parent orelse return null);
+}
+
+const ContainerState = struct {
+    mode: wm.ContainerMode,
+    axis: wm.Axis,
+};
+
+fn nextContainerState(mode: wm.ContainerMode, axis: wm.Axis) ContainerState {
+    return switch (mode) {
+        .tabbed => .{ .mode = .split, .axis = .horizontal },
+        .split => switch (axis) {
+            .horizontal => .{ .mode = .split, .axis = .vertical },
+            .vertical => .{ .mode = .tabbed, .axis = .vertical },
+        },
+    };
+}
+
+test "container mode cycle visits tabbed horizontal and vertical" {
+    const horizontal = nextContainerState(.tabbed, .vertical);
+    try std.testing.expectEqual(wm.ContainerMode.split, horizontal.mode);
+    try std.testing.expectEqual(wm.Axis.horizontal, horizontal.axis);
+
+    const vertical = nextContainerState(horizontal.mode, horizontal.axis);
+    try std.testing.expectEqual(wm.ContainerMode.split, vertical.mode);
+    try std.testing.expectEqual(wm.Axis.vertical, vertical.axis);
+
+    const tabbed = nextContainerState(vertical.mode, vertical.axis);
+    try std.testing.expectEqual(wm.ContainerMode.tabbed, tabbed.mode);
 }
 
 test "configured spawn failures do not escape into the compositor loop" {

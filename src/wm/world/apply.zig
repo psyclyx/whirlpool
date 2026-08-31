@@ -101,6 +101,7 @@ fn window(world: anytype, item: command.Window) !void {
         .set_output => |value| try world_policy.setWindowOutputInPlace(world, value.window, value.output),
         .set_placement => |value| try world_policy.setPlacementInPlace(world, value.window, value.placement),
         .transition_placement => |value| try world_policy.transitionPlacementInPlace(world, value.window, value.transition),
+        .update_sizing => |value| try world_policy.updateWindowSizingInPlace(world, value.window, value.hints, value.actual, value.proposed),
         .begin_close => |id| try beginClose(world, id),
         .destroy => |id| try world_tree.destroyWindowInPlace(world, id),
     }

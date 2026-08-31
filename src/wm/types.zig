@@ -34,6 +34,16 @@ pub const OutputTransform = enum {
 };
 pub const Point = struct { x: i32, y: i32 };
 pub const Size = struct { width: u32, height: u32 };
+pub const SizeHints = struct {
+    min: Size = .{ .width = 0, .height = 0 },
+    max: Size = .{ .width = 0, .height = 0 },
+
+    pub fn fixed(self: @This()) ?Size {
+        if (self.min.width == 0 or self.min.height == 0) return null;
+        if (self.min.width != self.max.width or self.min.height != self.max.height) return null;
+        return self.min;
+    }
+};
 pub const Rect = struct {
     x: i32,
     y: i32,
@@ -168,6 +178,9 @@ pub const Window = struct {
     placement: Placement = .tiled,
     restore_placement: RestoredPlacement = .tiled,
     floating_geometry: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    size_hints: SizeHints = .{},
+    actual_size: ?Size = null,
+    proposed_size: ?Size = null,
     focus_serial: u64 = 0,
     marks: std.ArrayList(Mark) = .empty,
     pub fn deinit(self: *Window, allocator: std.mem.Allocator) void {
@@ -188,6 +201,9 @@ pub const WindowSpec = struct {
     output: ?OutputId = null,
     placement: Placement = .tiled,
     floating_geometry: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    size_hints: SizeHints = .{},
+    actual_size: ?Size = null,
+    proposed_size: ?Size = null,
 };
 pub const OutputSpec = struct {
     active_tag: TagId,

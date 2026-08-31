@@ -143,6 +143,39 @@ test "floating geometry rejects undersized and overflowing atomic updates" {
     try world.validate();
 }
 
+test "window sizing metadata is validated and updated atomically" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const window = try world.createWindow(.{
+        .tag = tag,
+        .size_hints = .{ .min = .{ .width = 100, .height = 80 } },
+        .actual_size = .{ .width = 200, .height = 120 },
+        .proposed_size = .{ .width = 180, .height = 120 },
+    });
+    _ = try world.applyAtomically(&.{.{ .window = .{ .update_sizing = .{
+        .window = window,
+        .hints = .{
+            .min = .{ .width = 240, .height = 160 },
+            .max = .{ .width = 240, .height = 160 },
+        },
+        .actual = .{ .width = 240, .height = 160 },
+        .proposed = .{ .width = 240, .height = 160 },
+    } } }});
+    try std.testing.expectEqual(types.Size{ .width = 240, .height = 160 }, world.getWindow(window).?.size_hints.fixed().?);
+
+    try std.testing.expectError(error.InvalidDimensionsHint, world.applyAtomically(&.{.{ .window = .{ .update_sizing = .{
+        .window = window,
+        .hints = .{
+            .min = .{ .width = 500, .height = 160 },
+            .max = .{ .width = 240, .height = 160 },
+        },
+        .actual = null,
+        .proposed = null,
+    } } }}));
+    try std.testing.expectEqual(types.Size{ .width = 240, .height = 160 }, world.getWindow(window).?.size_hints.fixed().?);
+}
+
 test "stale node identities cannot mutate a reused slot" {
     var world = World.init(std.testing.allocator);
     defer world.deinit();
@@ -283,6 +316,29 @@ test "vertical absorb groups adjacent leaves without losing either window" {
     try std.testing.expectEqual(first_node.parent, second_node.parent);
     try std.testing.expect(first_node.parent != null);
     try std.testing.expectEqual(types.Axis.vertical, world.getNode(first_node.parent.?).?.axis);
+}
+
+test "horizontal absorb creates a vertical split inside the column strip" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
+        .usable = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
+    });
+    var windows: [2]WindowId = undefined;
+    for (&windows) |*window| {
+        const column = try world.createColumn(tag, .{});
+        window.* = try world.createWindow(.{ .tag = tag, .output = output });
+        try world.manageWindow(window.*, column);
+    }
+    _ = try world.applyAtomically(&.{
+        .{ .focus = .{ .window = windows[0] } },
+        .{ .tree = .{ .absorb = .{ .output = output, .direction = .right } } },
+    });
+    const root = world.getColumn(world.getNode(world.nodeForWindow(windows[0]).?).?.column).?.root.?;
+    try std.testing.expectEqual(types.Axis.vertical, world.getNode(root).?.axis);
 }
 
 test "output removal orphans windows and repairs focus" {

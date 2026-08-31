@@ -15,6 +15,7 @@ const types = @import("types.zig");
 pub const FramePlans = struct {
     allocator: std.mem.Allocator,
     epoch: u64,
+    needs_frame: bool,
     manage: wm.ManagePlan,
     render: wm.RenderPlan,
     river_manage: bridge.OwnedManagePlan,
@@ -35,6 +36,7 @@ pub fn translateFrame(
     input: wm.LayoutPlans,
     resolver: bridge.Resolver,
 ) !FramePlans {
+    const needs_frame = input.needs_frame;
     var manage = input.manage;
     errdefer manage.deinit();
     var render = input.render;
@@ -52,6 +54,7 @@ pub fn translateFrame(
     return .{
         .allocator = allocator,
         .epoch = manage.context.epoch,
+        .needs_frame = needs_frame,
         .manage = manage,
         .render = render,
         .river_manage = river_manage,

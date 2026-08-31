@@ -13,6 +13,7 @@ const river_policy = @import("whirlpool-river-policy-runtime");
 pub const Services = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    clock_origin: std.Io.Timestamp,
     commands: std.Io.Group = .init,
     config: ?script.config.Config = null,
     policy: ?river_policy.Runtime = null,
@@ -26,7 +27,11 @@ pub const Services = struct {
         client: *wayland_client.Client,
         config_path: ?[]const u8,
     ) !Services {
-        var self = Services{ .allocator = allocator, .io = io };
+        var self = Services{
+            .allocator = allocator,
+            .io = io,
+            .clock_origin = std.Io.Clock.awake.now(io),
+        };
         errdefer self.deinit();
         if (config_path) |path| {
             self.config = try script.config.load(allocator, io, path);
@@ -57,6 +62,7 @@ pub const Services = struct {
         std.debug.assert((self.config == null) == (self.layout == null));
         std.debug.assert((self.config == null) == (self.keybindings == null));
         var options: river_host.Options = .{};
+        options.clock = .{ .context = @ptrCast(self), .monotonic_ms = monotonicMilliseconds };
         if (self.policy) |*policy| options.policy = .{
             .context = @ptrCast(policy),
             .budget = .{ .max_steps = policy.limits.max_instructions },
@@ -67,6 +73,12 @@ pub const Services = struct {
             .build = river_layout.Runtime.buildHook,
         };
         return options;
+    }
+
+    fn monotonicMilliseconds(raw: ?*anyopaque) f64 {
+        const self: *Services = @ptrCast(@alignCast(raw orelse unreachable));
+        const elapsed = self.clock_origin.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
+        return @as(f64, @floatFromInt(@max(elapsed, 0))) / 1_000_000.0;
     }
 
     /// Attach config-specific callbacks after the host has stable storage.

@@ -12,8 +12,12 @@ pub const WindowRecord = struct {
     node: types.NodeId,
     wm_id: ?wm.WindowId = null,
     preferred_output: ?types.OutputId = null,
-    desired_placement: wm.Placement = .tiled,
+    requested_placement: ?wm.Placement = null,
+    placement_applied: ?wm.Placement = null,
     actual_size: ?types.Size = null,
+    dimensions_hint: wm.SizeHints = .{},
+    last_proposed_size: ?types.Size = null,
+    parent: ?types.WindowId = null,
     decoration_hint: ?types.DecorationHint = null,
     decoration_ssd_applied: ?bool = null,
     borders_applied: ?types.WindowBorders = null,
@@ -40,10 +44,20 @@ pub const OutputRecord = struct {
 };
 
 pub const LayerFocus = enum { exclusive, non_exclusive, none };
+pub const PointerOperationKind = enum { move, resize };
+pub const PointerOperation = struct {
+    window: types.WindowId,
+    kind: PointerOperationKind,
+    edges: ?u32 = null,
+    last_delta: types.Point = .{ .x = 0, .y = 0 },
+    start_pending: bool = true,
+    end_pending: bool = false,
+};
 pub const SeatRecord = struct {
     layer_focus: LayerFocus = .none,
     applied_window_focus: ?wm.WindowId = null,
     focus_needs_reassert: bool = false,
+    operation: ?PointerOperation = null,
 };
 
 pub const Counts = struct {
@@ -236,6 +250,16 @@ pub const Registry = struct {
     pub fn setWindowTitle(self: *Registry, window: types.WindowId, value: []const u8) !void {
         const record = self.windows.getPtr(window) orelse return error.UnknownWindow;
         try replaceOwned(self.allocator, &record.title, value);
+    }
+
+    pub fn setWindowDimensionsHint(self: *Registry, window: types.WindowId, hint: wm.SizeHints) !void {
+        const record = self.windows.getPtr(window) orelse return error.UnknownWindow;
+        record.dimensions_hint = hint;
+    }
+
+    pub fn setWindowParent(self: *Registry, window: types.WindowId, parent: ?types.WindowId) !void {
+        const record = self.windows.getPtr(window) orelse return error.UnknownWindow;
+        record.parent = parent;
     }
 
     pub fn outputSize(self: *const Registry, output: types.OutputId) !?types.Size {

@@ -58,12 +58,24 @@ pub const Runtime = struct {
         output: wm.OutputId,
         sampled_camera: f32,
     ) !wm.LayoutPlans {
+        return self.buildAt(allocator, snapshot, output, sampled_camera, 0);
+    }
+
+    pub fn buildAt(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        snapshot: *const wm.WorldView,
+        output: wm.OutputId,
+        sampled_camera: f32,
+        monotonic_ms: f64,
+    ) !wm.LayoutPlans {
         if (!std.math.isFinite(sampled_camera)) return error.InvalidCamera;
+        if (!std.math.isFinite(monotonic_ms) or monotonic_ms < 0) return error.InvalidLayoutTime;
         defer self.vm.setTop(0);
         self.vm.getGlobal("whirlpool_layout_provider");
         if (self.vm.luaType(-1) != .function) return error.InvalidLayoutSource;
         var count: usize = 0;
-        try pushSnapshot(&self.vm, snapshot, output, &count, self.limits, 0);
+        try pushSnapshot(&self.vm, snapshot, output, monotonic_ms, &count, self.limits, 0);
         self.vm.pushNumber(sampled_camera);
 
         self.instructions = 0;
@@ -79,9 +91,10 @@ pub const Runtime = struct {
         snapshot: *const wm.WorldView,
         output: wm.OutputId,
         sampled_camera: f32,
+        monotonic_ms: f64,
     ) anyerror!wm.LayoutPlans {
         const self: *Runtime = @ptrCast(@alignCast(raw orelse return error.MissingLayoutRuntime));
-        return self.build(allocator, snapshot, output, sampled_camera);
+        return self.buildAt(allocator, snapshot, output, sampled_camera, monotonic_ms);
     }
 
     fn instructionHook(raw: ?*anyopaque, amount: u64) callconv(.c) bool {
@@ -95,14 +108,19 @@ fn pushSnapshot(
     vm: *script.lua_vm.Vm,
     snapshot: *const wm.WorldView,
     output_id: wm.OutputId,
+    monotonic_ms: f64,
     count: *usize,
     limits: Limits,
     depth: usize,
 ) !void {
     const output = snapshot.getOutput(output_id) orelse return error.UnknownOutput;
     const tag = snapshot.getTag(output.active_tag) orelse return error.InvalidInvariant;
-    vm.createTable(0, 3);
+    vm.createTable(0, 4);
     try setId(vm, "epoch", snapshot.epoch());
+
+    vm.createTable(0, 1);
+    setNumber(vm, "monotonic_ms", monotonic_ms);
+    vm.setField(-2, "clock");
 
     vm.createTable(0, 2);
     try setId(vm, "id", output_id.raw());
@@ -161,11 +179,27 @@ fn pushNode(
     setInteger(vm, "active", node.active_child + 1);
     if (node.window) |window_id| {
         const window = snapshot.getWindow(window_id) orelse return error.InvalidInvariant;
-        vm.createTable(0, 4);
+        vm.createTable(0, 8);
         try setId(vm, "id", window.id.raw());
         setString(vm, "placement", @tagName(window.placement));
         setString(vm, "lifecycle", @tagName(window.lifecycle));
         try setId(vm, "focus_serial", window.focus_serial);
+        pushOptionalSize(vm, window.actual_size);
+        vm.setField(-2, "actual");
+        pushOptionalSize(vm, window.proposed_size);
+        vm.setField(-2, "proposed");
+        vm.createTable(0, 4);
+        setInteger(vm, "min_width", window.size_hints.min.width);
+        setInteger(vm, "min_height", window.size_hints.min.height);
+        setInteger(vm, "max_width", window.size_hints.max.width);
+        setInteger(vm, "max_height", window.size_hints.max.height);
+        vm.setField(-2, "size_hints");
+        vm.createTable(0, 4);
+        setInteger(vm, "x", window.floating_geometry.x);
+        setInteger(vm, "y", window.floating_geometry.y);
+        setInteger(vm, "width", window.floating_geometry.width);
+        setInteger(vm, "height", window.floating_geometry.height);
+        vm.setField(-2, "floating");
         vm.setField(-2, "window");
         vm.createTable(0, 0);
         vm.setField(-2, "children");
@@ -181,6 +215,16 @@ fn pushNode(
         vm.rawSetInteger(-2, @intCast(index + 1));
     }
     vm.setField(-2, "children");
+}
+
+fn pushOptionalSize(vm: *script.lua_vm.Vm, value: ?wm.Size) void {
+    const size = value orelse {
+        vm.pushNil();
+        return;
+    };
+    vm.createTable(0, 2);
+    setInteger(vm, "width", size.width);
+    setInteger(vm, "height", size.height);
 }
 
 fn setId(vm: *script.lua_vm.Vm, comptime name: [:0]const u8, value: u64) !void {
@@ -217,12 +261,14 @@ fn parsePlans(
     const current = try numberField(vm, -1, "camera_current");
     const target = try numberField(vm, -1, "camera_target");
     const strip_width = try numberField(vm, -1, "strip_width");
+    const needs_frame = try optionalBoolField(vm, -1, "needs_frame", false);
     if (!std.math.isFinite(current) or !std.math.isFinite(target) or !std.math.isFinite(strip_width) or strip_width < 0)
         return error.InvalidLayoutPlan;
     const camera: wm.CameraTarget = .{ .tag = tag, .current = current, .target = target, .strip_width = strip_width };
     var plans: wm.LayoutPlans = .{
         .manage = .{ .context = .{ .allocator = allocator, .epoch = epoch, .output = output, .camera = camera } },
         .render = .{ .context = .{ .allocator = allocator, .epoch = epoch, .output = output, .camera = camera } },
+        .needs_frame = needs_frame,
     };
     errdefer plans.deinit();
 
@@ -313,6 +359,14 @@ fn boolField(vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8) !
     return vm.boolean(-1) orelse error.InvalidLayoutPlan;
 }
 
+fn optionalBoolField(vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8, default: bool) !bool {
+    const base = fieldBase(vm);
+    vm.getField(index, name);
+    defer vm.setTop(base);
+    if (vm.luaType(-1) == .nil) return default;
+    return vm.boolean(-1) orelse error.InvalidLayoutPlan;
+}
+
 fn floatRectField(vm: *script.lua_vm.Vm, index: c_int, comptime name: [:0]const u8) !wm.FRect {
     const base = fieldBase(vm);
     vm.getField(index, name);
@@ -365,7 +419,8 @@ test "bounded Lua provider turns an immutable snapshot into generic plans" {
         \\  local window = column.root.children[1].node.window
         \\  return {
         \\    epoch = snapshot.epoch, tag = snapshot.tag.id,
-        \\    camera_current = camera, camera_target = 5, strip_width = 320,
+        \\    camera_current = camera, camera_target = snapshot.clock.monotonic_ms, strip_width = 320,
+        \\    needs_frame = true,
         \\    entries = {{
         \\      window = window.id, column = column.id, placement = window.placement,
         \\      virtual = { x = 0, y = 0, width = 300, height = 200 },
@@ -377,12 +432,13 @@ test "bounded Lua provider turns an immutable snapshot into generic plans" {
         \\end
     , .{});
     defer runtime.deinit();
-    var plans = try runtime.build(std.testing.allocator, &snapshot, output, 2);
+    var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 2, 5);
     defer plans.deinit();
     try std.testing.expectEqual(@as(usize, 1), plans.manage.dimensions.items.len);
     try std.testing.expectEqual(@as(usize, 1), plans.render.entries.items.len);
     try std.testing.expectEqual(window, plans.render.entries.items[0].window);
     try std.testing.expectEqual(@as(f32, 5), plans.render.context.camera.target);
+    try std.testing.expect(plans.needs_frame);
 }
 
 fn loadScrollingSource(allocator: std.mem.Allocator) ![]u8 {
@@ -394,7 +450,7 @@ fn loadScrollingSource(allocator: std.mem.Allocator) ![]u8 {
     );
 }
 
-test "sample scrolling provider lays out columns, focuses camera, and clips viewport" {
+test "sample scrolling provider moves camera to keep focus in the viewport" {
     var world = wm.World.init(std.testing.allocator);
     defer world.deinit();
     const tag = try world.createTag();
@@ -415,14 +471,80 @@ test "sample scrolling provider lays out columns, focuses camera, and clips view
     defer std.testing.allocator.free(source);
     var runtime = try Runtime.init(std.testing.allocator, source, .{});
     defer runtime.deinit();
-    var plans = try runtime.build(std.testing.allocator, &snapshot, output, 0);
-    defer plans.deinit();
+    {
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 0);
+        defer plans.deinit();
+        try std.testing.expectEqual(@as(usize, 3), plans.render.entries.items.len);
+        try std.testing.expect(plans.render.context.camera.target > 0);
+        try std.testing.expectEqual(@as(f32, 0), plans.render.context.camera.current);
+        try std.testing.expect(plans.needs_frame);
+        try std.testing.expectEqual(@as(f32, 1032), plans.render.context.camera.strip_width);
+    }
+    {
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 90);
+        defer plans.deinit();
+        try std.testing.expect(plans.render.context.camera.current > 0);
+        try std.testing.expect(plans.render.context.camera.current < plans.render.context.camera.target);
+        try std.testing.expect(plans.needs_frame);
+    }
+    {
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 180);
+        defer plans.deinit();
+        try std.testing.expectEqual(plans.render.context.camera.target, plans.render.context.camera.current);
+        try std.testing.expect(!plans.needs_frame);
+        try std.testing.expectEqual(@as(u32, 0), plans.render.entries.items[0].clip.width);
+        try std.testing.expectEqual(@as(u32, 328), plans.render.entries.items[2].clip.width);
+    }
+}
 
-    try std.testing.expectEqual(@as(usize, 3), plans.render.entries.items.len);
-    try std.testing.expect(plans.render.context.camera.target > 0);
-    try std.testing.expectEqual(@as(f32, 1032), plans.render.context.camera.strip_width);
-    try std.testing.expectEqual(@as(u32, 336), plans.render.entries.items[0].clip.width);
-    try std.testing.expectEqual(@as(u32, 0), plans.render.entries.items[2].clip.width);
+test "sample scrolling camera retargets from its interrupted position" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 400, .height = 240 },
+        .usable = .{ .x = 0, .y = 0, .width = 400, .height = 240 },
+    });
+    var windows: [3]wm.WindowId = undefined;
+    for (&windows) |*window| {
+        const column = try world.createColumn(tag, .{ .width = 1 });
+        window.* = try world.createWindow(.{ .tag = tag, .output = output });
+        try world.manageWindow(window.*, column);
+    }
+    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = windows[2] } }});
+    const source = try loadScrollingSource(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 0);
+        plans.deinit();
+    }
+    var interrupted: f32 = undefined;
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 90);
+        defer plans.deinit();
+        interrupted = plans.render.context.camera.current;
+    }
+    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = windows[0] } }});
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 90);
+        defer plans.deinit();
+        try std.testing.expectApproxEqAbs(interrupted, plans.render.context.camera.current, 0.01);
+        try std.testing.expectEqual(@as(f32, 0), plans.render.context.camera.target);
+        try std.testing.expect(plans.needs_frame);
+    }
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 270);
+        defer plans.deinit();
+        try std.testing.expectEqual(@as(f32, 0), plans.render.context.camera.current);
+        try std.testing.expect(!plans.needs_frame);
+    }
 }
 
 test "sample scrolling provider preserves split geometry and tab visibility" {
@@ -456,7 +578,7 @@ test "sample scrolling provider preserves split geometry and tab visibility" {
         try std.testing.expectEqual(@as(usize, 2), plans.render.entries.items.len);
         const first_width = plans.render.entries.items[0].target_virtual.width;
         const second_width = plans.render.entries.items[1].target_virtual.width;
-        try std.testing.expectApproxEqAbs(@as(f32, 928), first_width + second_width, 0.01);
+        try std.testing.expectApproxEqAbs(@as(f32, 912), first_width + second_width, 0.01);
         try std.testing.expect(first_width > second_width * 2.9);
     }
     _ = try world.applyAtomically(&.{
@@ -471,6 +593,185 @@ test "sample scrolling provider preserves split geometry and tab visibility" {
     try std.testing.expectEqual(@as(usize, 1), visible);
     try std.testing.expect(!plans.render.entries.items[0].visible);
     try std.testing.expect(plans.render.entries.items[1].visible);
+}
+
+test "sample scrolling provider animates tiled movement while proposing final sizes" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 1000, .height = 600 },
+        .usable = .{ .x = 0, .y = 0, .width = 1000, .height = 600 },
+    });
+    const column = try world.createColumn(tag, .{ .width = 1 });
+    const first = try world.createWindow(.{ .tag = tag, .output = output });
+    const second = try world.createWindow(.{ .tag = tag, .output = output });
+    try world.manageWindow(first, column);
+    try world.manageWindow(second, column);
+    const root = world.getColumn(column).?.root.?;
+    const source = try loadScrollingSource(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+
+    var initial_position: wm.Rect = undefined;
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 0);
+        defer plans.deinit();
+        initial_position = plans.render.entries.items[1].screen;
+        try std.testing.expect(!plans.needs_frame);
+    }
+    _ = try world.applyAtomically(&.{.{ .tree = .{ .set_container_mode = .{
+        .node = root,
+        .mode = .split,
+        .axis = .horizontal,
+    } } }});
+
+    var target: wm.FRect = undefined;
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 10);
+        defer plans.deinit();
+        const entry = plans.render.entries.items[1];
+        target = entry.target_virtual;
+        try std.testing.expectEqual(initial_position.x, entry.screen.x);
+        try std.testing.expectEqual(initial_position.y, entry.screen.y);
+        try std.testing.expect(plans.needs_frame);
+        try std.testing.expectEqual(
+            @as(u32, @intFromFloat(@ceil(target.width))),
+            plans.manage.dimensions.items[1].size.width,
+        );
+    }
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 100);
+        defer plans.deinit();
+        const position = plans.render.entries.items[1].screen;
+        try std.testing.expect(position.x > initial_position.x);
+        try std.testing.expect(position.x < @as(i32, @intFromFloat(@floor(target.x))));
+        try std.testing.expect(plans.needs_frame);
+    }
+    {
+        var snapshot = world.view();
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0, 190);
+        defer plans.deinit();
+        const position = plans.render.entries.items[1].screen;
+        try std.testing.expectEqual(@as(i32, @intFromFloat(@floor(target.x))), position.x);
+        try std.testing.expectEqual(@as(i32, @intFromFloat(@floor(target.y))), position.y);
+        try std.testing.expect(!plans.needs_frame);
+    }
+}
+
+test "sample scrolling provider keeps configured gaps between adjacent columns" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 1000, .height = 600 },
+        .usable = .{ .x = 0, .y = 0, .width = 1000, .height = 600 },
+    });
+    var windows: [2]wm.WindowId = undefined;
+    for (&windows) |*window| {
+        const column = try world.createColumn(tag, .{ .width = 0.5 });
+        window.* = try world.createWindow(.{ .tag = tag, .output = output });
+        try world.manageWindow(window.*, column);
+    }
+    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = windows[1] } }});
+
+    const source = try loadScrollingSource(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    var snapshot = world.view();
+    var plans = try runtime.build(std.testing.allocator, &snapshot, output, 0);
+    defer plans.deinit();
+
+    const left = plans.render.entries.items[0].screen;
+    const right = plans.render.entries.items[1].screen;
+    const border_width: i32 = 4;
+    const gap = (right.x - border_width) -
+        (left.x + @as(i32, @intCast(left.width)) + border_width);
+    try std.testing.expectEqual(@as(i32, 8), gap);
+    try std.testing.expectEqual(@as(f32, 0), plans.render.context.camera.current);
+    try std.testing.expectEqual(@as(f32, 0), plans.render.context.camera.target);
+}
+
+test "confirmed reluctant width expands every window in a vertical column" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 500, .height = 400 },
+        .usable = .{ .x = 0, .y = 0, .width = 500, .height = 400 },
+    });
+    const column = try world.createColumn(tag, .{ .width = 0.5 });
+    const reluctant = try world.createWindow(.{
+        .tag = tag,
+        .output = output,
+        .actual_size = .{ .width = 360, .height = 100 },
+        .proposed_size = .{ .width = 200, .height = 100 },
+    });
+    const sibling = try world.createWindow(.{
+        .tag = tag,
+        .output = output,
+        .actual_size = .{ .width = 200, .height = 100 },
+        .proposed_size = .{ .width = 200, .height = 100 },
+    });
+    try world.manageWindow(reluctant, column);
+    try world.manageWindow(sibling, column);
+    try std.testing.expectEqual(wm.Axis.vertical, world.getNode(world.getColumn(column).?.root.?).?.axis);
+
+    const source = try loadScrollingSource(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    var snapshot = world.view();
+    var plans = try runtime.build(std.testing.allocator, &snapshot, output, 0);
+    defer plans.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), plans.manage.dimensions.items.len);
+    try std.testing.expectEqual(@as(u32, 360), plans.manage.dimensions.items[0].size.width);
+    try std.testing.expectEqual(@as(u32, 360), plans.manage.dimensions.items[1].size.width);
+    try std.testing.expectEqual(
+        plans.render.entries.items[0].screen.x,
+        plans.render.entries.items[1].screen.x,
+    );
+}
+
+test "sample scrolling provider renders floating geometry" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 10, .y = 20, .width = 500, .height = 300 },
+        .usable = .{ .x = 10, .y = 20, .width = 500, .height = 300 },
+    });
+    const column = try world.createColumn(tag, .{});
+    const window = try world.createWindow(.{
+        .tag = tag,
+        .output = output,
+        .placement = .floating,
+        .floating_geometry = .{ .x = 70, .y = 80, .width = 220, .height = 140 },
+    });
+    try world.manageWindow(window, column);
+
+    const source = try loadScrollingSource(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    var snapshot = world.view();
+    var plans = try runtime.build(std.testing.allocator, &snapshot, output, 0);
+    defer plans.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), plans.manage.dimensions.items.len);
+    try std.testing.expectEqual(wm.Size{ .width = 220, .height = 140 }, plans.manage.dimensions.items[0].size);
+    try std.testing.expect(plans.render.entries.items[0].visible);
+    try std.testing.expectEqual(wm.Rect{ .x = 70, .y = 80, .width = 220, .height = 140 }, plans.render.entries.items[0].screen);
 }
 
 test "sample scrolling provider isolates fullscreen from floating and scratchpad" {
@@ -503,7 +804,7 @@ test "sample scrolling provider isolates fullscreen from floating and scratchpad
     defer plans.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), plans.render.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 1), plans.manage.dimensions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), plans.manage.dimensions.items.len);
     for (plans.render.entries.items) |entry| {
         if (entry.window == windows[2]) {
             try std.testing.expect(entry.visible);

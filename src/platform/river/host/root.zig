@@ -35,7 +35,13 @@ pub const LayoutHook = struct {
         *const wm.WorldView,
         wm.OutputId,
         f32,
+        f64,
     ) anyerror!wm.LayoutPlans,
+};
+
+pub const ClockHook = struct {
+    context: ?*anyopaque = null,
+    monotonic_ms: *const fn (?*anyopaque) f64,
 };
 
 pub const ShellHook = struct {
@@ -72,6 +78,7 @@ pub const SpawnHook = configured_actions.Spawn;
 pub const Options = struct {
     policy: ?PolicyHook = null,
     layout: ?LayoutHook = null,
+    clock: ?ClockHook = null,
     shell: ?ShellHook = null,
     surfaces: ?SurfaceHooks = null,
     seat: ?SeatHook = null,
@@ -332,16 +339,29 @@ pub const Runtime = struct {
         var cycle = self.adapter.finishManage(&draft, .{
             .layout_context = if (self.options.layout) |layout| layout.context else null,
             .build_layout = if (self.options.layout) |layout| layout.build else null,
+            .monotonic_ms = if (self.options.clock) |clock| clock.monotonic_ms(clock.context) else 0,
         }) catch |err| return transport.finishManageError(Runtime, self, err);
         errdefer cycle.deinit();
 
         var operations = std.ArrayList(types.ManageOperation).empty;
         defer operations.deinit(self.allocator);
-        for (cycle.frames.frames()) |frame| try operations.appendSlice(self.allocator, frame.plans.river_manage.operations.items);
+        for (cycle.frames.frames()) |frame| for (frame.plans.river_manage.operations.items) |operation| switch (operation) {
+            .propose_dimensions => |proposal| if (try self.adapter.needsDimensionProposal(proposal))
+                try operations.append(self.allocator, operation),
+            else => try operations.append(self.allocator, operation),
+        };
         try self.adapter.appendServerDecorationRequests(&operations);
+        try self.adapter.appendWindowPlacementRequests(&operations);
+        try self.adapter.appendPointerOperationRequests(&operations);
         try self.adapter.appendSeatFocusRequests(&operations);
         try plans.applyManageTransport(transport.manage(Runtime, self), .{ .operations = operations.items });
+        for (operations.items) |operation| switch (operation) {
+            .propose_dimensions => |proposal| try self.adapter.commitDimensionProposal(proposal),
+            else => {},
+        };
         self.adapter.commitServerDecorationRequests();
+        self.adapter.commitWindowPlacementRequests();
+        self.adapter.commitPointerOperationRequests();
         self.adapter.commitSeatFocusRequests();
         // River guarantees at least one render sequence after every completed
         // manage sequence. Remember that credit so asynchronous surface work
@@ -378,6 +398,7 @@ pub const Runtime = struct {
         try self.surface_queue.appendReady(self.allocator, &commits);
         try coordinator.runRender(.{ .operations = operations.items }, commits.items, transport.renderEmitter(Runtime, self));
         self.adapter.commitWindowBorderRequests();
+        if (render_cycle.dimensions_changed or frames.needs_frame) self.manage_dirty_requested = true;
     }
 
     fn runShell(self: *Runtime) !void {
@@ -471,6 +492,7 @@ const TestTrace = struct {
     allocator: std.mem.Allocator,
     events: std.ArrayList(u8) = .empty,
     policy_calls: usize = 0,
+    needs_frame: bool = false,
 
     fn add(self: *@This(), event: u8) !void {
         try self.events.append(self.allocator, event);
@@ -491,11 +513,12 @@ const TestTrace = struct {
         try self.add('p');
     }
     fn layout(
-        _: ?*anyopaque,
+        raw: ?*anyopaque,
         allocator: std.mem.Allocator,
         snapshot: *const wm.WorldView,
         output_id: wm.OutputId,
         camera_value: f32,
+        _: f64,
     ) !wm.LayoutPlans {
         const output = snapshot.getOutput(output_id).?;
         const tag = snapshot.getTag(output.active_tag).?;
@@ -506,6 +529,7 @@ const TestTrace = struct {
         var result: wm.LayoutPlans = .{
             .manage = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id, .camera = camera } },
             .render = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id, .camera = camera } },
+            .needs_frame = from(raw).needs_frame,
         };
         errdefer result.deinit();
         const virtual: wm.FRect = .{ .x = 0, .y = 0, .width = 800, .height = 600 };
@@ -566,7 +590,7 @@ fn fakeRef(value: usize) types.ProxyRef {
 }
 
 test "compositor-free coordinator runs policy and retained commits only after boundaries" {
-    var trace = TestTrace{ .allocator = std.testing.allocator };
+    var trace = TestTrace{ .allocator = std.testing.allocator, .needs_frame = true };
     defer trace.events.deinit(trace.allocator);
     var runtime = Runtime.initWithOptions(std.testing.allocator, .{
         .policy = .{ .context = &trace, .run = TestTrace.policy },
@@ -595,19 +619,19 @@ test "compositor-free coordinator runs policy and retained commits only after bo
     try std.testing.expectEqual(@as(usize, 0), trace.policy_calls);
     try runtime.afterDispatch();
     try std.testing.expectEqual(@as(usize, 1), trace.policy_calls);
-    try std.testing.expectEqualSlices(u8, "pmM", trace.events.items);
+    try std.testing.expectEqualSlices(u8, "pmmM", trace.events.items);
 
     try runtime.queueSubmittedCommit(.{ .role = .{ .decoration = decoration }, .generation = 1, .token = 9 });
     runtime.requestShellPhase();
     try runtime.stageRenderBoundary();
     try runtime.afterDispatch();
-    try std.testing.expectEqualSlices(u8, "pmMascrrrrrRblk", trace.events.items);
+    try std.testing.expectEqualSlices(u8, "pmmMascrrrrrRblkd", trace.events.items);
     try std.testing.expectEqual(@as(u64, 1), runtime.stats.committed_surfaces);
     try std.testing.expectEqual(@as(u64, 1), runtime.stats.shell_callbacks);
 
     try runtime.stageRenderBoundary();
     try runtime.afterDispatch();
-    try std.testing.expectEqualSlices(u8, "pmMascrrrrrRblkrrrrR", trace.events.items);
+    try std.testing.expectEqualSlices(u8, "pmmMascrrrrrRblkdrrrrR", trace.events.items);
 }
 
 test "surface retirement discards queued work before presenter teardown" {

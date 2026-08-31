@@ -73,6 +73,11 @@ fn translateInput(runtime: anytype, intent: world.input_intents.Intent) !?script
         .toggle_fullscreen => .{ .transition_placement = .{ .window = window, .transition = .fullscreen } },
         .next_column => .{ .focus_direction = .{ .output = output, .direction = .right } },
         .previous_column => .{ .focus_direction = .{ .output = output, .direction = .left } },
-        .move, .resize => null,
+        .move => .{ .move_floating = .{ .window = window, .delta = .{ .x = intent.delta.x, .y = intent.delta.y } } },
+        .resize => .{ .resize_floating = .{
+            .window = window,
+            .edges = try wm.ResizeEdges.fromBits(intent.edges orelse return null),
+            .delta = .{ .x = intent.delta.x, .y = intent.delta.y },
+        } },
     };
 }

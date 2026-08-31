@@ -22,6 +22,7 @@ pub const NamedAction = enum {
 pub const Source = union(enum) {
     pointer_binding: ids.PointerBindingId,
     decoration: ids.DecorationId,
+    window_request: ids.WindowId,
 };
 
 pub const Intent = struct {
@@ -30,6 +31,8 @@ pub const Intent = struct {
     seat: ?ids.SeatId = null,
     window: ?ids.WindowId = null,
     position: ?ids.Point = null,
+    delta: ids.Point = .{ .x = 0, .y = 0 },
+    edges: ?u32 = null,
 };
 
 pub const Queue = struct {

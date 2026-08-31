@@ -42,7 +42,7 @@ local bindings = {
 
   -- Width, tabs, and outputs
   { modifiers = alt, key = "r", action = action("grow") },
-  { modifiers = alt, key = "t", action = action("toggle-split-tabbed") },
+  { modifiers = alt, key = "space", action = action("cycle-container-mode") },
   { modifiers = alt, key = "Tab", action = action("focus-tab-next") },
   { modifiers = { "alt", "shift" }, key = "Tab", action = action("focus-tab-prev") },
   { modifiers = alt, key = "comma", action = action("focus-output-prev") },

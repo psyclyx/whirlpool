@@ -184,6 +184,9 @@ pub const World = struct {
         self.assertValid();
         try self.requireTag(spec.tag);
         try validation.validateFloatingGeometry(spec.floating_geometry);
+        try validation.validateSizeHints(spec.size_hints);
+        try validation.validateOptionalSize(spec.actual_size);
+        try validation.validateOptionalSize(spec.proposed_size);
         if (spec.output) |output_id| try self.requireOutput(output_id);
         const id = try self.windows.insert(.{
             .id = undefined,
@@ -192,6 +195,9 @@ pub const World = struct {
             .lifecycle = .announced,
             .placement = spec.placement,
             .floating_geometry = spec.floating_geometry,
+            .size_hints = spec.size_hints,
+            .actual_size = spec.actual_size,
+            .proposed_size = spec.proposed_size,
         });
         self.advanceEpoch();
         self.assertValid();

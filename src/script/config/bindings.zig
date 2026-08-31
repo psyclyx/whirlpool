@@ -19,7 +19,7 @@ pub const Action = union(enum) {
     toggle_float,
     toggle_fullscreen,
     cycle_width: wm.ColumnWidthStep,
-    toggle_split_tabbed,
+    cycle_container_mode,
     focus_tab: TabStep,
     focus_output: TabStep,
     focus_tag: u8,
@@ -153,7 +153,7 @@ fn parseAction(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!Action {
     if (std.mem.eql(u8, name, "toggle-fullscreen")) return .toggle_fullscreen;
     if (std.mem.eql(u8, name, "shrink-width")) return .{ .cycle_width = .previous };
     if (std.mem.eql(u8, name, "grow-width") or std.mem.eql(u8, name, "grow")) return .{ .cycle_width = .next };
-    if (std.mem.eql(u8, name, "toggle-split-tabbed")) return .toggle_split_tabbed;
+    if (std.mem.eql(u8, name, "cycle-container-mode")) return .cycle_container_mode;
     if (std.mem.eql(u8, name, "focus-tab-next")) return .{ .focus_tab = .next };
     if (std.mem.eql(u8, name, "focus-tab-prev")) return .{ .focus_tab = .previous };
     if (std.mem.eql(u8, name, "focus-output-next")) return .{ .focus_output = .next };

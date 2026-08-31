@@ -182,8 +182,13 @@ pub const Runtime = struct {
     /// never expose a half-created surface to a presenter.
     pub fn reconcile(self: *Runtime) !void {
         try self.reconcileShells();
-        try self.reconcileDecorationExtents();
+        // Manage reconciliation removes a closed window record before role
+        // reconciliation runs. Mark its borrowed decoration for retirement
+        // before either retirement advancement or extent lookup needs that
+        // record again.
+        try self.retireOrphanDecorations();
         try self.advanceDecorationRetirements();
+        try self.reconcileDecorationExtents();
         var selection = try self.adapter.visibleTiledDecorationSelection();
         defer selection.deinit();
 
@@ -198,6 +203,16 @@ pub const Runtime = struct {
         };
         try self.decoration_lifetime.reconcile(selected.items, self, createDecoration, destroyDecoration);
         try self.advanceDecorationRetirements();
+    }
+
+    fn retireOrphanDecorations(self: *Runtime) !void {
+        for (self.decorations.items) |*record| {
+            if (record.state != .active or self.adapter.objects.windows.contains(record.window)) continue;
+            record.state = .retiring;
+            const role_index = self.managerDecorationIndex(record.decoration) orelse
+                return error.RoleOwnershipLost;
+            try self.manager.requestDecorationRoleRetirement(role_index);
+        }
     }
 
     fn reconcileDecorationExtents(self: *Runtime) !void {
@@ -400,6 +415,42 @@ fn decorationExtentChanged(current: types.Size, next: types.Size) bool {
 test "role lifecycle has explicit hook and ownership seams" {
     try std.testing.expect(@sizeOf(Runtime) > 0);
     _ = Runtime.reconcile;
+}
+
+test "orphaned window decorations retire before extent lookup" {
+    var manager: live.Manager = .{
+        .allocator = std.testing.allocator,
+        .client = undefined,
+        .proxy = undefined,
+    };
+    defer manager.decoration_roles.deinit(manager.allocator);
+    try manager.decoration_roles.append(manager.allocator, .{
+        .window = @ptrFromInt(0x2000),
+        .surface = @ptrFromInt(0x2010),
+        .decoration = @ptrFromInt(0x2020),
+    });
+
+    var adapter = world.Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+    var runtime = Runtime.init(
+        std.testing.allocator,
+        &manager,
+        &adapter,
+        undefined,
+        .{},
+    );
+    defer runtime.abandon();
+    try runtime.decorations.append(std.testing.allocator, .{
+        .window = types.WindowId.init(7),
+        .extent = .{ .width = 800, .height = 600 },
+        .decoration = @ptrFromInt(0x2020),
+        .surface = @ptrFromInt(0x2010),
+        .id = types.DecorationId.init(9),
+    });
+
+    try runtime.retireOrphanDecorations();
+    try std.testing.expectEqual(RecordState.retiring, runtime.decorations.items[0].state);
+    try std.testing.expect(manager.decoration_roles.items[0].retirement_requested);
 }
 
 test "shell extent changes require fresh presentation ownership" {

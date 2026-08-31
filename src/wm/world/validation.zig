@@ -107,6 +107,9 @@ fn validateWindows(world: anytype) !void {
         if (world.tags.getConst(window.tag) == null) return error.InvalidInvariant;
         if (window.output) |output_id| if (world.outputs.getConst(output_id) == null) return error.InvalidInvariant;
         try validateFloatingGeometry(window.floating_geometry);
+        try validateSizeHints(window.size_hints);
+        validateOptionalSize(window.actual_size) catch return error.InvalidInvariant;
+        validateOptionalSize(window.proposed_size) catch return error.InvalidInvariant;
         for (window.marks.items) |mark| {
             try validateName(mark.name);
             if (marks.fetchPut(mark.name, window.id) catch return error.InvalidInvariant) |_| return error.InvalidInvariant;
@@ -124,6 +127,10 @@ fn validateWindows(world: anytype) !void {
             if (world.windows.getConst(window_id) == null or !isVisible(world, window_id)) return error.InvalidInvariant;
         }
     }
+}
+
+pub fn validateOptionalSize(value: ?types.Size) !void {
+    if (value) |size| if (size.width == 0 or size.height == 0) return error.InvalidDimensions;
 }
 
 fn isVisible(world: anytype, window_id: WindowId) bool {
@@ -174,4 +181,9 @@ pub fn validateFloatingGeometry(geometry: Rect) !void {
     const right = @as(i64, geometry.x) + @as(i64, geometry.width);
     const bottom = @as(i64, geometry.y) + @as(i64, geometry.height);
     if (right > std.math.maxInt(i32) or bottom > std.math.maxInt(i32)) return error.InvalidFloatingGeometry;
+}
+
+pub fn validateSizeHints(hints: types.SizeHints) !void {
+    if (hints.max.width != 0 and hints.min.width > hints.max.width) return error.InvalidDimensionsHint;
+    if (hints.max.height != 0 and hints.min.height > hints.max.height) return error.InvalidDimensionsHint;
 }
