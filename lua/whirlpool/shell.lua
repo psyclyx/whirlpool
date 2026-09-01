@@ -7,10 +7,40 @@ local Status = require("whirlpool.status")
 
 local BAR_HEIGHT = 38
 local SPARK_COUNT = 15
+local NETWORK_SAMPLE_COUNT = 16
+local NETWORK_SAMPLE_MS = 500
+local NETWORK_BAR_WIDTH = 2
+local NETWORK_BAR_GAP = 1
+local NETWORK_HALF_HEIGHT = BAR_HEIGHT / 2
+local NETWORK_ZOOM_FLOOR = 128 * 1024
+local NETWORK_HEADROOM = 0.78
+local SLANT = 0.30
 local CLEAR = { 0, 0, 0, 0 }
 
 local function with_alpha(color, alpha)
   return { color[1], color[2], color[3], alpha }
+end
+
+-- The motif is Lua policy. Whirlpool only supplies box-relative polygons;
+-- this helper chooses a constant physical slope and permits the top edge to
+-- extend into the following panel so adjacent sections share one diagonal.
+local function angled_points(width, height, slant)
+  local shift = (slant or SLANT) * height / math.max(1, width)
+  return { { shift, 0 }, { 1 + shift, 0 }, { 1, 1 }, { 0, 1 } }
+end
+
+local function angled_shape(parent, width, height, color)
+  return parent:polygon({ fill = color, points = angled_points(width, height) })
+end
+
+local function resize_angled(node, width, height)
+  node:set("width", width)
+  node:set("height", height)
+  node:set("points", angled_points(width, height))
+end
+
+local function visual_center_shift(height)
+  return SLANT * height * 0.5
 end
 
 local function ellipsis(text, limit)
@@ -44,9 +74,12 @@ end
 local function meter(parent, color, initial)
   local column = parent:column({ width = 8, height = BAR_HEIGHT })
   column:spacer({ flex = 1 })
-  local fill = column:shape({ width = 8, height = 2, fill = color })
+  local fill = column:polygon({
+    width = 8, height = 2, fill = color, points = angled_points(8, 2),
+  })
   local function update(percent, next_color)
-    fill:set("height", math.max(2, math.floor(BAR_HEIGHT * math.min(100, math.max(0, percent or 0)) / 100 + 0.5)))
+    local height = math.max(2, math.floor(BAR_HEIGHT * math.min(100, math.max(0, percent or 0)) / 100 + 0.5))
+    resize_angled(fill, 8, height)
     if next_color then fill:set("fill", next_color) end
   end
   update(initial or 0)
@@ -55,8 +88,8 @@ end
 
 local function section(parent, width, background)
   local panel = parent:stack({ width = width, height = BAR_HEIGHT })
-  panel:shape({ fill = background })
-  return panel:row({ padding = { 0, 9, 0, 5 }, gap = 6 })
+  angled_shape(panel, width, BAR_HEIGHT, background)
+  return panel:row({ padding = { 0, 12, 0, 2 }, gap = 8, offset_x = visual_center_shift(BAR_HEIGHT) })
 end
 
 local function sparkline(parent, color)
@@ -65,12 +98,15 @@ local function sparkline(parent, color)
   for index = 1, SPARK_COUNT do
     local column = row:column({ width = 3, height = BAR_HEIGHT })
     column:spacer({ flex = 1 })
-    bars[index] = column:shape({ width = 3, height = 2, fill = color })
+    bars[index] = column:polygon({
+      width = 3, height = 2, fill = color, points = angled_points(3, 2),
+    })
   end
   return function(values)
     for index, bar in ipairs(bars) do
       local value = values[index] or 0
-      bar:set("height", math.max(2, math.floor((BAR_HEIGHT - 2) * math.min(1, math.max(0, value)) + 0.5)))
+      local height = math.max(2, math.floor((BAR_HEIGHT - 2) * math.min(1, math.max(0, value)) + 0.5))
+      resize_angled(bar, 3, height)
     end
   end
 end
@@ -82,6 +118,13 @@ local function build(parent)
     occupied = {},
     items = {},
     item_count = 0,
+    frame_ms = 0,
+    network_sample_ms = 0,
+    network_sequence = 0,
+    network_rx = {},
+    network_tx = {},
+    network_zoom = NETWORK_ZOOM_FLOOR,
+    network_zoom_target = NETWORK_ZOOM_FLOOR,
   }
 
   local root = parent:stack()
@@ -98,8 +141,10 @@ local function build(parent)
   local workspace_cells = {}
   for index = 1, 9 do
     local cell = workspaces:stack({ width = index == 1 and 30 or 1, height = BAR_HEIGHT, opacity = index == 1 and 1 or 0 })
-    local background = cell:shape({ fill = index == 1 and theme.accent or CLEAR })
-    local label = cell:column({ padding = { 9, 9, 0, 10 } }):text({
+    local background = angled_shape(cell, 30, BAR_HEIGHT, index == 1 and theme.accent or CLEAR)
+    local label = cell:column({
+      padding = { 9, 9, 0, 10 }, offset_x = visual_center_shift(BAR_HEIGHT),
+    }):text({
       text = tostring(index),
       font_size = 16,
       text_color = index == 1 and theme.bg or theme.text,
@@ -108,36 +153,51 @@ local function build(parent)
   end
 
   local strip = bar:stack({ height = BAR_HEIGHT, flex = 1, clip = true })
-  local strip_content = strip:row({ width = 1, height = BAR_HEIGHT, gap = 4 })
+  local strip_content = strip:stack({ width = 1, height = BAR_HEIGHT })
+  local window_layer = strip_content:stack({ height = BAR_HEIGHT })
+  local marker_layer = strip_content:stack({ height = BAR_HEIGHT })
   local display_items = {}
   local function create_display_item()
-    local cell = strip_content:stack({ width = 1, height = BAR_HEIGHT, opacity = 0, clip = true })
-    local background = cell:shape({ fill = CLEAR, radius = 3 })
-    local group_label = cell:text({ text = "", font_size = 17, text_color = theme.bright, padding = { 8, 5, 0, 5 } })
-    local window = cell:row({ gap = 6, padding = { 7, 7, 7, 7 }, opacity = 0 })
+    local cell = window_layer:stack({ width = 1, height = BAR_HEIGHT, opacity = 0 })
+    local background = cell:polygon({ fill = CLEAR, points = angled_points(1, BAR_HEIGHT) })
+    local window = cell:row({
+      gap = 6, padding = { 7, 9, 7, 7 },
+      offset_x = visual_center_shift(BAR_HEIGHT),
+    })
     local mark = window:text({ text = "", width = 1, font_size = 11, text_color = theme.accent, opacity = 0 })
     local icon = window:icon({ icon_source = "", width = 20, height = 20 })
     local labels = window:column({ gap = 1 })
     local app_id = labels:text({ text = "", height = 12, font_size = 11, text_color = theme.text })
     local title = labels:text({ text = "", height = 10, font_size = 9, text_color = theme.muted })
+    local marker = marker_layer:stack({ width = 3, height = BAR_HEIGHT, opacity = 0 })
+    local marker_column = marker:column({ width = 3, height = BAR_HEIGHT })
+    marker_column:spacer({ flex = 1 })
+    local marker_line = marker_column:polygon({
+      width = 3, height = 24, fill = theme.blue, points = angled_points(3, 24),
+    })
+    marker_column:spacer({ flex = 1 })
     display_items[#display_items + 1] = {
       cell = cell,
       background = background,
-      group_label = group_label,
       window = window,
       mark = mark,
       icon = icon,
       app_id = app_id,
       title = title,
+      marker = marker,
+      marker_line = marker_line,
     }
   end
 
-  local left_fade = strip:row({ width = 24, height = BAR_HEIGHT, opacity = 0 })
-  local right_fade = strip:row({ height = BAR_HEIGHT, opacity = 0 })
+  local left_fade = strip:stack({ width = 1, height = BAR_HEIGHT, opacity = 0, clip = true })
+  local left_gradient = left_fade:row({ width = 24, height = BAR_HEIGHT })
+  local right_fade = strip:row({ height = BAR_HEIGHT })
   right_fade:spacer({ flex = 1 })
+  local right_clip = right_fade:stack({ width = 1, height = BAR_HEIGHT, opacity = 0, clip = true })
+  local right_gradient = right_clip:row({ width = 24, height = BAR_HEIGHT, offset_x = -23 })
   for index = 1, 8 do
-    left_fade:shape({ width = 3, height = BAR_HEIGHT, fill = with_alpha(theme.bg, (9 - index) / 8) })
-    right_fade:shape({ width = 3, height = BAR_HEIGHT, fill = with_alpha(theme.bg, index / 8) })
+    left_gradient:shape({ width = 3, height = BAR_HEIGHT, fill = with_alpha(theme.bg, (9 - index) / 8) })
+    right_gradient:shape({ width = 3, height = BAR_HEIGHT, fill = with_alpha(theme.bg, index / 8) })
   end
 
   local right = bar:row({ height = BAR_HEIGHT })
@@ -147,16 +207,56 @@ local function build(parent)
   cpu:text({ text = "CPU", font_size = 12, text_color = theme.yellow, padding = { 11, 0, 0, 0 } })
 
   local network = section(right, 178, theme.blend(theme.cyan))
-  local net_spark = network:row({ height = BAR_HEIGHT, gap = 1 })
+  local network_view_width = SPARK_COUNT * NETWORK_BAR_WIDTH + (SPARK_COUNT - 1) * NETWORK_BAR_GAP
+  local network_content_width = NETWORK_SAMPLE_COUNT * NETWORK_BAR_WIDTH
+    + (NETWORK_SAMPLE_COUNT - 1) * NETWORK_BAR_GAP
+  local net_spark = network:stack({ width = network_view_width, height = BAR_HEIGHT, clip = true })
+  local net_content = net_spark:row({ width = network_content_width, height = BAR_HEIGHT, gap = NETWORK_BAR_GAP })
   local rx_bars, tx_bars = {}, {}
-  for index = 1, SPARK_COUNT do
-    local pair = net_spark:column({ width = 2, height = BAR_HEIGHT })
-    rx_bars[index] = pair:shape({ width = 2, height = 2, fill = theme.green })
-    tx_bars[index] = pair:shape({ width = 2, height = 2, fill = theme.cyan })
+  for index = 1, NETWORK_SAMPLE_COUNT do
+    local pair = net_content:column({ width = NETWORK_BAR_WIDTH, height = BAR_HEIGHT })
+    local upper = pair:column({ width = NETWORK_BAR_WIDTH, height = NETWORK_HALF_HEIGHT })
+    upper:spacer({ flex = 1 })
+    rx_bars[index] = upper:polygon({
+      width = NETWORK_BAR_WIDTH, height = 1, fill = theme.green,
+      points = angled_points(NETWORK_BAR_WIDTH, 1), opacity = 0,
+    })
+    local lower = pair:column({ width = NETWORK_BAR_WIDTH, height = NETWORK_HALF_HEIGHT })
+    tx_bars[index] = lower:polygon({
+      width = NETWORK_BAR_WIDTH, height = 1, fill = theme.cyan,
+      points = angled_points(NETWORK_BAR_WIDTH, 1), opacity = 0,
+    })
+    lower:spacer({ flex = 1 })
   end
   local net_text = network:column({ gap = 1, padding = { 4, 0, 0, 0 } })
   local rx_label = net_text:text({ text = "rx 0B", font_size = 12, text_color = theme.green })
   local tx_label = net_text:text({ text = "tx 0B", font_size = 12, text_color = theme.cyan })
+
+  local function draw_network(now_ms)
+    now_ms = math.max(state.frame_ms, tonumber(now_ms) or 0)
+    local elapsed = math.max(0, now_ms - state.frame_ms)
+    state.frame_ms = now_ms
+    local tau = state.network_zoom_target > state.network_zoom and 800 or 6000
+    local blend = elapsed > 0 and (1 - math.exp(-elapsed / tau)) or 0
+    state.network_zoom = state.network_zoom
+      + (state.network_zoom_target - state.network_zoom) * blend
+    local progress = math.max(0, math.min(0.99,
+      (now_ms - state.network_sample_ms) / NETWORK_SAMPLE_MS))
+    net_content:set("offset_x", -(NETWORK_BAR_WIDTH + NETWORK_BAR_GAP) * progress)
+    for index = 1, NETWORK_SAMPLE_COUNT do
+      local rx = math.max(0, tonumber(state.network_rx[index]) or 0)
+      local tx = math.max(0, tonumber(state.network_tx[index]) or 0)
+      local rx_height = math.max(1, math.floor(NETWORK_HALF_HEIGHT * math.min(1, rx / state.network_zoom) + 0.5))
+      local tx_height = math.max(1, math.floor(NETWORK_HALF_HEIGHT * math.min(1, tx / state.network_zoom) + 0.5))
+      local edge_opacity = index == 1 and (1 - progress)
+        or index == NETWORK_SAMPLE_COUNT and progress
+        or 1
+      resize_angled(rx_bars[index], NETWORK_BAR_WIDTH, rx_height)
+      resize_angled(tx_bars[index], NETWORK_BAR_WIDTH, tx_height)
+      rx_bars[index]:set("opacity", rx > 0 and edge_opacity or 0)
+      tx_bars[index]:set("opacity", tx > 0 and edge_opacity or 0)
+    end
+  end
 
   local audio = section(right, 44, theme.blend(theme.purple))
   local update_audio = meter(audio, theme.purple, 0)
@@ -171,7 +271,7 @@ local function build(parent)
   disk:text({ text = "D", font_size = 14, text_color = theme.orange, padding = { 10, 0, 0, 0 } })
 
   local battery_panel = right:stack({ width = 1, height = BAR_HEIGHT, opacity = 0 })
-  battery_panel:shape({ fill = theme.blend(theme.red) })
+  angled_shape(battery_panel, 44, BAR_HEIGHT, theme.blend(theme.red))
   local battery = battery_panel:row({ padding = { 0, 9, 0, 5 }, gap = 6 })
   local update_battery = meter(battery, theme.red, 0)
   local battery_label = battery:text({ text = "B", font_size = 14, text_color = theme.red, padding = { 10, 0, 0, 0 } })
@@ -220,23 +320,23 @@ local function build(parent)
         local style = tostring(item[1] or "")
         local is_window = style == "window"
         local is_insertion = style == "insertion"
+        local is_group = style == "group-open" or style == "group-close"
         local focused = item[5] == true
+        local group_kind = tostring(item[2] or "")
         local detail = tostring(item[8] or "")
         local marked = detail ~= ""
         local app_id = tostring(item[3] or "")
         local title = tostring(item[4] or "")
-        view.cell:set("width", math.max(1, math.floor(tonumber(item[6]) or 1)))
-        view.cell:set("opacity", 1)
-        view.group_label:set("text", tostring(item[2] or ""))
-        view.group_label:set("opacity", is_window and 0 or 1)
-        view.window:set("opacity", is_window and 1 or 0)
-        view.background:set("fill", focused and theme.blend(theme.accent, 112)
-          or is_insertion and theme.blend(theme.accent, 48)
-          or style == "group" and theme.blend(theme.blue, 26)
-          or CLEAR)
+        local x = tonumber(item[9]) or 0
         local width = math.max(1, math.floor(tonumber(item[6]) or 1))
-        local app_limit = math.max(4, math.floor((width - 48) / 7))
-        local title_limit = math.max(5, math.floor((width - 48) / 6))
+        view.cell:set("width", width)
+        view.cell:set("offset_x", x)
+        view.cell:set("opacity", is_window and 1 or 0)
+        resize_angled(view.background, width, BAR_HEIGHT)
+        view.background:set("fill", focused and theme.blend(theme.accent, 112)
+          or theme.blend(theme.surface, 96))
+        local app_limit = math.max(4, math.floor((width - 58) / 7))
+        local title_limit = math.max(5, math.floor((width - 58) / 6))
         view.icon:set("icon_source", is_window and tostring(item[7] or "") or "")
         view.mark:set("text", detail)
         view.mark:set("width", marked and math.max(10, #detail * 7) or 1)
@@ -245,22 +345,43 @@ local function build(parent)
         view.app_id:set("text_color", focused and theme.bright or theme.text)
         view.title:set("text", is_window and ellipsis(title, title_limit) or "")
         view.title:set("text_color", focused and theme.text or theme.muted)
+        view.marker:set("offset_x", x - 1.5)
+        view.marker:set("opacity", (is_insertion or is_group) and 1 or 0)
+        local marker_height = is_insertion and 34 or 24
+        resize_angled(view.marker_line, 3, marker_height)
+        view.marker_line:set("fill", is_insertion and theme.accent
+          or marked and theme.purple
+          or focused and theme.bright
+          or group_kind == "float" and theme.purple
+          or group_kind == "full" and theme.orange
+          or group_kind == "scratch" and theme.cyan
+          or group_kind == "t" and theme.purple
+          or group_kind == "v" and theme.cyan
+          or style == "group-open" and theme.blue
+          or theme.muted)
       else
         view.cell:set("width", 1)
         view.cell:set("opacity", 0)
+        view.marker:set("opacity", 0)
       end
     end
     state.item_count = #state.items
     strip_content:set("width", math.max(1, math.floor(tonumber(values[5]) or 1)))
     strip_content:set("offset_x", -math.max(0, math.floor(tonumber(values[4]) or 0)))
-    left_fade:set("opacity", values[6] == true and 1 or 0)
-    right_fade:set("opacity", values[7] == true and 1 or 0)
+    local left_cut = math.max(0, math.min(24, math.floor(tonumber(values[6]) or 0)))
+    local right_cut = math.max(0, math.min(24, math.floor(tonumber(values[7]) or 0)))
+    left_fade:set("width", math.max(1, left_cut))
+    left_fade:set("opacity", left_cut > 0 and 1 or 0)
+    right_clip:set("width", math.max(1, right_cut))
+    right_clip:set("opacity", right_cut > 0 and 1 or 0)
+    right_gradient:set("offset_x", right_cut - 24)
   end
 
   local function update_status(values)
     local cpu_history = type(values[5]) == "table" and values[5] or {}
     local rx_history = type(values[10]) == "table" and values[10] or {}
     local tx_history = type(values[11]) == "table" and values[11] or {}
+    local network_sequence = math.floor(tonumber(values[18]) or 0)
     local audio_percent = tonumber(values[12]) or 0
     local audio_muted = values[13] == true
     local battery_present = values[15] == true
@@ -270,10 +391,18 @@ local function build(parent)
     update_cpu_spark(cpu_history)
     rx_label:set("text", "rx " .. Status.format_rate(values[8]))
     tx_label:set("text", "tx " .. Status.format_rate(values[9]))
-    for index = 1, SPARK_COUNT do
-      rx_bars[index]:set("height", math.max(2, math.floor(17 * (rx_history[index] or 0) + 0.5)))
-      tx_bars[index]:set("height", math.max(2, math.floor(17 * (tx_history[index] or 0) + 0.5)))
+    if network_sequence ~= state.network_sequence then
+      state.network_sequence = network_sequence
+      state.network_sample_ms = state.frame_ms
+      state.network_rx = rx_history
+      state.network_tx = tx_history
+      local peak = NETWORK_ZOOM_FLOOR
+      for index = 1, NETWORK_SAMPLE_COUNT do
+        peak = math.max(peak, tonumber(rx_history[index]) or 0, tonumber(tx_history[index]) or 0)
+      end
+      state.network_zoom_target = math.max(NETWORK_ZOOM_FLOOR, peak / NETWORK_HEADROOM)
     end
+    draw_network(state.frame_ms)
     local audio_color = audio_muted and theme.red or (audio_percent >= 100 and theme.yellow or theme.purple)
     update_audio(audio_percent, audio_color)
     audio_label:set("text", audio_muted and "X" or "A")
@@ -313,6 +442,8 @@ local function build(parent)
         update_desktop(values)
       elseif service == "status" then
         update_status(values)
+      elseif service == "frame" then
+        draw_network(tonumber(values[1]) or state.frame_ms)
       end
     end,
   }

@@ -1,8 +1,8 @@
 //! C-ABI membrane for the Skia renderer.
 //!
-//! Skia owns text rasterization and 2D drawing.  Only scalar values and a
-//! borrowed pixel frame cross the C++ boundary. Vulkan upload and presentation
-//! remain entirely in the Wayland WSI owner.
+//! Skia owns text rasterization and 2D drawing. Only scalar values, bounded
+//! borrowed geometry, and a borrowed pixel frame cross the C++ boundary.
+//! Vulkan upload and presentation remain entirely in the Wayland WSI owner.
 
 const std = @import("std");
 
@@ -14,6 +14,7 @@ extern fn whirlpool_skia_destroy(renderer: *Native) void;
 extern fn whirlpool_skia_begin(renderer: *Native, width: u32, height: u32) c_int;
 extern fn whirlpool_skia_clear(renderer: *Native, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_rect(renderer: *Native, x: f32, y: f32, width: f32, height: f32, radius: f32, r: f32, g: f32, b: f32, a: f32) void;
+extern fn whirlpool_skia_draw_polygon(renderer: *Native, points: [*]const f32, point_count: usize, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_text(renderer: *Native, text: [*]const u8, length: usize, x: f32, baseline: f32, size: f32, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_icon(renderer: *Native, source: [*]const u8, length: usize, x: f32, y: f32, width: f32, height: f32, opacity: f32) void;
 extern fn whirlpool_skia_push_clip(renderer: *Native, x: f32, y: f32, width: f32, height: f32) void;
@@ -56,6 +57,10 @@ pub const Renderer = struct {
         whirlpool_skia_draw_rect(self.native, rect.x, rect.y, rect.width, rect.height, radius, color.r, color.g, color.b, color.a);
     }
 
+    pub fn drawPolygon(self: *Renderer, polygon: Polygon, color: Color) void {
+        drawPolygonNative(self.native, polygon, color);
+    }
+
     pub fn drawText(self: *Renderer, text: []const u8, x: f32, baseline: f32, size: f32, color: Color) void {
         whirlpool_skia_draw_text(self.native, text.ptr, text.len, x, baseline, size, color.r, color.g, color.b, color.a);
     }
@@ -70,6 +75,7 @@ pub const Renderer = struct {
     pub fn drawList(self: *Renderer, list: DrawList) void {
         for (list.ops) |op| switch (op) {
             .rect => |rect| self.drawRect(rect.rect, rect.radius, rect.color),
+            .polygon => |item| self.drawPolygon(item.points, item.color),
             .text => |item| self.drawText(item.text, item.x, item.baseline, item.size, item.color),
             .icon => |item| self.drawIcon(item.source, item.rect, item.opacity),
             .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
@@ -132,6 +138,7 @@ pub const GpuRenderer = struct {
     pub fn drawList(self: *GpuRenderer, list: DrawList) void {
         for (list.ops) |op| switch (op) {
             .rect => |rect| whirlpool_skia_draw_rect(self.native, rect.rect.x, rect.rect.y, rect.rect.width, rect.rect.height, rect.radius, rect.color.r, rect.color.g, rect.color.b, rect.color.a),
+            .polygon => |item| drawPolygonNative(self.native, item.points, item.color),
             .text => |item| whirlpool_skia_draw_text(self.native, item.text.ptr, item.text.len, item.x, item.baseline, item.size, item.color.r, item.color.g, item.color.b, item.color.a),
             .icon => |item| whirlpool_skia_draw_icon(self.native, item.source.ptr, item.source.len, item.rect.x, item.rect.y, item.rect.width, item.rect.height, item.opacity),
             .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
@@ -166,6 +173,17 @@ pub const VulkanTarget = struct {
 
 pub const Rect = struct { x: f32, y: f32, width: f32, height: f32 };
 pub const Color = struct { r: f32, g: f32, b: f32, a: f32 };
+pub const max_polygon_points = 16;
+pub const Point = extern struct { x: f32, y: f32 };
+pub const Polygon = struct {
+    points: [max_polygon_points]Point = [_]Point{.{ .x = 0, .y = 0 }} ** max_polygon_points,
+    len: u8 = 0,
+};
+
+fn drawPolygonNative(native: *Native, polygon: Polygon, color: Color) void {
+    if (polygon.len < 3 or polygon.len > max_polygon_points) return;
+    whirlpool_skia_draw_polygon(native, @ptrCast(&polygon.points[0]), polygon.len, color.r, color.g, color.b, color.a);
+}
 
 /// The UI module intentionally does not import this type. A host lowers its
 /// retained node snapshots into this small scalar draw contract instead.
@@ -179,6 +197,10 @@ pub const DrawOp = union(enum) {
     rect: struct {
         rect: Rect,
         radius: f32 = 0,
+        color: Color,
+    },
+    polygon: struct {
+        points: Polygon,
         color: Color,
     },
     text: struct {
@@ -198,6 +220,7 @@ pub const DrawOp = union(enum) {
 test "Skia binding keeps protocol ownership outside the C++ membrane" {
     try std.testing.expect(@sizeOf(Renderer) > 0);
     try std.testing.expect(@sizeOf(Rect) == @sizeOf(f32) * 4);
+    try std.testing.expect(@sizeOf(Point) == @sizeOf(f32) * 2);
     try std.testing.expect(@sizeOf(DrawList) > 0);
 }
 
@@ -206,6 +229,25 @@ test "CPU renderer resolves a system font and rasterizes text" {
     defer renderer.deinit();
     try renderer.begin(160, 40, .{ 0, 0, 0, 0 });
     renderer.drawText("Whirlpool", 4, 28, 20, .{ .r = 1, .g = 1, .b = 1, .a = 1 });
+    const frame = try renderer.end();
+    const pixels = frame.pixels[0 .. frame.row_bytes * frame.height];
+    var painted = false;
+    for (pixels) |value| if (value != 0) {
+        painted = true;
+        break;
+    };
+    try std.testing.expect(painted);
+}
+
+test "CPU renderer rasterizes a filled polygon" {
+    var renderer = try Renderer.init(true);
+    defer renderer.deinit();
+    try renderer.begin(32, 32, .{ 0, 0, 0, 0 });
+    var polygon = Polygon{ .len = 3 };
+    polygon.points[0] = .{ .x = 4, .y = 28 };
+    polygon.points[1] = .{ .x = 16, .y = 4 };
+    polygon.points[2] = .{ .x = 28, .y = 28 };
+    renderer.drawPolygon(polygon, .{ .r = 1, .g = 0.5, .b = 0, .a = 1 });
     const frame = try renderer.end();
     const pixels = frame.pixels[0 .. frame.row_bytes * frame.height];
     var painted = false;

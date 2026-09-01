@@ -38,11 +38,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     // This CLI owns the whole client connection. On any process-exit path,
     // stop its worker and drop local proxies before wl_display disconnects.
     defer if (layer_live) layer.abandon();
-    session.setPollInterval(1000);
+    session.setPollInterval(16);
     layer.setWake(.{ .context = @ptrCast(&session), .run = wakeSession });
     status.setWake(.{ .context = @ptrCast(&session), .run = wakeSession });
     defer status.clearWake();
-    var after_dispatch = AfterDispatch{ .runtime = &layer, .session = &session, .status = status };
+    var after_dispatch = AfterDispatch{
+        .runtime = &layer,
+        .session = &session,
+        .status = status,
+        .io = io,
+        .clock_origin = std.Io.Clock.awake.now(io),
+    };
     session.setAfterDispatch(.{ .context = @ptrCast(&after_dispatch), .run = AfterDispatch.run });
     std.log.info("Portable layer-shell host connected", .{});
     session.run() catch |err| switch (err) {
@@ -64,17 +70,20 @@ const AfterDispatch = struct {
     runtime: *layer_shell_runtime.Runtime,
     session: *wayland_runtime.Session,
     status: *status_app.Service,
+    io: std.Io,
+    clock_origin: std.Io.Timestamp,
     status_revision: u64 = 0,
 
     fn run(raw: ?*anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         if (self.status.latestAfter(self.status_revision)) |latest| {
             self.status_revision = latest.revision;
-            var cpu_history: [status_app.history_len]script.program_loader.Value = undefined;
-            var rx_history: [status_app.history_len]script.program_loader.Value = undefined;
-            var tx_history: [status_app.history_len]script.program_loader.Value = undefined;
-            for (0..status_app.history_len) |index| {
+            var cpu_history: [status_app.cpu_history_len]script.program_loader.Value = undefined;
+            var rx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
+            var tx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
+            for (0..status_app.cpu_history_len) |index|
                 cpu_history[index] = .{ .number = latest.value.cpu_history[index] };
+            for (0..status_app.network_history_len) |index| {
                 rx_history[index] = .{ .number = latest.value.network_rx_history[index] };
                 tx_history[index] = .{ .number = latest.value.network_tx_history[index] };
             }
@@ -96,9 +105,12 @@ const AfterDispatch = struct {
                 .{ .boolean = latest.value.battery_present },
                 .{ .number = @floatFromInt(latest.value.battery_percent) },
                 .{ .boolean = latest.value.battery_charging },
+                .{ .number = @floatFromInt(latest.value.network_sample_sequence) },
             };
             try self.runtime.update(.{ .service = "status", .values = &values });
         }
+        const elapsed = self.clock_origin.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
+        try self.runtime.frame(@as(f64, @floatFromInt(@max(elapsed, 0))) / 1_000_000.0);
         _ = self.runtime.presentIfReady() catch |err| switch (err) {
             error.NotReady => return,
             error.SurfaceClosed => {

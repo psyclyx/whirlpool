@@ -16,6 +16,8 @@ const item_flow = @import("item_flow.zig");
 /// Owns the optional graphics runtime and its River role callback context.
 pub const Bridge = struct {
     allocator: std.mem.Allocator = undefined,
+    io: std.Io = undefined,
+    clock_origin: std.Io.Timestamp = undefined,
     graphics: ?*river_presenter_runtime.Runtime = null,
     status: ?*status_app.Service = null,
     icons: ?*desktop_icons.Service = null,
@@ -36,6 +38,8 @@ pub const Bridge = struct {
     ) !river_role_lifecycle.Hooks {
         self.* = .{};
         self.allocator = allocator;
+        self.io = io;
+        self.clock_origin = std.Io.Clock.awake.now(io);
         const spec = surface orelse return .{};
         self.graphics = try river_presenter_runtime.Runtime.init(allocator, io, client, .{
             .context = @ptrCast(runtime),
@@ -93,10 +97,17 @@ pub const Bridge = struct {
             self.status_revision = latest.revision;
             self.context.status = latest.value;
         }
+        self.context.frame_ms = self.monotonicMilliseconds();
         try self.context.roles.forEachShell(&self.context, Context.updateShellServices);
         try self.context.roles.forEachShell(&self.context, Context.updateStatusServices);
+        try self.context.roles.forEachShell(&self.context, Context.updateFrameServices);
         try self.context.roles.forEachDecoration(&self.context, Context.updateDecorationServices);
         try self.collectReady();
+    }
+
+    fn monotonicMilliseconds(self: *const Bridge) f64 {
+        const elapsed = self.clock_origin.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
+        return @as(f64, @floatFromInt(@max(elapsed, 0))) / 1_000_000.0;
     }
 
     /// Claim worker-completed frames before an already-staged River render
@@ -224,6 +235,7 @@ pub const Context = struct {
     graphics: *river_presenter_runtime.Runtime,
     icons: *desktop_icons.Service,
     status: status_app.Snapshot = .{},
+    frame_ms: f64 = 0,
     flow_states: std.AutoHashMapUnmanaged(u64, FlowState) = .empty,
 
     const FlowState = struct {
@@ -340,7 +352,7 @@ pub const Context = struct {
             flow_state.offset = item_flow.scroll(flow_state.offset, 0, viewport, flow.content_width);
         }
 
-        var item_storage: [item_flow.max_items][8]script.program_loader.Value = undefined;
+        var item_storage: [item_flow.max_items][10]script.program_loader.Value = undefined;
         var items: [item_flow.max_items]script.program_loader.Value = undefined;
         for (flow.slice(), 0..) |*item, index| {
             var app_id: []const u8 = "";
@@ -356,14 +368,15 @@ pub const Context = struct {
             items[index] = .{ .array = &item_storage[index] };
         }
 
+        const clipping = item_flow.edgeClipping(flow_state.offset, viewport, flow.content_width, 24);
         const values = [_]script.program_loader.Value{
             .{ .number = @floatFromInt(ordinal + 1) },
             .{ .array = &occupied_storage },
             .{ .array = items[0..flow.len] },
             .{ .number = @floatFromInt(flow_state.offset) },
             .{ .number = @floatFromInt(flow.content_width) },
-            .{ .boolean = flow_state.offset != 0 },
-            .{ .boolean = flow_state.offset +| viewport < flow.content_width },
+            .{ .number = @floatFromInt(clipping.leading) },
+            .{ .number = @floatFromInt(clipping.trailing) },
         };
         try self.graphics.update(.{ .shell = shell_id }, .{
             .service = "desktop",
@@ -376,7 +389,7 @@ pub const Context = struct {
         app_id: []const u8,
         title: []const u8,
         icon_source: []const u8,
-        target: *[8]script.program_loader.Value,
+        target: *[10]script.program_loader.Value,
     ) void {
         target.* = .{
             .{ .string = item.style.slice() },
@@ -387,16 +400,19 @@ pub const Context = struct {
             .{ .number = @floatFromInt(item.width) },
             .{ .string = icon_source },
             .{ .string = item.detail.slice() },
+            .{ .number = @floatFromInt(item.x) },
+            .{ .boolean = item.overlay },
         };
     }
 
     pub fn updateStatusServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
         const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-        var cpu_history: [status_app.history_len]script.program_loader.Value = undefined;
-        var rx_history: [status_app.history_len]script.program_loader.Value = undefined;
-        var tx_history: [status_app.history_len]script.program_loader.Value = undefined;
-        for (0..status_app.history_len) |index| {
+        var cpu_history: [status_app.cpu_history_len]script.program_loader.Value = undefined;
+        var rx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
+        var tx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
+        for (0..status_app.cpu_history_len) |index|
             cpu_history[index] = .{ .number = self.status.cpu_history[index] };
+        for (0..status_app.network_history_len) |index| {
             rx_history[index] = .{ .number = self.status.network_rx_history[index] };
             tx_history[index] = .{ .number = self.status.network_tx_history[index] };
         }
@@ -418,8 +434,15 @@ pub const Context = struct {
             .{ .boolean = self.status.battery_present },
             .{ .number = @floatFromInt(self.status.battery_percent) },
             .{ .boolean = self.status.battery_charging },
+            .{ .number = @floatFromInt(self.status.network_sample_sequence) },
         };
         try self.graphics.update(.{ .shell = shell_id }, .{ .service = "status", .values = &values });
+    }
+
+    pub fn updateFrameServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
+        const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
+        const values = [_]script.program_loader.Value{.{ .number = self.frame_ms }};
+        try self.graphics.update(.{ .shell = shell_id }, .{ .service = "frame", .values = &values });
     }
 
     pub fn updateDecorationServices(raw: ?*anyopaque, window_id: host.types.WindowId, decoration_id: host.types.DecorationId) !void {
@@ -552,9 +575,10 @@ test "display updates preserve distinct retained item labels and window metadata
     var flow: item_flow.Flow = .{ .len = 3 };
     flow.items[0] = .{
         .x = 0,
-        .width = 48,
-        .style = try script.layout_projection.Label.init("group"),
-        .text = try script.layout_projection.Label.init("( h"),
+        .width = 3,
+        .style = try script.layout_projection.Label.init("group-open"),
+        .text = try script.layout_projection.Label.init("h"),
+        .overlay = true,
     };
     flow.items[1] = .{
         .x = 52,
@@ -563,12 +587,12 @@ test "display updates preserve distinct retained item labels and window metadata
     };
     flow.items[2] = .{
         .x = 204,
-        .width = 18,
+        .width = 3,
         .style = try script.layout_projection.Label.init("insertion"),
-        .text = try script.layout_projection.Label.init("+"),
+        .overlay = true,
     };
 
-    var storage: [3][8]script.program_loader.Value = undefined;
+    var storage: [3][10]script.program_loader.Value = undefined;
     var items: [3]script.program_loader.Value = undefined;
     for (flow.slice(), 0..) |*item, index| {
         Context.writeDisplayItem(
@@ -588,11 +612,13 @@ test "display updates preserve distinct retained item labels and window metadata
     defer owned.deinit();
 
     const encoded = owned.value.values[0].array;
-    try std.testing.expectEqualStrings("group", encoded[0].array[0].string);
-    try std.testing.expectEqualStrings("( h", encoded[0].array[1].string);
+    try std.testing.expectEqualStrings("group-open", encoded[0].array[0].string);
+    try std.testing.expectEqualStrings("h", encoded[0].array[1].string);
+    try std.testing.expect(encoded[0].array[9].boolean);
     try std.testing.expectEqualStrings("window", encoded[1].array[0].string);
     try std.testing.expectEqualStrings("foot", encoded[1].array[2].string);
     try std.testing.expectEqualStrings("shell", encoded[1].array[3].string);
     try std.testing.expectEqualStrings("insertion", encoded[2].array[0].string);
-    try std.testing.expectEqualStrings("+", encoded[2].array[1].string);
+    try std.testing.expectEqual(@as(f64, 204), encoded[2].array[8].number);
+    try std.testing.expect(encoded[2].array[9].boolean);
 }

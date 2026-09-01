@@ -35,6 +35,8 @@ pub fn apply(composition: anytype, id: lua_program.NodeId, key: []const u8, valu
         try setPadding(composition, handle, value);
     } else if (std.mem.eql(u8, key, "radius")) {
         try setRadius(composition, handle, value);
+    } else if (std.mem.eql(u8, key, "points")) {
+        try setPoints(composition, handle, value);
     } else if (std.mem.eql(u8, key, "fill") or std.mem.eql(u8, key, "color")) {
         try setColor(composition, snapshot.kind, handle, value);
     } else if (std.mem.eql(u8, key, "text_color")) {
@@ -100,13 +102,9 @@ fn setClip(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value
 }
 
 fn setOffsetX(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    const number = switch (value) {
-        .number => |item| item,
-        else => return error.InvalidProperty,
-    };
-    if (!std.math.isFinite(number) or @floor(number) != number or
-        number < std.math.minInt(i32) or number > std.math.maxInt(i32)) return error.InvalidProperty;
-    try composition.delta.setOffsetX(handle, @intFromFloat(number));
+    const number = try signedFiniteNumber(value);
+    if (@abs(number) > std.math.maxInt(i32)) return error.InvalidProperty;
+    try composition.delta.setOffsetX(handle, @floatCast(number));
     composition.stats.applied_properties += 1;
 }
 
@@ -129,11 +127,28 @@ fn setPadding(composition: anytype, handle: ui.NodeHandle, value: lua_program.Va
 fn setColor(composition: anytype, kind: ui.NodeKind, handle: ui.NodeHandle, value: lua_program.Value) !void {
     const color = try colorValue(value);
     switch (kind) {
-        .shape => try composition.delta.setFill(handle, color),
+        .shape, .polygon => try composition.delta.setFill(handle, color),
         .text => try composition.delta.setTextColor(handle, color),
         .icon => return error.InvalidProperty,
         else => return error.InvalidProperty,
     }
+    composition.stats.applied_properties += 1;
+}
+
+fn setPoints(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
+    const values = array(value, 3) orelse return error.InvalidProperty;
+    if (values.len > ui.properties.max_polygon_points) return error.InvalidProperty;
+    var polygon = ui.Polygon{};
+    polygon.len = @intCast(values.len);
+    for (values, 0..) |item, index| {
+        const coordinates = array(item, 2) orelse return error.InvalidProperty;
+        if (coordinates.len != 2) return error.InvalidProperty;
+        polygon.points[index] = .{
+            .x = try coordinateValue(coordinates[0]),
+            .y = try coordinateValue(coordinates[1]),
+        };
+    }
+    try composition.delta.setPoints(handle, polygon);
     composition.stats.applied_properties += 1;
 }
 
@@ -147,6 +162,19 @@ fn finiteNumber(value: lua_program.Value) !f64 {
         .number => |number| if (std.math.isFinite(number) and number >= 0) number else error.InvalidProperty,
         else => error.InvalidProperty,
     };
+}
+
+fn signedFiniteNumber(value: lua_program.Value) !f64 {
+    return switch (value) {
+        .number => |number| if (std.math.isFinite(number)) number else error.InvalidProperty,
+        else => error.InvalidProperty,
+    };
+}
+
+fn coordinateValue(value: lua_program.Value) !f32 {
+    const number = try signedFiniteNumber(value);
+    if (@abs(number) > ui.properties.max_polygon_coordinate) return error.InvalidProperty;
+    return @floatCast(number);
 }
 
 fn integerValue(value: lua_program.Value) !u64 {

@@ -12,6 +12,10 @@ const Allocator = std.mem.Allocator;
 const DrawList = graphics.skia.DrawList;
 const DrawOp = graphics.skia.DrawOp;
 
+comptime {
+    std.debug.assert(ui.properties.max_polygon_points == graphics.skia.max_polygon_points);
+}
+
 pub const Viewport = struct { width: u32, height: u32 };
 
 pub const LowerError = error{
@@ -20,6 +24,7 @@ pub const LowerError = error{
     InvalidColor,
     InvalidOpacity,
     InvalidFontSize,
+    InvalidPolygon,
 };
 
 pub const OwnedDrawList = struct {
@@ -56,7 +61,7 @@ const Lowerer = struct {
         try validateSnapshot(snapshot);
         const properties = snapshot.properties;
         const box = Box{
-            .x = offered.x + @as(f32, @floatFromInt(properties.offset_x)),
+            .x = offered.x + properties.offset_x,
             .y = offered.y,
             .width = if (properties.width) |value| try dimension(value) else offered.width,
             .height = if (properties.height) |value| try dimension(value) else offered.height,
@@ -72,6 +77,19 @@ const Lowerer = struct {
                 .radius = properties.radius,
                 .color = colorWithOpacity(properties.fill, opacity),
             } }),
+            .polygon => if (box.width > 0 and box.height > 0 and properties.points.len >= 3) {
+                var polygon = graphics.skia.Polygon{ .len = properties.points.len };
+                for (properties.points.slice(), 0..) |point, point_index| {
+                    polygon.points[point_index] = .{
+                        .x = box.x + point.x * box.width,
+                        .y = box.y + point.y * box.height,
+                    };
+                }
+                try self.ops.append(self.allocator, .{ .polygon = .{
+                    .points = polygon,
+                    .color = colorWithOpacity(properties.fill, opacity),
+                } });
+            },
             .text => if (properties.text.len != 0) {
                 const size = try fontSize(properties.font_size);
                 const text = try self.arena.allocator().dupe(u8, properties.text);
@@ -182,7 +200,7 @@ const Lowerer = struct {
                 before + after + @ceil(@as(f32, @floatFromInt(properties.text.len)) * try fontSize(properties.font_size) * 0.62)
             else
                 before + after + try fontSize(properties.font_size),
-            .icon, .shape, .spacer => 0,
+            .icon, .shape, .polygon, .spacer => 0,
             .row, .column, .stack => blk: {
                 var total: f32 = 0;
                 var maximum: f32 = 0;
@@ -264,6 +282,9 @@ fn validateSnapshot(snapshot: ui.NodeSnapshot) LowerError!void {
     if (!validColor(properties.fill) or !validColor(properties.text_color)) return error.InvalidColor;
     if (!std.math.isFinite(properties.opacity) or properties.opacity < 0 or properties.opacity > 1) return error.InvalidOpacity;
     if (!std.math.isFinite(properties.radius) or properties.radius < 0) return error.InvalidDimensions;
+    if (snapshot.kind == .polygon and properties.points.len != 0) {
+        ui.properties.validate(.polygon, .{ .points = properties.points }) catch return error.InvalidPolygon;
+    }
 }
 
 fn dimension(value: u32) LowerError!f32 {
@@ -318,6 +339,27 @@ test "stack stretches auto-sized paint nodes to its box" {
     try std.testing.expectEqual(@as(f32, 24), result.ops[0].rect.rect.height);
 }
 
+test "polygon vertices are box-relative and may extend beyond layout bounds" {
+    var points = ui.Polygon{ .len = 4 };
+    points.points[0] = .{ .x = 0.25, .y = 0 };
+    points.points[1] = .{ .x = 1.25, .y = 0 };
+    points.points[2] = .{ .x = 1, .y = 1 };
+    points.points[3] = .{ .x = 0, .y = 1 };
+    const snapshot = fixture(.polygon, 0, null, .{
+        .width = 80,
+        .height = 20,
+        .fill = ui.Color.rgba(0.2, 0.4, 0.6, 1),
+        .points = points,
+    });
+    var result = try lower(std.testing.allocator, &.{snapshot}, .{ .width = 100, .height = 30 });
+    defer result.deinit();
+    const polygon = result.ops[0].polygon;
+    try std.testing.expectEqual(@as(u8, 4), polygon.points.len);
+    try std.testing.expectEqual(@as(f32, 20), polygon.points.points[0].x);
+    try std.testing.expectEqual(@as(f32, 100), polygon.points.points[1].x);
+    try std.testing.expectEqual(@as(f32, 20), polygon.points.points[3].y);
+}
+
 test "icon nodes lower to a renderer-neutral image operation" {
     const snapshot = fixture(.icon, 0, null, .{
         .width = 24,
@@ -360,13 +402,13 @@ test "clip and horizontal offset bound translated descendants" {
     const content = ui.NodeHandle{ .slot = 1, .generation = 1 };
     const snapshots = [_]ui.NodeSnapshot{
         fixture(.stack, 0, null, .{ .width = 40, .height = 20, .clip = true }),
-        fixture(.row, 1, root, .{ .width = 80, .offset_x = -12 }),
+        fixture(.row, 1, root, .{ .width = 80, .offset_x = -12.5 }),
         fixture(.shape, 2, content, .{ .width = 20, .fill = ui.Color.white }),
     };
     var result = try lower(std.testing.allocator, &snapshots, .{ .width = 100, .height = 30 });
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 3), result.operationCount());
     try std.testing.expectEqual(@as(f32, 40), result.ops[0].push_clip.width);
-    try std.testing.expectEqual(@as(f32, -12), result.ops[1].rect.rect.x);
+    try std.testing.expectEqual(@as(f32, -12.5), result.ops[1].rect.rect.x);
     try std.testing.expect(result.ops[2] == .pop_clip);
 }

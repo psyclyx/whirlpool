@@ -217,6 +217,7 @@ fn parseProjection(allocator: std.mem.Allocator, vm: *script.lua_vm.Vm, snapshot
             .window = window,
             .focused = try optionalBoolField(vm, -1, "focused", false),
             .width = width,
+            .overlay = try optionalBoolField(vm, -1, "overlay", false),
             .action = try script.layout_projection.Label.init(try optionalStringField(vm, -1, "action", "")),
             .args = action_args.values,
             .arg_count = action_args.len,
@@ -575,4 +576,27 @@ test "action batches commit or roll back retained provider state" {
     var committed = (try runtime.project(std.testing.allocator, &snapshot, output)).?;
     defer committed.deinit();
     try std.testing.expectEqualStrings("1", committed.items.items[0].text.slice());
+}
+
+test "layout projections preserve generic overlay placement" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{
+        .active_tag = tag,
+        .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
+        .usable = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
+    });
+    var runtime = try Runtime.init(std.testing.allocator,
+        \\return {
+        \\  layout = function(s) return { epoch=s.epoch, output=s.output.id, tag=s.tag.id, entries={} } end,
+        \\  project = function() return {{ style='marker', width=3, overlay=true }} end,
+        \\}
+    , .{});
+    defer runtime.deinit();
+    var snapshot = world.view();
+    var projection = (try runtime.project(std.testing.allocator, &snapshot, output)).?;
+    defer projection.deinit();
+    try std.testing.expect(projection.items.items[0].overlay);
+    try std.testing.expectEqual(@as(u32, 3), projection.items.items[0].width);
 }

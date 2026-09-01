@@ -23,6 +23,7 @@
 #include "core/SkImage.h"
 #include "core/SkImageInfo.h"
 #include "core/SkPaint.h"
+#include "core/SkPath.h"
 #include "core/SkSamplingOptions.h"
 #include "core/SkSurface.h"
 #include "gpu/ganesh/GrBackendSurface.h"
@@ -254,6 +255,23 @@ extern "C" void whirlpool_skia_draw_rect(WhirlpoolSkia *renderer,
         renderer->canvas->drawRoundRect(rect, radius, radius, paint);
     else
         renderer->canvas->drawRect(rect, paint);
+}
+
+extern "C" void whirlpool_skia_draw_polygon(WhirlpoolSkia *renderer,
+                                               const float *points, size_t point_count,
+                                               float r, float g, float b, float a) {
+    constexpr size_t kMaxPolygonPoints = 16;
+    if (!renderer || !renderer->canvas || !points ||
+        point_count < 3 || point_count > kMaxPolygonPoints) return;
+    SkPoint vertices[kMaxPolygonPoints];
+    for (size_t index = 0; index < point_count; ++index)
+        vertices[index] = SkPoint::Make(points[index * 2], points[index * 2 + 1]);
+    const SkPath path = SkPath::Polygon(
+        SkSpan<const SkPoint>(vertices, point_count), true);
+    SkPaint paint;
+    paint.setAntiAlias(true);
+    paint.setColor4f(SkColor4f{r, g, b, a}, nullptr);
+    renderer->canvas->drawPath(path, paint);
 }
 
 extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *text,

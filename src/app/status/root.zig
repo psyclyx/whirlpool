@@ -6,20 +6,23 @@
 
 const std = @import("std");
 
-pub const history_len = 15;
+pub const cpu_history_len = 15;
+pub const network_history_len = 16;
+pub const network_sample_period_ms = 500;
 
 pub const Snapshot = struct {
     time: [5]u8 = "--:--".*,
     dow: [3]u8 = "---".*,
     date: [10]u8 = "----------".*,
     cpu_percent: u8 = 0,
-    cpu_history: [history_len]f64 = [_]f64{0} ** history_len,
+    cpu_history: [cpu_history_len]f64 = [_]f64{0} ** cpu_history_len,
     memory_percent: u8 = 0,
     disk_percent: u8 = 0,
     network_rx: f64 = 0,
     network_tx: f64 = 0,
-    network_rx_history: [history_len]f64 = [_]f64{0} ** history_len,
-    network_tx_history: [history_len]f64 = [_]f64{0} ** history_len,
+    network_rx_history: [network_history_len]f64 = [_]f64{0} ** network_history_len,
+    network_tx_history: [network_history_len]f64 = [_]f64{0} ** network_history_len,
+    network_sample_sequence: u64 = 0,
     audio_percent: u8 = 0,
     audio_muted: bool = false,
     audio_visible: bool = false,
@@ -129,7 +132,7 @@ pub const Service = struct {
             previous = current;
             self.lock();
             self.snapshot.cpu_percent = percent;
-            pushHistory(&self.snapshot.cpu_history, @as(f64, @floatFromInt(percent)) / 100.0);
+            pushBoundedHistory(cpu_history_len, &self.snapshot.cpu_history, @as(f64, @floatFromInt(percent)) / 100.0);
             self.publish();
             try std.Io.sleep(self.io, .fromSeconds(2), .awake);
         }
@@ -165,6 +168,7 @@ pub const Service = struct {
 
     fn networkLoop(self: *Service) std.Io.Cancelable!void {
         var previous: ?NetworkSample = null;
+        var previous_at: ?std.Io.Timestamp = null;
         var interface_buffer: [64]u8 = undefined;
         var interface: ?[]const u8 = null;
         while (true) {
@@ -176,23 +180,30 @@ pub const Service = struct {
                 if (err == error.Canceled) return error.Canceled;
                 break :blk null;
             } else null;
+            const sample = current orelse {
+                try std.Io.sleep(self.io, .fromMilliseconds(network_sample_period_ms), .awake);
+                continue;
+            };
             var rx: f64 = 0;
             var tx: f64 = 0;
-            if (current) |sample| {
-                if (previous) |old| {
-                    rx = @floatFromInt(sample.rx -| old.rx);
-                    tx = @floatFromInt(sample.tx -| old.tx);
-                }
-                previous = sample;
+            const now = std.Io.Clock.awake.now(self.io);
+            if (previous) |old| {
+                const elapsed_ns = (previous_at orelse now).durationTo(now).nanoseconds;
+                const elapsed_seconds = @as(f64, @floatFromInt(@max(elapsed_ns, 1))) / std.time.ns_per_s;
+                rx = @as(f64, @floatFromInt(sample.rx -| old.rx)) / elapsed_seconds;
+                tx = @as(f64, @floatFromInt(sample.tx -| old.tx)) / elapsed_seconds;
             }
-            const peak = @max(128.0 * 1024.0, @max(rx, tx));
+            previous = sample;
+            previous_at = now;
             self.lock();
             self.snapshot.network_rx = rx;
             self.snapshot.network_tx = tx;
-            pushHistory(&self.snapshot.network_rx_history, rx / peak);
-            pushHistory(&self.snapshot.network_tx_history, tx / peak);
+            pushRawHistory(&self.snapshot.network_rx_history, rx);
+            pushRawHistory(&self.snapshot.network_tx_history, tx);
+            self.snapshot.network_sample_sequence +|= 1;
+            if (self.snapshot.network_sample_sequence == 0) self.snapshot.network_sample_sequence = 1;
             self.publish();
-            try std.Io.sleep(self.io, .fromSeconds(1), .awake);
+            try std.Io.sleep(self.io, .fromMilliseconds(network_sample_period_ms), .awake);
         }
     }
 
@@ -288,7 +299,7 @@ pub const Service = struct {
 
     fn pollBattery(self: *Service) !BatterySample {
         const output = try self.command(&.{
-            "sh", "-c",
+            "sh",                                                                                                                                                                                                   "-c",
             "for p in /sys/class/power_supply/*; do [ \"$(cat \"$p/type\" 2>/dev/null)\" = Battery ] || continue; printf '%s|' \"$(cat \"$p/capacity\" 2>/dev/null)\"; cat \"$p/status\" 2>/dev/null; break; done",
         });
         defer self.allocator.free(output);
@@ -399,15 +410,26 @@ fn readNetwork(io: std.Io, interface: []const u8) !?NetworkSample {
     return null;
 }
 
-fn pushHistory(history: *[history_len]f64, value: f64) void {
-    std.mem.copyForwards(f64, history[0 .. history_len - 1], history[1..]);
-    history[history_len - 1] = @min(1.0, @max(0.0, value));
+fn pushBoundedHistory(comptime len: usize, history: *[len]f64, value: f64) void {
+    std.mem.copyForwards(f64, history[0 .. len - 1], history[1..]);
+    history[len - 1] = @min(1.0, @max(0.0, value));
+}
+
+fn pushRawHistory(history: *[network_history_len]f64, value: f64) void {
+    std.mem.copyForwards(f64, history[0 .. network_history_len - 1], history[1..]);
+    history[network_history_len - 1] = if (std.math.isFinite(value)) @max(0, value) else 0;
 }
 
 test "history retains the latest bounded samples" {
-    var history = [_]f64{0} ** history_len;
-    pushHistory(&history, 0.25);
-    pushHistory(&history, 2.0);
-    try std.testing.expectEqual(@as(f64, 0.25), history[history_len - 2]);
-    try std.testing.expectEqual(@as(f64, 1.0), history[history_len - 1]);
+    var history = [_]f64{0} ** cpu_history_len;
+    pushBoundedHistory(cpu_history_len, &history, 0.25);
+    pushBoundedHistory(cpu_history_len, &history, 2.0);
+    try std.testing.expectEqual(@as(f64, 0.25), history[cpu_history_len - 2]);
+    try std.testing.expectEqual(@as(f64, 1.0), history[cpu_history_len - 1]);
+}
+
+test "network history retains raw rates for drawing policy" {
+    var history = [_]f64{0} ** network_history_len;
+    pushRawHistory(&history, 256 * 1024);
+    try std.testing.expectEqual(@as(f64, 256 * 1024), history[network_history_len - 1]);
 }

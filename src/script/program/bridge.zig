@@ -375,6 +375,7 @@ const bootstrap_source =
     "  function node:stack(p) return child('stack', p) end\n" ++
     "  function node:spacer(p) return child('spacer', p) end\n" ++
     "  function node:shape(p) return child('shape', p) end\n" ++
+    "  function node:polygon(p) return child('polygon', p) end\n" ++
     "  function node:text(p) return child('text', p) end\n" ++
     "  function node:icon(p) return child('icon', p) end\n" ++
     "  if properties then for key, value in pairs(properties) do whirlpool_native_set(id, key, value) end end\n" ++

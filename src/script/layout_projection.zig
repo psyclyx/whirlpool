@@ -33,6 +33,7 @@ pub const Item = struct {
     window: ?wm.WindowId = null,
     focused: bool = false,
     width: u32 = 1,
+    overlay: bool = false,
     action: Label = .{},
     args: [max_action_args]Label = [_]Label{.{}} ** max_action_args,
     arg_count: u8 = 0,

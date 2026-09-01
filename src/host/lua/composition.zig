@@ -1,6 +1,6 @@
 //! Host composition of an installed Lua retained program.
 //!
-//! Lua emits only script-level node ids, kinds, and scalar property values.
+//! Lua emits only script-level node ids, kinds, and bounded property values.
 //! This adapter owns the translation to UI mount/node handles, snapshots the
 //! complete retained tree, and lowers those snapshots through skia_scene.
 //! No Wayland, Vulkan, Skia native pointer, or WM object enters this module.
@@ -197,6 +197,7 @@ pub const Composition = struct {
             .stack => .stack,
             .spacer => .spacer,
             .shape => .shape,
+            .polygon => .polygon,
             .text => .text,
             .icon => .icon,
         };
@@ -258,6 +259,35 @@ test "composition mounts an equivalent Lua retained program and lowers a complet
     try std.testing.expectEqual(@as(usize, 4), frame.node_count);
     try std.testing.expectEqual(@as(usize, 2), frame.operationCount());
     try std.testing.expectEqualStrings("hello", frame.drawList().ops[0].text.text);
+}
+
+test "Lua defines arbitrary filled polygons through the retained contract" {
+    var vm = try lua_program.Vm.init(true);
+    defer vm.deinit();
+
+    const modules = [_]lua_program.Module{.{
+        .name = "main",
+        .source =
+        \\return function(parent)
+        \\  parent:polygon({
+        \\    width = 40, height = 20, fill = { 1, 0.5, 0, 1 },
+        \\    points = { { 0.25, 0 }, { 1.25, 0 }, { 1, 1 }, { 0, 1 } },
+        \\  })
+        \\end
+        ,
+    }};
+    var loader = lua_program.Loader.init(std.testing.allocator, .{});
+    var program = try loader.load("main", &modules);
+    defer program.deinit();
+    var composition = try Composition.mount(std.testing.allocator, &vm, &program, .{});
+    defer composition.deinit();
+
+    var frame = try composition.snapshotAndLower(.{ .width = 80, .height = 20 });
+    defer frame.deinit();
+    const polygon = frame.drawList().ops[0].polygon;
+    try std.testing.expectEqual(@as(u8, 4), polygon.points.len);
+    try std.testing.expectEqual(@as(f32, 10), polygon.points.points[0].x);
+    try std.testing.expectEqual(@as(f32, 50), polygon.points.points[1].x);
 }
 
 test "named service updates mutate the retained Lua controller" {

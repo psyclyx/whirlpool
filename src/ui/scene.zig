@@ -83,6 +83,10 @@ pub const SceneDelta = struct {
         try self.set(node, .{ .radius = value });
     }
 
+    pub fn setPoints(self: *SceneDelta, node: tree.NodeHandle, value: tree.Polygon) !void {
+        try self.set(node, .{ .points = value });
+    }
+
     pub fn setText(self: *SceneDelta, node: tree.NodeHandle, value: []const u8) !void {
         try self.set(node, .{ .text = value });
     }
@@ -107,7 +111,7 @@ pub const SceneDelta = struct {
         try self.set(node, .{ .clip = value });
     }
 
-    pub fn setOffsetX(self: *SceneDelta, node: tree.NodeHandle, value: i32) !void {
+    pub fn setOffsetX(self: *SceneDelta, node: tree.NodeHandle, value: f32) !void {
         try self.set(node, .{ .offset_x = value });
     }
 

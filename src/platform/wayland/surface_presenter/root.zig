@@ -137,6 +137,7 @@ pub const Presenter = struct {
     changed: std.Io.Condition = .init,
     thread: ?std.Thread = null,
     pending: ?OwnedUpdate = null,
+    frame_ms: ?f64 = null,
     render_requested: bool = false,
     worker_active: bool = false,
     closing: bool = false,
@@ -233,6 +234,21 @@ pub const Presenter = struct {
         if (replaced) |*old| old.deinit();
     }
 
+    /// Coalesce a host-clock frame request independently from named service
+    /// updates so acquisition and drawing cadence cannot overwrite each other.
+    pub fn requestFrame(self: *Presenter, monotonic_ms: f64) !void {
+        if (!std.math.isFinite(monotonic_ms) or monotonic_ms < 0) return error.InvalidFrameTime;
+        self.lock();
+        if (self.closing) {
+            self.unlock();
+            return error.PresenterClosing;
+        }
+        self.frame_ms = monotonic_ms;
+        self.render_requested = true;
+        self.changed.signal(self.io);
+        self.unlock();
+    }
+
     /// Adopt one completed DMA-BUF on the Wayland thread without waiting for
     /// Lua, Skia, Vulkan, or compositor release work.
     pub fn present(self: *Presenter) !bool {
@@ -305,13 +321,15 @@ pub const Presenter = struct {
             }
             var request = self.pending;
             self.pending = null;
+            const frame_ms = self.frame_ms;
+            self.frame_ms = null;
             self.render_requested = false;
             const index = self.freeSlot() orelse unreachable;
             self.slots[index].state = .rendering;
             self.worker_active = true;
             self.unlock();
 
-            const rendered = self.render(&renderer, index, if (request) |*owned| owned.value else null);
+            const rendered = self.render(&renderer, index, if (request) |*owned| owned.value else null, frame_ms);
             if (request) |*owned| owned.deinit();
 
             self.lock();
@@ -339,8 +357,13 @@ pub const Presenter = struct {
         renderer: *graphics.skia.GpuRenderer,
         index: usize,
         update_value: ?script.program_loader.Update,
+        frame_ms: ?f64,
     ) !void {
         if (update_value) |service_update| try self.composition.update(service_update);
+        if (frame_ms) |now| {
+            const values = [_]script.program_loader.Value{.{ .number = now }};
+            try self.composition.update(.{ .service = "frame", .values = &values });
+        }
         var frame = try self.composition.snapshotAndLower(.{
             .width = self.width,
             .height = self.height,

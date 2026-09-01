@@ -992,19 +992,19 @@ local function mark_badges()
   end
   return nodes, windows, strips
 end
-local function append_item(items, style, text, focused, detail, window, width, action)
+local function append_item(items, style, text, focused, detail, window, width, action, overlay)
   items[#items + 1] = {
     style = style, text = text or "", focused = focused == true,
     detail = detail or "", window = window, width = width, action = action,
     args = action and window and { tostring(window) } or nil,
+    overlay = overlay == true,
   }
 end
 local function append_open(items, label, selected, mark)
-  local text = "( " .. label .. (mark and mark ~= "" and " " .. mark or "")
-  append_item(items, "group", text, selected, "", nil, math.max(46, 24 + #text * 9))
+  append_item(items, "group-open", label, selected, mark, nil, 3, nil, true)
 end
 local function append_close(items)
-  append_item(items, "group", ")", false, "", nil, 18)
+  append_item(items, "group-close", "", false, "", nil, 3, nil, true)
 end
 local function project_node(items, id, focus, node_marks, window_marks)
   local current = node(id)
@@ -1039,12 +1039,12 @@ local function project(snapshot)
     for _, slot in ipairs(strip.roots) do
       project_node(items, slot.node, focus, node_marks, window_marks)
       if strip == state.current and focused_root and slot.node == focused_root.id then
-        append_item(items, "insertion", "+", false, "", nil, 18)
+        append_item(items, "insertion", "", false, "", nil, 3, nil, true)
         inserted = true
       end
     end
     if strip == state.current and not inserted then
-      append_item(items, "insertion", "+", false, "", nil, 18)
+      append_item(items, "insertion", "", false, "", nil, 3, nil, true)
     end
     append_close(items)
   end

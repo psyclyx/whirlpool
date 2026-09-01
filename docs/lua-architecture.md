@@ -54,6 +54,12 @@ tag, changing a window's protocol state, or assigning a window to a tag and
 output. Presentation has one logical `focused` item whether that item is a leaf
 or group; it has no second selection model.
 
+Projected presentation items may be ordinary flow items or zero-advance
+overlays anchored at a flow boundary. The sample uses that generic distinction
+for group and insertion lines, so moving a structural marker cannot change
+window-item geometry. The host also reports exact leading and trailing clipped
+pixel counts; Lua decides how those amounts become edge fades.
+
 Time-dependent layouts use the same boundary. Zig adds a monotonic timestamp
 to the snapshot and honors the plan's `needs_frame` flag at River's next safe
 transaction edge. Lua retains motion state and chooses duration, easing,
@@ -74,7 +80,17 @@ Widget policy remains in Lua. `whirlpool.shell` composes the retained bar and
 OSD, `whirlpool.decorator` owns title/tab presentation, `whirlpool.status`
 polls portable operating-system status sources, and `whirlpool.theme` is the
 shared color vocabulary. None of those modules owns a Wayland proxy or River
-transaction.
+transaction. The retained vocabulary includes a generic filled polygon whose
+vertices are normalized to its layout box. Lua composes that primitive with
+stacks and clipping to define the sample's angled motif; Whirlpool has no
+slant, powerline section, or bar-specific drawing policy.
+
+Surface roles receive a monotonic `frame` service independently from status
+acquisition. Status producers retain raw sampled measurements at their own
+cadence, while Lua chooses interpolation, normalization, zoom, and graph
+geometry on frame updates. In particular, the sample's network history is raw
+bytes per second; the paired center-out graph and its smooth scrolling are
+ordinary Lua drawing policy.
 
 ## Surfaces
 
@@ -112,9 +128,12 @@ such as launchers can use `zwlr_layer_shell_v1` normally.
 ## Drawing
 
 Retained Lua/UI trees are lowered to a small Skia draw list containing scalar
-rectangles and text. A role worker asks Skia Ganesh to render that list directly
-into an imported Vulkan image. This keeps scene and text behavior independent
-of DMA-BUF, Vulkan, and Wayland resource ownership without a CPU pixel copy.
+rectangles, bounded polygons, text, and icons. Polygon points are box-relative
+and may extend outside `0..1`; layout remains rectangular while an ancestor's
+ordinary clip property controls overflow. A role worker asks Skia Ganesh to
+render that list directly into an imported Vulkan image. This keeps scene and
+text behavior independent of DMA-BUF, Vulkan, and Wayland resource ownership
+without a CPU pixel copy.
 
 ## Vulkan and Wayland
 

@@ -52,6 +52,10 @@ pub const Runtime = struct {
         try self.presenter.update(update_value);
     }
 
+    pub fn frame(self: *Runtime, monotonic_ms: f64) !void {
+        try self.presenter.requestFrame(monotonic_ms);
+    }
+
     pub fn setWake(self: *Runtime, wake: surface_presenter.Wake) void {
         self.presenter.setWake(wake);
     }

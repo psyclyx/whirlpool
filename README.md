@@ -84,6 +84,8 @@ a bottom bar with workspace, minimap, focused-window, system-status, and clock
 widgets, an audio OSD, and title/tab decorations. The same retained shell
 content is used by River's integrated shell role and the portable layer-shell
 adapter; River additionally supplies live desktop state and bar interaction.
+Its angled Shoal motif is defined in that Lua content using Whirlpool's generic
+box-relative polygon node, rather than being a native bar or slant feature.
 
 The sample layout has one logical focus, normally a leaf window. `Alt+g` focuses
 its parent (repeat to walk outward), while `Alt+Shift+g` walks back toward the

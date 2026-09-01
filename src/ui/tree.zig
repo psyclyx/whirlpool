@@ -11,6 +11,8 @@ const MountHandle = arena.Handle(.mount);
 pub const NodeKind = properties.NodeKind;
 pub const Edges = properties.Edges;
 pub const Color = properties.Color;
+pub const Point = properties.Point;
+pub const Polygon = properties.Polygon;
 pub const DirtyFlags = properties.DirtyFlags;
 pub const NodeProperties = properties.Snapshot;
 
@@ -597,6 +599,12 @@ pub const MountContext = struct {
         const node = self.scene.lookupNodeMut(handle) orelse unreachable;
         node.properties.fill = fill;
         return handle;
+    }
+
+    /// Create an empty polygon node. Vertices are supplied transactionally
+    /// through the same property API as every other retained value.
+    pub fn polygon(self: *MountContext, parent: ?NodeHandle) !NodeHandle {
+        return self.create(.polygon, parent);
     }
 
     /// Create a text node with owned UTF-8 bytes.

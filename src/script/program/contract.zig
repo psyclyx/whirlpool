@@ -29,6 +29,7 @@ pub const NodeKind = enum {
     stack,
     spacer,
     shape,
+    polygon,
     text,
     icon,
 };
