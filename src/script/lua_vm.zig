@@ -387,6 +387,10 @@ pub const Vm = struct {
         self.api.push_number(self.state, value);
     }
 
+    pub fn pushBoolean(self: *Vm, value: bool) void {
+        self.api.push_boolean(self.state, @intFromBool(value));
+    }
+
     pub fn pushString(self: *Vm, value: []const u8) void {
         _ = self.api.push_lstring_value(self.state, value.ptr, value.len);
     }

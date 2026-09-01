@@ -49,15 +49,25 @@ pub fn translateManage(
 ) !OwnedManagePlan {
     var result = OwnedManagePlan{ .allocator = allocator };
     errdefer result.deinit();
-    try result.operations.ensureTotalCapacity(allocator, plan.dimensionSlice().len);
+    try result.operations.ensureTotalCapacity(allocator, plan.dimensionSlice().len * 2);
     for (plan.dimensionSlice()) |dimension| {
-        try result.operations.append(allocator, .{ .propose_dimensions = .{
-            .window = try resolver.window(resolver.context, dimension.window),
+        const window = try resolver.window(resolver.context, dimension.window);
+        if (dimension.size) |size| try result.operations.append(allocator, .{ .propose_dimensions = .{
+            .window = window,
             .size = .{
-                .width = try signedDimension(dimension.size.width),
-                .height = try signedDimension(dimension.size.height),
+                .width = try signedDimension(size.width),
+                .height = try signedDimension(size.height),
             },
         } });
+        switch (dimension.placement) {
+            .unplaced, .scratchpad => {},
+            .tiled => try result.operations.append(allocator, .{ .set_tiled = .{ .window = window, .edges = 0xf } }),
+            .floating => try result.operations.append(allocator, .{ .set_tiled = .{ .window = window, .edges = 0 } }),
+            .fullscreen => try result.operations.append(allocator, .{ .fullscreen = .{
+                .window = window,
+                .output = try resolver.output(resolver.context, plan.context.output),
+            } }),
+        }
     }
     return result;
 }
@@ -69,7 +79,7 @@ pub fn translateRender(
 ) !OwnedRenderPlan {
     var result = OwnedRenderPlan{ .allocator = allocator };
     errdefer result.deinit();
-    try result.operations.ensureTotalCapacity(allocator, plan.entrySlice().len * 4);
+    try result.operations.ensureTotalCapacity(allocator, plan.entrySlice().len * 6);
     for (plan.entrySlice()) |entry| {
         const window = try resolver.window(resolver.context, entry.window);
         const node = try resolver.node(resolver.context, entry.window);
@@ -97,6 +107,37 @@ pub fn translateRender(
             else
                 try box(entry.clip),
         } });
+        if (entry.border) |border| try result.operations.append(allocator, .{ .set_borders = .{
+            .window = window,
+            .edges = border.edges,
+            .width = border.width,
+            .rgba = border.rgba,
+        } });
+    }
+    const entries = plan.entrySlice();
+    if (entries.len != 0) {
+        const order = try allocator.alloc(usize, entries.len);
+        defer allocator.free(order);
+        for (order, 0..) |*index, value| index.* = value;
+        // Layouts provide a total numeric stacking key. Preserve provider
+        // order for equal keys so the lowering is deterministic.
+        for (1..order.len) |index| {
+            const wanted = order[index];
+            var cursor = index;
+            while (cursor > 0 and entries[order[cursor - 1]].z_index > entries[wanted].z_index) : (cursor -= 1) {
+                order[cursor] = order[cursor - 1];
+            }
+            order[cursor] = wanted;
+        }
+        var previous: ?types.NodeId = null;
+        for (order) |index| {
+            const current = try resolver.node(resolver.context, entries[index].window);
+            try result.operations.append(allocator, if (previous) |lower|
+                .{ .place_above = .{ .node = current, .other = lower } }
+            else
+                .{ .place_bottom = current });
+            previous = current;
+        }
     }
     return result;
 }
@@ -136,15 +177,12 @@ test "plan translation requires explicit identity resolution and preserves owner
             .allocator = allocator,
             .epoch = 4,
             .output = wm.OutputId.init(1, 1),
-            .camera = .{ .tag = wm.TagId.init(1, 1), .current = 0, .target = 0, .strip_width = 100 },
         },
     };
     defer plan.deinit();
     try plan.dimensions.append(allocator, .{
         .window = wm.WindowId.init(3, 2),
-        .column = wm.ColumnId.init(1, 1),
         .size = .{ .width = 800, .height = 600 },
-        .virtual = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
     });
 
     const resolver = Resolver{ .window = FixtureResolver.window, .output = FixtureResolver.output, .node = FixtureResolver.node };
@@ -161,15 +199,11 @@ test "render translation maps screen geometry and rejects overflow" {
             .allocator = allocator,
             .epoch = 1,
             .output = wm.OutputId.init(1, 1),
-            .camera = .{ .tag = wm.TagId.init(1, 1), .current = 0, .target = 0, .strip_width = 1 },
         },
     };
     defer plan.deinit();
     try plan.entries.append(allocator, .{
         .window = wm.WindowId.init(2, 1),
-        .column = wm.ColumnId.init(1, 1),
-        .placement = .tiled,
-        .target_virtual = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
         .screen = .{ .x = 4, .y = 8, .width = 10, .height = 10 },
         .clip = .{ .x = 4, .y = 8, .width = 10, .height = 10 },
         .visible = true,
@@ -177,7 +211,7 @@ test "render translation maps screen geometry and rejects overflow" {
     const resolver = Resolver{ .window = FixtureResolver.window, .output = FixtureResolver.output, .node = FixtureResolver.node };
     var translated = try translateRender(allocator, &plan, resolver);
     defer translated.deinit();
-    try std.testing.expectEqual(@as(usize, 4), translated.operations.items.len);
+    try std.testing.expectEqual(@as(usize, 5), translated.operations.items.len);
     try std.testing.expectEqual(@as(i32, 4), translated.operations.items[1].set_position.position.x);
     try std.testing.expectEqual(@as(i32, 0), translated.operations.items[2].set_clip_box.box.width);
     try std.testing.expectEqual(@as(i32, 0), translated.operations.items[2].set_clip_box.box.height);
@@ -192,15 +226,11 @@ test "whole-window clipping preserves chrome geometry instead of shrinking conte
             .allocator = allocator,
             .epoch = 1,
             .output = wm.OutputId.init(1, 1),
-            .camera = .{ .tag = wm.TagId.init(1, 1), .current = 0, .target = 0, .strip_width = 1 },
         },
     };
     defer plan.deinit();
     try plan.entries.append(allocator, .{
         .window = wm.WindowId.init(2, 1),
-        .column = wm.ColumnId.init(1, 1),
-        .placement = .tiled,
-        .target_virtual = .{ .x = 0, .y = 0, .width = 100, .height = 80 },
         .screen = .{ .x = 4, .y = 32, .width = 100, .height = 80 },
         .clip = .{ .x = 0, .y = 0, .width = 100, .height = 80 },
         .window_clip = .{ .x = -4, .y = -32, .width = 108, .height = 116 },
@@ -213,4 +243,29 @@ test "whole-window clipping preserves chrome geometry instead of shrinking conte
     try std.testing.expectEqual(@as(i32, -32), translated.operations.items[2].set_clip_box.box.y);
     try std.testing.expectEqual(@as(i32, 108), translated.operations.items[2].set_clip_box.box.width);
     try std.testing.expectEqual(@as(i32, 0), translated.operations.items[3].set_content_clip_box.box.width);
+}
+
+test "render translation applies the provider's stacking order" {
+    const allocator = std.testing.allocator;
+    var plan = wm.RenderPlan{ .context = .{
+        .allocator = allocator,
+        .epoch = 1,
+        .output = wm.OutputId.init(1, 1),
+    } };
+    defer plan.deinit();
+    for ([_]struct { window: wm.WindowId, z: i32 }{
+        .{ .window = wm.WindowId.init(2, 1), .z = 20 },
+        .{ .window = wm.WindowId.init(3, 1), .z = 10 },
+    }) |entry| try plan.entries.append(allocator, .{
+        .window = entry.window,
+        .screen = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .clip = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .visible = true,
+        .z_index = entry.z,
+    });
+    const resolver = Resolver{ .window = FixtureResolver.window, .output = FixtureResolver.output, .node = FixtureResolver.node };
+    var translated = try translateRender(allocator, &plan, resolver);
+    defer translated.deinit();
+    try std.testing.expectEqual(types.NodeId.init(wm.WindowId.init(3, 1).raw()), translated.operations.items[8].place_bottom);
+    try std.testing.expectEqual(types.NodeId.init(wm.WindowId.init(2, 1).raw()), translated.operations.items[9].place_above.node);
 }

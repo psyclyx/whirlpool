@@ -30,6 +30,7 @@ pub fn run(self: anytype, facts: []const types.ManageFact) !void {
     try removeRetiredOutputs(self);
     try moveWindowsToPreferredOutputs(self);
     try materializeWindows(self);
+    try syncWindowMetadata(self);
     try syncWindowSizing(self);
     try applyWindowPolicy(self);
     if (focus) |window| if (self.objects.windows.get(window)) |record| {
@@ -44,7 +45,7 @@ fn destroyClosedWindows(self: anytype) !void {
     while (iterator.next()) |entry| {
         if (!entry.value_ptr.closed) continue;
         if (entry.value_ptr.wm_id) |id| {
-            try destroyWindowAndEmptyColumn(self, id);
+            try destroyWindow(self, id);
             std.debug.assert(self.objects.wm_to_window.remove(id));
             entry.value_ptr.wm_id = null;
         }
@@ -117,17 +118,13 @@ fn removeRetiredOutputs(self: anytype) !void {
                 const window_id = entry.wm_id orelse continue;
                 const value = self.world.getWindow(window_id) orelse return error.UnknownWindow;
                 if (value.output != removed_output) continue;
-                try destroyWindowAndEmptyColumn(self, window_id);
+                try destroyWindow(self, window_id);
                 std.debug.assert(self.objects.wm_to_window.remove(window_id));
                 entry.wm_id = null;
             }
             _ = try self.world.applyAtomically(&.{.{ .output = .{ .remove = removed_output } }});
             std.debug.assert(self.objects.wm_to_output.remove(removed_output));
             if (record.owns_tag) if (record.tag) |tag| {
-                while (self.world.tagColumns(tag)) |columns| {
-                    if (columns.len == 0) break;
-                    _ = try self.world.applyAtomically(&.{.{ .tree = .{ .remove_column = columns[0] } }});
-                }
                 _ = try self.world.applyAtomically(&.{.{ .tag = .{ .remove = tag } }});
             };
         }
@@ -144,11 +141,15 @@ fn materializeWindows(self: anytype) !void {
         const output_record = self.objects.outputs.get(destination).?;
         const output_value = self.world.getOutput(output_record.wm_id.?) orelse return error.UnknownOutput;
         const active_tag = output_value.active_tag;
-        const placement = entry.requested_placement orelse defaultPlacement(self, entry);
+        // New-window grouping and floating heuristics belong to the retained
+        // Lua controller. Native reconciliation only establishes a neutral
+        // managed window record from compositor facts.
+        const placement = entry.requested_placement orelse .unplaced;
         const floating_geometry = initialFloatingGeometry(entry, output_value.usable);
         const result = try wm.lifecycle.applyEvent(&self.world, .{ .window_announced = .{
             .tag = active_tag,
             .output = output_record.wm_id.?,
+            .transient = entry.parent != null,
             .placement = placement,
             .floating_geometry = floating_geometry,
             .size_hints = entry.dimensions_hint,
@@ -156,20 +157,25 @@ fn materializeWindows(self: anytype) !void {
             .proposed_size = wmSize(entry.last_proposed_size),
         } });
         const window_id = result.announced_window.?;
-        const tag = self.world.getTag(active_tag) orelse return error.UnknownTag;
-        const focused_column = if (tag.focused) |node|
-            (self.world.getNode(node) orelse return error.InvalidInvariant).column
-        else
-            null;
-        // Tidepool's scrolling policy gives every newly tiled window its own
-        // 50% column immediately after the focused column. Structural absorb
-        // actions are what intentionally combine windows later.
-        const column = try self.world.createColumnAfter(active_tag, focused_column, .{ .width = 0.5 });
-        _ = try wm.lifecycle.applyEvent(&self.world, .{ .window_managed = .{ .window = window_id, .column = column } });
+        _ = try wm.lifecycle.applyEvent(&self.world, .{ .window_managed = window_id });
         _ = try self.world.applyAtomically(&.{.{ .focus = .{ .window = window_id } }});
         entry.wm_id = window_id;
         entry.requested_placement = null;
         try self.objects.wm_to_window.put(window_id, window);
+    }
+}
+
+fn syncWindowMetadata(self: anytype) !void {
+    var iterator = self.objects.windows.iterator();
+    while (iterator.next()) |entry| {
+        const id = entry.value_ptr.wm_id orelse continue;
+        const current = self.world.getWindow(id) orelse return error.UnknownWindow;
+        const transient = entry.value_ptr.parent != null;
+        if (current.transient == transient) continue;
+        _ = try self.world.applyAtomically(&.{.{ .window = .{ .set_transient = .{
+            .window = id,
+            .transient = transient,
+        } } }});
     }
 }
 
@@ -208,24 +214,17 @@ fn moveWindowsToPreferredOutputs(self: anytype) !void {
         const window_id = entry.wm_id orelse continue;
         const current = self.world.getWindow(window_id) orelse return error.UnknownWindow;
         if (current.output == destination_wm) continue;
-        try destroyWindowAndEmptyColumn(self, window_id);
-        std.debug.assert(self.objects.wm_to_window.remove(window_id));
-        entry.wm_id = null;
+        const destination_tag = (self.world.getOutput(destination_wm) orelse return error.UnknownOutput).active_tag;
+        _ = try self.world.applyAtomically(&.{.{ .window = .{ .assign = .{
+            .window = window_id,
+            .tag = destination_tag,
+            .output = destination_wm,
+        } } }});
     }
 }
 
-fn destroyWindowAndEmptyColumn(self: anytype, window_id: wm.WindowId) !void {
-    const node_id = self.world.nodeForWindow(window_id) orelse return error.UnknownWindow;
-    const node = self.world.getNode(node_id) orelse return error.InvalidInvariant;
-    const column = self.world.getColumn(node.column) orelse return error.InvalidInvariant;
-    if (column.root == node_id) {
-        _ = try self.world.applyAtomically(&.{
-            .{ .window = .{ .destroy = window_id } },
-            .{ .tree = .{ .remove_column = node.column } },
-        });
-    } else {
-        _ = try self.world.applyAtomically(&.{.{ .window = .{ .destroy = window_id } }});
-    }
+fn destroyWindow(self: anytype, window_id: wm.WindowId) !void {
+    _ = try self.world.applyAtomically(&.{.{ .window = .{ .destroy = window_id } }});
 }
 
 fn applyWindowPolicy(self: anytype) !void {
@@ -240,33 +239,6 @@ fn applyWindowPolicy(self: anytype) !void {
         } } }});
         entry.value_ptr.requested_placement = null;
     }
-}
-
-fn defaultPlacement(self: anytype, record: anytype) wm.Placement {
-    if (record.parent) |parent| if (self.objects.windows.get(parent)) |value|
-        if (!value.closed) return .floating;
-    if (likelyFixedSize(record) or likelyConstrainedDialog(record)) return .floating;
-    return .tiled;
-}
-
-fn likelyFixedSize(record: anytype) bool {
-    if (record.dimensions_hint.fixed() != null) return true;
-    const actual = wmSize(record.actual_size) orelse return false;
-    const minimum = record.dimensions_hint.min;
-    return minimum.width > 0 and minimum.height > 0 and std.meta.eql(minimum, actual);
-}
-
-fn likelyConstrainedDialog(record: anytype) bool {
-    const hints = record.dimensions_hint;
-    if (hints.max.width > 0 and hints.max.height > 0) {
-        if (hints.max.width < 1600 and hints.max.height < 1200) return true;
-        if (hints.min.width > 0 and hints.min.height > 0 and
-            @as(u64, hints.min.width) * 2 >= hints.max.width and
-            @as(u64, hints.min.height) * 2 >= hints.max.height) return true;
-    }
-    const actual = wmSize(record.actual_size) orelse return false;
-    return record.decoration_hint == .only_supports_csd and
-        actual.width < 1200 and actual.height < 900;
 }
 
 fn initialFloatingGeometry(record: anytype, usable: wm.Rect) wm.Rect {

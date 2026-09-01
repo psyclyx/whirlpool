@@ -88,9 +88,8 @@ test "frame composition translates one WM epoch into both River plans" {
         .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
         .usable = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
     });
-    const column = try world.createColumn(tag, .{});
     const window = try world.createWindow(.{ .tag = tag, .output = output });
-    try world.manageWindow(window, column);
+    try world.manageWindow(window);
 
     const resolver = bridge.Resolver{
         .window = FixtureResolver.window,
@@ -98,24 +97,16 @@ test "frame composition translates one WM epoch into both River plans" {
         .node = FixtureResolver.node,
     };
     var snapshot = world.view();
-    const output_value = snapshot.getOutput(output).?;
-    const tag_value = snapshot.getTag(output_value.active_tag).?;
-    const camera: wm.CameraTarget = .{ .tag = tag_value.id, .current = 0, .target = 0, .strip_width = 800 };
     var input: wm.LayoutPlans = .{
-        .manage = .{ .context = .{ .allocator = std.testing.allocator, .epoch = snapshot.epoch(), .output = output, .camera = camera } },
-        .render = .{ .context = .{ .allocator = std.testing.allocator, .epoch = snapshot.epoch(), .output = output, .camera = camera } },
+        .manage = .{ .context = .{ .allocator = std.testing.allocator, .epoch = snapshot.epoch(), .output = output } },
+        .render = .{ .context = .{ .allocator = std.testing.allocator, .epoch = snapshot.epoch(), .output = output } },
     };
     try input.manage.dimensions.append(std.testing.allocator, .{
         .window = window,
-        .column = column,
         .size = .{ .width = 800, .height = 600 },
-        .virtual = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
     });
     try input.render.entries.append(std.testing.allocator, .{
         .window = window,
-        .column = column,
-        .placement = .tiled,
-        .target_virtual = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
         .screen = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
         .clip = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
         .visible = true,
@@ -126,7 +117,7 @@ test "frame composition translates one WM epoch into both River plans" {
     try std.testing.expectEqual(world.epoch(), frame.epoch);
     try std.testing.expectEqual(frame.manage.context.epoch, frame.render.context.epoch);
     try std.testing.expectEqual(frame.manage.dimensionSlice().len, frame.river_manage.operations.items.len);
-    try std.testing.expectEqual(@as(usize, 4), frame.river_render.operations.items.len);
+    try std.testing.expectEqual(@as(usize, 5), frame.river_render.operations.items.len);
 }
 
 test "frame composition rejects mismatched provider epochs" {
@@ -138,18 +129,15 @@ test "frame composition rejects mismatched provider epochs" {
         .bounds = .{ .x = 0, .y = 0, .width = 320, .height = 240 },
         .usable = .{ .x = 0, .y = 0, .width = 320, .height = 240 },
     });
-    _ = try world.createColumn(tag, .{});
     const resolver = bridge.Resolver{
         .window = FixtureResolver.window,
         .output = FixtureResolver.output,
         .node = FixtureResolver.node,
     };
     var snapshot = world.view();
-    const output_value = snapshot.getOutput(output).?;
-    const camera: wm.CameraTarget = .{ .tag = output_value.active_tag, .current = 0, .target = 0, .strip_width = 0 };
     const input: wm.LayoutPlans = .{
-        .manage = .{ .context = .{ .allocator = std.testing.allocator, .epoch = snapshot.epoch(), .output = output, .camera = camera } },
-        .render = .{ .context = .{ .allocator = std.testing.allocator, .epoch = snapshot.epoch() + 1, .output = output, .camera = camera } },
+        .manage = .{ .context = .{ .allocator = std.testing.allocator, .epoch = snapshot.epoch(), .output = output } },
+        .render = .{ .context = .{ .allocator = std.testing.allocator, .epoch = snapshot.epoch() + 1, .output = output } },
     };
     try std.testing.expectError(error.PlanEpochMismatch, translateFrame(std.testing.allocator, input, resolver));
 }

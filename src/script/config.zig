@@ -11,6 +11,7 @@ const binding_config = @import("config/bindings.zig");
 pub const MaxConfigBytes: usize = 256 * 1024;
 pub const MaxBindings = binding_config.MaxBindings;
 pub const MaxArguments = binding_config.MaxArguments;
+pub const default_mode = binding_config.default_mode;
 pub const MaxSurfaces: usize = 64;
 pub const MaxSurfaceSourceBytes: usize = 256 * 1024;
 pub const MaxLayoutSourceBytes: usize = 256 * 1024;
@@ -34,7 +35,6 @@ pub const SurfaceSpec = struct {
     }
 };
 
-pub const TabStep = binding_config.TabStep;
 pub const Action = binding_config.Action;
 pub const Binding = binding_config.Binding;
 

@@ -11,7 +11,7 @@ const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
 const river_presenter_runtime = @import("whirlpool-river-presenter-runtime");
 const status_app = @import("whirlpool-app-status");
 const desktop_icons = @import("whirlpool-app-desktop-icons");
-const window_strip = @import("window_strip.zig");
+const item_flow = @import("item_flow.zig");
 
 /// Owns the optional graphics runtime and its River role callback context.
 pub const Bridge = struct {
@@ -224,11 +224,10 @@ pub const Context = struct {
     graphics: *river_presenter_runtime.Runtime,
     icons: *desktop_icons.Service,
     status: status_app.Snapshot = .{},
-    strip_states: std.AutoHashMapUnmanaged(u64, StripState) = .empty,
+    flow_states: std.AutoHashMapUnmanaged(u64, FlowState) = .empty,
 
-    const StripState = struct {
+    const FlowState = struct {
         offset: u32 = 0,
-        focused: ?wm.WindowId = null,
         focused_x: ?u32 = null,
         viewport_width: u32 = 0,
     };
@@ -241,7 +240,7 @@ pub const Context = struct {
     const right_width_with_battery: u32 = 592;
 
     fn deinit(self: *Context) void {
-        self.strip_states.deinit(self.allocator);
+        self.flow_states.deinit(self.allocator);
     }
 
     pub fn hooks(self: *Context) river_role_lifecycle.Hooks {
@@ -261,16 +260,18 @@ pub const Context = struct {
         const selected = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
         const workspace_width = self.workspaceWidth(world, selected);
         if (x >= @as(f64, @floatFromInt(workspace_width))) {
-            const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
+            const viewport = self.itemViewport(try self.presentationWidth(output_id), workspace_width);
             const right_edge = workspace_width + viewport;
             if (x >= @as(f64, @floatFromInt(right_edge))) return;
-            const focused = world.view().focusedWindow(wm_output);
-            const strip = try self.buildWindowStrip(world, wm_output, output.active_tag, focused);
-            const state = try self.stripState(output_id);
+            const flow = try self.buildItemFlow(wm_output);
+            const state = try self.flowState(output_id);
             const local = x - @as(f64, @floatFromInt(workspace_width)) + @as(f64, @floatFromInt(state.offset));
             if (local < 0 or local > std.math.maxInt(u32)) return;
-            const token = strip.tokenAt(@intFromFloat(local)) orelse return;
-            if (token.window) |window| try self.runtime.queueIntent(.{ .focus_window = window });
+            const item = flow.itemAt(@intFromFloat(local)) orelse return;
+            if (item.action.len == 0) return;
+            var args: [script.layout_projection.max_action_args][]const u8 = undefined;
+            for (item.args[0..item.arg_count], 0..) |arg, index| args[index] = arg.slice();
+            try self.runtime.queueLayoutAction(wm_output, item.action.slice(), args[0..item.arg_count]);
             return;
         }
 
@@ -295,12 +296,12 @@ pub const Context = struct {
         const current = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
         const workspace_width = self.workspaceWidth(world, current);
         if (x >= @as(f64, @floatFromInt(workspace_width))) {
-            const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
+            const viewport = self.itemViewport(try self.presentationWidth(output_id), workspace_width);
             if (x >= @as(f64, @floatFromInt(workspace_width + viewport))) return;
-            const strip = try self.buildWindowStrip(world, wm_output, output.active_tag, world.view().focusedWindow(wm_output));
-            const state = try self.stripState(output_id);
+            const flow = try self.buildItemFlow(wm_output);
+            const state = try self.flowState(output_id);
             const amount: i32 = if (delta > 0) 96 else if (delta < 0) -96 else 0;
-            state.offset = window_strip.pan(state.offset, amount, viewport, strip.content_width);
+            state.offset = item_flow.scroll(state.offset, amount, viewport, flow.content_width);
             return;
         }
         const next = delta > 0;
@@ -309,21 +310,10 @@ pub const Context = struct {
         try self.runtime.queueIntent(.{ .set_active_tag = .{ .output = wm_output, .tag = world.tagAt(target) orelse return } });
     }
 
-    fn buildWindowStrip(self: *Context, world: *const wm.World, output: wm.OutputId, tag: wm.TagId, focused: ?wm.WindowId) !window_strip.Strip {
+    fn buildItemFlow(self: *Context, output: wm.OutputId) !item_flow.Flow {
         var projection = try self.runtime.layoutProjection(self.allocator, output);
         defer if (projection) |*value| value.deinit();
-        var strip = if (projection) |*value|
-            window_strip.fromProjection(value)
-        else
-            window_strip.build(world, tag, focused);
-        for (strip.tokens[0..strip.len]) |*token| if (token.window) |window| {
-            if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
-                const record = try self.runtime.adapter.objects.windowRecord(live_window);
-                token.width = window_strip.widthForAppId(record.app_id);
-            }
-        };
-        strip.reflow();
-        return strip;
+        return if (projection) |*value| item_flow.fromProjection(value) else .{};
     }
 
     pub fn updateShellServices(raw: ?*anyopaque, output_id: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
@@ -336,56 +326,53 @@ pub const Context = struct {
         var occupied_storage: [9]script.program_loader.Value = undefined;
         for (&occupied_storage, 0..) |*item, index| item.* = .{ .boolean = self.tagOccupied(world, world.tagAt(index)) };
 
-        const focused = world.view().focusedWindow(wm_output);
-        const strip = try self.buildWindowStrip(world, wm_output, output.active_tag, focused);
+        const flow = try self.buildItemFlow(wm_output);
 
         const workspace_width = self.workspaceWidth(world, ordinal);
-        const viewport = self.stripViewport(try self.presentationWidth(output_id), workspace_width);
-        const strip_state = try self.stripState(output_id);
-        const focused_x = if (strip.focused_index) |index| strip.tokens[index].x else null;
-        if (strip_state.focused != focused or strip_state.focused_x != focused_x or strip_state.viewport_width != viewport) {
-            strip_state.offset = window_strip.reveal(strip_state.offset, viewport, &strip);
-            strip_state.focused = focused;
-            strip_state.focused_x = focused_x;
-            strip_state.viewport_width = viewport;
+        const viewport = self.itemViewport(try self.presentationWidth(output_id), workspace_width);
+        const flow_state = try self.flowState(output_id);
+        const focused_x = if (flow.focused_index) |index| flow.items[index].x else null;
+        if (flow_state.focused_x != focused_x or flow_state.viewport_width != viewport) {
+            flow_state.offset = item_flow.ensureVisible(flow_state.offset, viewport, &flow);
+            flow_state.focused_x = focused_x;
+            flow_state.viewport_width = viewport;
         } else {
-            strip_state.offset = window_strip.pan(strip_state.offset, 0, viewport, strip.content_width);
+            flow_state.offset = item_flow.scroll(flow_state.offset, 0, viewport, flow.content_width);
         }
 
-        var token_storage: [window_strip.max_tokens][9]script.program_loader.Value = undefined;
-        var tokens: [window_strip.max_tokens]script.program_loader.Value = undefined;
-        for (strip.slice(), 0..) |token, index| {
+        var item_storage: [item_flow.max_items][8]script.program_loader.Value = undefined;
+        var items: [item_flow.max_items]script.program_loader.Value = undefined;
+        for (flow.slice(), 0..) |item, index| {
             var app_id: []const u8 = "";
             var title: []const u8 = "";
             var icon_source: []const u8 = "";
-            if (token.window) |window| if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
+            if (item.window) |window| if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
                 const record = try self.runtime.adapter.objects.windowRecord(live_window);
                 app_id = record.app_id;
                 title = record.title;
                 icon_source = try self.icons.pathFor(app_id);
             };
-            token_storage[index] = .{
-                .{ .number = @floatFromInt(@intFromEnum(token.kind)) },
-                .{ .string = token.labelSlice() },
+            item_storage[index] = .{
+                .{ .string = item.style.slice() },
+                .{ .string = item.text.slice() },
                 .{ .string = app_id },
                 .{ .string = title },
-                .{ .boolean = token.focused },
-                .{ .number = @floatFromInt(token.width) },
+                .{ .boolean = item.focused },
+                .{ .number = @floatFromInt(item.width) },
                 .{ .string = icon_source },
-                .{ .boolean = token.selected },
-                .{ .string = token.mark.slice() },
+                .{ .string = item.detail.slice() },
             };
-            tokens[index] = .{ .array = &token_storage[index] };
+            items[index] = .{ .array = &item_storage[index] };
         }
 
         const values = [_]script.program_loader.Value{
             .{ .number = @floatFromInt(ordinal + 1) },
             .{ .array = &occupied_storage },
-            .{ .array = tokens[0..strip.len] },
-            .{ .number = @floatFromInt(strip_state.offset) },
-            .{ .number = @floatFromInt(strip.content_width) },
-            .{ .boolean = strip_state.offset != 0 },
-            .{ .boolean = strip_state.offset +| viewport < strip.content_width },
+            .{ .array = items[0..flow.len] },
+            .{ .number = @floatFromInt(flow_state.offset) },
+            .{ .number = @floatFromInt(flow.content_width) },
+            .{ .boolean = flow_state.offset != 0 },
+            .{ .boolean = flow_state.offset +| viewport < flow.content_width },
         };
         try self.graphics.update(.{ .shell = shell_id }, .{
             .service = "desktop",
@@ -430,39 +417,14 @@ pub const Context = struct {
         const record = try self.runtime.adapter.objects.windowRecord(window_id);
         const wm_window = record.wm_id orelse return;
         const world = self.runtime.adapter.worldView();
-        const window = world.getWindow(wm_window) orelse return error.UnknownWindow;
-        const is_focused = if (window.output) |output|
-            if (world.view().focusedWindow(output)) |focused| focused == wm_window else false
-        else
-            false;
-        var tab_values: [8]script.program_loader.Value = undefined;
-        var tab_count: usize = 0;
-        var active_tab: usize = 0;
-        if (world.nodeForWindow(wm_window)) |leaf| {
-            var parent = (world.getNode(leaf) orelse return error.UnknownWindow).parent;
-            while (parent) |parent_id| {
-                const node = world.getNode(parent_id) orelse break;
-                if (node.mode == .tabbed) {
-                    active_tab = node.active_child + 1;
-                    for (node.children.items) |child| {
-                        if (tab_count == tab_values.len) break;
-                        const tab_window = activeLeafWindow(world, child.id) orelse continue;
-                        const live_tab = self.runtime.adapter.objects.wm_to_window.get(tab_window) orelse continue;
-                        const tab_record = try self.runtime.adapter.objects.windowRecord(live_tab);
-                        tab_values[tab_count] = .{ .string = tab_record.title };
-                        tab_count += 1;
-                    }
-                    break;
-                }
-                parent = node.parent;
-            }
-        }
+        _ = world.getWindow(wm_window) orelse return error.UnknownWindow;
+        const is_focused = world.focusedWindow() == wm_window;
         const values = [_]script.program_loader.Value{
             .{ .string = record.title },
             .{ .boolean = is_focused },
             .{ .string = record.app_id },
-            .{ .array = tab_values[0..tab_count] },
-            .{ .number = @floatFromInt(active_tab) },
+            .{ .array = &.{} },
+            .{ .number = 0 },
         };
         try self.graphics.update(.{ .decoration = decoration_id }, .{
             .service = "decoration",
@@ -490,7 +452,7 @@ pub const Context = struct {
         return width;
     }
 
-    fn stripViewport(self: *const Context, output_width: u32, workspace_width: u32) u32 {
+    fn itemViewport(self: *const Context, output_width: u32, workspace_width: u32) u32 {
         const right_width: u32 = if (self.status.battery_present) right_width_with_battery else right_width_without_battery;
         return @max(1, output_width -| workspace_width -| right_width);
     }
@@ -501,17 +463,10 @@ pub const Context = struct {
         return @intCast(size.width);
     }
 
-    fn stripState(self: *Context, output: host.types.OutputId) !*StripState {
-        const entry = try self.strip_states.getOrPut(self.allocator, output.value);
+    fn flowState(self: *Context, output: host.types.OutputId) !*FlowState {
+        const entry = try self.flow_states.getOrPut(self.allocator, output.value);
         if (!entry.found_existing) entry.value_ptr.* = .{};
         return entry.value_ptr;
-    }
-
-    fn activeLeafWindow(world: *const wm.World, node_id: wm.NodeId) ?wm.WindowId {
-        const node = world.getNode(node_id) orelse return null;
-        if (node.window) |window| return window;
-        if (node.children.items.len == 0 or node.active_child >= node.children.items.len) return null;
-        return activeLeafWindow(world, node.children.items[node.active_child].id);
     }
 
     fn extent(width: i32, height: i32) !river_presenter_runtime.Extent {
@@ -527,13 +482,17 @@ pub const Context = struct {
     fn decorationExtent(self: *const Context, window: host.types.WindowId) !river_presenter_runtime.Extent {
         const size = (try self.roles.adapter.objects.actualWindowSize(window)) orelse
             return error.WindowGeometryUnavailable;
-        const border_width = self.roles.adapter.windowBorderWidth();
+        const record = try self.runtime.adapter.objects.windowRecord(window);
+        const chrome = if (record.wm_id) |wm_window| self.runtime.windowChrome(wm_window) else null;
+        const border_width = if (chrome) |value| value.border_width else 0;
+        const configured_height = self.graphics.decoration_surface orelse return error.MissingDecorationSurface;
+        const decoration_height = if (chrome) |value| value.decoration_height else std.math.cast(i32, configured_height.height) orelse return error.InvalidExtent;
         const framed_width = try std.math.add(
             i32,
             size.width,
             try std.math.mul(i32, border_width, 2),
         );
-        return extent(framed_width, 28);
+        return extent(framed_width, decoration_height);
     }
 };
 
@@ -557,7 +516,7 @@ fn onShellCreated(raw: ?*anyopaque, output: host.types.OutputId, shell: *wayland
 
 fn onShellRetire(raw: ?*anyopaque, output: host.types.OutputId, shell: host.types.ShellSurfaceId) !river_role_lifecycle.RetirementStatus {
     const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-    _ = self.strip_states.remove(output.value);
+    _ = self.flow_states.remove(output.value);
     return retire(self, .{ .shell = shell });
 }
 

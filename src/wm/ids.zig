@@ -2,9 +2,7 @@
 
 const std = @import("std");
 
-pub const Kind = enum { node, column, tag, output, window };
-pub const NodeId = Id(.node);
-pub const ColumnId = Id(.column);
+pub const Kind = enum { tag, output, window };
 pub const TagId = Id(.tag);
 pub const OutputId = Id(.output);
 pub const WindowId = Id(.window);

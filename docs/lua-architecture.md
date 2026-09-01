@@ -14,37 +14,56 @@ The sample configuration is a supported API example. Unknown fields, actions,
 or invalid action arity fail during loading rather than becoming inert
 configuration.
 
+Bindings may belong to named one-shot modes. Whirlpool only enables the mode's
+physical key bindings and returns to the default mode after one action; Lua
+decides that the sample's modes mean set, focus, summon, send, or clear a
+letter-named mark. The input mechanism has no knowledge of marks or layouts.
+
 Layouts are executable user modules. A module may return a layout function or
-a retained controller with `layout(snapshot, camera)` and
-`action(snapshot, request)` entry points. The host gives the selected module a
-bounded, immutable world snapshot and accepts validated generic geometry and
-identity-based action plans. A controller may also provide
-`project(snapshot)`, a bounded sequence of group/window/insertion tokens used
-by shells to present that exact retained model. Directional and structural
-action names and arguments cross this boundary opaquely; Zig does not assign
-them spatial meaning.
+a retained controller with layout, action, and presentation entry points. The
+host gives the selected module a bounded, immutable, flat snapshot of windows,
+outputs, tags, size constraints, and time. It accepts only validated leaf
+effects and per-window frame plans. The snapshot contains no parent links,
+groups, columns, strips, modes, weights, marks, or camera. Those relationships
+exist only in the controller's retained Lua state.
+
+Configured layout actions cross the binding boundary as an opaque name and
+bounded string arguments. Reparenting, swapping, absorbing, ejecting,
+summoning, marking, and directional traversal are ordinary Lua table
+operations; Zig neither recognizes those verbs nor implements relational
+effects for them. When a Lua operation has a compositor consequence, such as
+closing or moving a focused group, Lua expands the group to its leaf window
+IDs and returns an atomic batch of generic per-window effects.
+Controllers may bracket an action batch with `begin_actions()` and
+`finish_actions(commit)`. The host acknowledges it only after every returned
+leaf effect validates and applies atomically, so retained Lua relationships can
+roll back with a rejected native batch instead of diverging from compositor
+facts.
 
 `config/lib/scrolling.lua` is the sample scrolling policy; it is not an
 installed stdlib algorithm and can be replaced without changing Zig. Its
 strips, main/cross-axis mapping, axis reversal, focus traversal, insertion
-policy, structural selection, marks, and two-dimensional camera state are
-retained Lua data. The bar consumes the controller's projection rather than
-reconstructing a second model from native columns: each strip is a group,
+policy, logical container focus, marks, and two-dimensional camera state are
+retained Lua data. The bar consumes the controller's presentation data rather
+than reconstructing a second model in Zig: each strip is a group,
 floating/fullscreen/scratchpad windows have distinct groups, and an insertion
-token identifies the destination for a new window. Whirlpool has no strip
-identity or strip-aware command. It only validates concrete mechanisms such as
-focusing a window, extracting a subtree, closing leaves, or summoning a known
-subtree intact.
+indicator identifies the destination for a new window. Whirlpool has no strip,
+group, or layout-node identity and no structural command. It validates only
+concrete host mechanisms such as focusing or closing a window, activating a
+tag, changing a window's protocol state, or assigning a window to a tag and
+output. Presentation has one logical `focused` item whether that item is a leaf
+or group; it has no second selection model.
 
 Time-dependent layouts use the same boundary. Zig adds a monotonic timestamp
 to the snapshot and honors the plan's `needs_frame` flag at River's next safe
 transaction edge. Lua retains motion state and chooses duration, easing,
-retargeting, and which geometry changes animate. Client size proposals remain
-final layout targets because Wayland clients may apply resizes asynchronously.
-Layouts may additionally provide an optional whole-window clip relative to a
-window's content origin. This lets a provider include its own title and border
-extents so partially off-screen chrome is clipped away at its true geometry
-instead of redrawing a shrinking border around content.
+retargeting, and which geometry changes animate. Each snapshot reports both
+requested and actual client sizes plus size hints. Lua therefore computes
+shared constraints from what clients actually occupy instead of assuming a
+resize request succeeded. A frame entry may also provide a whole-window clip
+relative to the content origin. This lets the controller keep border geometry
+fixed while partially off-screen chrome shrinks through clipping and finally
+disappears.
 
 Workspace actions are likewise an ordinary Lua convention.
 `whirlpool.workspace` constructs semantic action values without exposing
@@ -76,8 +95,10 @@ layer-shell role deliberately has no compositor-specific WM authority.
 ## River host
 
 The River adapter owns generated River proxies and translates compositor facts
-into the renderer-neutral WM model. Policy produces typed intents; the host
-applies those intents only at River's transaction boundaries.
+into the flat renderer-neutral WM model. Lua policy returns generic leaf
+effects and per-window presentation plans; the host validates and applies them
+only at River's transaction boundaries. Protocol `river_node_v1` handles stay
+private to this adapter and are not layout nodes.
 
 Shell and decoration surfaces are retained by role. River's
 `sync_next_commit` remains the authority for coordinating a role's next

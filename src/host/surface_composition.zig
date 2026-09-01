@@ -144,7 +144,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
     try std.testing.expectEqual(@as(f32, 562), background.y);
 
     const window_token = [_]script.program_loader.Value{
-        .{ .number = 2 },
+        .{ .string = "window" },
         .{ .string = "" },
         .{ .string = "foot" },
         .{ .string = "terminal" },
@@ -181,7 +181,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
     try std.testing.expectEqualStrings("/icons/foot.svg", icon_source orelse return error.MissingShellIcon);
 
     const second_window_token = [_]script.program_loader.Value{
-        .{ .number = 2 },
+        .{ .string = "window" },
         .{ .string = "" },
         .{ .string = "firefox" },
         .{ .string = "abcdefghijklm" },

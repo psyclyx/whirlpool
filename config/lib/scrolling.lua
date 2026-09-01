@@ -1,697 +1,792 @@
 -- Example scrolling layout provider. This is user configuration, not
--- Whirlpool's installed standard library: replace this file to replace the
--- layout algorithm.
+-- Whirlpool's installed standard library. The host supplies flat compositor
+-- facts; every relationship between windows below is retained Lua state.
 
-local peek = 16
-local inner_gap = 8
-local outer_gap = 4
-local border_width = 4
-local decoration_height = 28
-local min_column_width = 0.05
-local max_column_width = 4
+local peek, inner_gap, outer_gap = 16, 8, 4
+local border_width, decoration_height = 4, 28
+local min_root_width, max_root_width = 0.05, 4
 local animation_duration_ms = 180
--- Presentation is expressed in logical axes. Switching the main axis or
--- either direction does not change strip, focus, movement, or camera policy.
-local main_axis = "horizontal"
-local main_reverse = false
-local cross_reverse = false
+local main_axis, main_reverse, cross_reverse = "horizontal", false, false
 
--- Motion is layout policy. Whirlpool supplies only monotonic time and another
--- transaction when this provider asks for one.
-local window_y_motion = {}
-local tag_layouts = {}
-local layout_marks = {}
+local model = {
+  tags = {}, nodes = {}, window_nodes = {}, windows = {}, marks = {},
+  next_node_id = 1, next_strip_id = 1,
+}
+local action_checkpoint
 
-local function new_strip(state)
-  local strip = { id = state.next_strip_id, columns = {} }
-  state.next_strip_id = state.next_strip_id + 1
-  return strip
+local function clamp(value, low, high) return math.max(low, math.min(high, value)) end
+local function copy(value, seen)
+  if type(value) ~= "table" then return value end
+  seen = seen or {}
+  if seen[value] then return seen[value] end
+  local result = {}
+  seen[value] = result
+  for key, child in pairs(value) do result[copy(key, seen)] = copy(child, seen) end
+  return result
 end
 
-local function clamp(value, low, high)
-  return math.max(low, math.min(high, value))
+local function node(id) return id and model.nodes[id] or nil end
+local function new_node(kind)
+  local id = model.next_node_id
+  model.next_node_id = id + 1
+  local result = { id = id, kind = kind, parent = nil }
+  model.nodes[id] = result
+  return result
+end
+local function new_leaf(window)
+  local result = new_node("window")
+  result.window = window
+  model.window_nodes[window] = result.id
+  return result
+end
+local function new_group(mode, axis)
+  local result = new_node("group")
+  result.mode, result.axis, result.active, result.children = mode or "split", axis or "vertical", 1, {}
+  return result
+end
+local function new_strip()
+  local result = { id = model.next_strip_id, roots = {} }
+  model.next_strip_id = model.next_strip_id + 1
+  return result
+end
+local function tag_state(id)
+  if model.tags[id] then return model.tags[id] end
+  local strip = new_strip()
+  local result = { id = id, strips = { strip }, current = strip }
+  model.tags[id] = result
+  return result
+end
+
+local function child_index(parent, child_id)
+  if not parent or parent.kind ~= "group" then return nil end
+  for index, child in ipairs(parent.children) do if child.node == child_id then return index end end
+end
+local function walk(root_id, visit)
+  local current = node(root_id)
+  if not current then return end
+  visit(current)
+  if current.kind == "group" then for _, child in ipairs(current.children) do walk(child.node, visit) end end
+end
+local function leaves(root_id, visible_only, active, result)
+  result = result or {}
+  local current = node(root_id)
+  if not current then return result end
+  if current.kind == "window" then
+    if not visible_only or active ~= false then result[#result + 1] = current end
+  else
+    for index, child in ipairs(current.children) do
+      leaves(child.node, visible_only,
+        active ~= false and (current.mode ~= "tabbed" or index == current.active), result)
+    end
+  end
+  return result
+end
+local function active_leaf(root_id)
+  local current = node(root_id)
+  while current and current.kind == "group" do
+    local child = current.children[clamp(current.active, 1, #current.children)]
+    current = child and node(child.node) or nil
+  end
+  return current
+end
+local function is_ancestor(ancestor_id, candidate_id)
+  local current = node(candidate_id)
+  while current and current.parent do
+    if current.parent == ancestor_id then return true end
+    current = node(current.parent)
+  end
+  return false
+end
+
+local function root_location(wanted)
+  for _, state in pairs(model.tags) do
+    for strip_index, strip in ipairs(state.strips) do
+      for root_index, slot in ipairs(strip.roots) do
+        if slot.node == wanted then return state, strip, strip_index, root_index, slot end
+      end
+    end
+  end
+end
+local function containing_root(id)
+  local current = node(id)
+  while current and current.parent do current = node(current.parent) end
+  return current
+end
+local function location_for_node(id)
+  local root = containing_root(id)
+  if root then return root_location(root.id) end
+end
+local function replace_position(old_id, replacement_id)
+  local old, replacement = node(old_id), node(replacement_id)
+  if not old or not replacement then return false end
+  if old.parent then
+    local parent = node(old.parent)
+    local index = child_index(parent, old.id)
+    if not index then return false end
+    parent.children[index].node, replacement.parent = replacement.id, parent.id
+  else
+    local _, _, _, _, slot = root_location(old.id)
+    if not slot then return false end
+    slot.node, replacement.parent = replacement.id, nil
+  end
+  return true
+end
+local function retire_group(group, replacement)
+  model.nodes[group.id] = nil
+  for _, mark in pairs(model.marks) do
+    if mark.target and mark.target.kind == "node" and mark.target.id == group.id then
+      mark.target = replacement and (replacement.kind == "window"
+        and { kind = "window", window = replacement.window }
+        or { kind = "node", id = replacement.id }) or nil
+    end
+  end
+end
+local function normalize(group_id)
+  local group = node(group_id)
+  if not group or group.kind ~= "group" then return end
+  if #group.children > 1 then group.active = clamp(group.active, 1, #group.children); return end
+  if #group.children == 1 then
+    local only = node(group.children[1].node)
+    local parent_id = group.parent
+    if only and replace_position(group.id, only.id) then retire_group(group, only); normalize(parent_id) end
+    return
+  end
+  local parent_id = group.parent
+  if parent_id then
+    local parent = node(parent_id)
+    local index = child_index(parent, group.id)
+    if index then table.remove(parent.children, index) end
+  else
+    local _, strip, _, index = root_location(group.id)
+    if strip and index then table.remove(strip.roots, index) end
+  end
+  retire_group(group)
+  normalize(parent_id)
+end
+local function detach(id)
+  local current = node(id)
+  if not current then return nil end
+  if current.parent then
+    local parent = node(current.parent)
+    local index = child_index(parent, current.id)
+    if not index then return nil end
+    local child = table.remove(parent.children, index)
+    current.parent = nil
+    if parent.active > #parent.children then parent.active = math.max(1, #parent.children) end
+    normalize(parent.id)
+    return { node = current.id, weight = child.weight or 1 }
+  end
+  local _, strip, _, index, slot = root_location(current.id)
+  if not strip then return { node = current.id, width = 0.5 } end
+  table.remove(strip.roots, index)
+  return { node = current.id, width = slot.width or 0.5 }
+end
+local function attach_root(state, strip, id, index, width)
+  local current = node(id)
+  if not current then return end
+  current.parent = nil
+  table.insert(strip.roots, clamp(index or #strip.roots + 1, 1, #strip.roots + 1), {
+    node = id, width = clamp(width or 0.5, min_root_width, max_root_width),
+  })
+  state.current = strip
+end
+local function compact_strips(state)
+  local kept = {}
+  for _, strip in ipairs(state.strips) do
+    if #strip.roots > 0 or strip == state.current then kept[#kept + 1] = strip end
+  end
+  if #kept == 0 then kept[1] = new_strip() end
+  local found = false
+  for _, strip in ipairs(kept) do if strip == state.current then found = true end end
+  state.strips = kept
+  if not found then state.current = kept[1] end
+end
+local function strip_by_id(state, id)
+  for index, strip in ipairs(state.strips) do if strip.id == id then return strip, index end end
+end
+
+local function classify(fact)
+  if fact.state and fact.state ~= "unplaced" then return fact.state end
+  local hints = fact.size_hints or {}
+  local minimum = hints.min or { width = hints.min_width or 0, height = hints.min_height or 0 }
+  local maximum = hints.max or { width = hints.max_width or 0, height = hints.max_height or 0 }
+  local fixed = minimum.width > 0 and minimum.height > 0
+    and minimum.width == maximum.width and minimum.height == maximum.height
+  if fact.transient or fixed then return "floating" end
+  return "tiled"
+end
+local function remove_window(window)
+  local leaf = node(model.window_nodes[window])
+  if leaf then detach(leaf.id); model.nodes[leaf.id] = nil end
+  model.window_nodes[window], model.windows[window] = nil, nil
+  for name, mark in pairs(model.marks) do if mark.anchor_window == window then model.marks[name] = nil end end
+end
+local function current_insertion(state, focused_window)
+  local strip, index = state.current, #state.current.roots + 1
+  local root = containing_root(focused_window and model.window_nodes[focused_window])
+  if root then
+    local owner, candidate, _, root_index = root_location(root.id)
+    if owner == state then strip, index = candidate, root_index + 1 end
+  end
+  return strip, index
+end
+local function sync(snapshot)
+  local seen = {}
+  for _, fact in ipairs(snapshot.windows or {}) do
+    seen[fact.id], model.windows[fact.id] = true, fact
+    if fact.lifecycle ~= "closed" then
+      local leaf = node(model.window_nodes[fact.id]) or new_leaf(fact.id)
+      leaf.state = leaf.state or classify(fact)
+      leaf.tag = leaf.tag or fact.tag
+      local state = tag_state(fact.tag)
+      local owner = location_for_node(leaf.id)
+      if leaf.state == "tiled" and not owner then
+        local strip, index = current_insertion(state,
+          snapshot.tag.id == fact.tag and snapshot.tag.focused_window or nil)
+        attach_root(state, strip, leaf.id, index, 0.5)
+      elseif leaf.state ~= "tiled" and owner then
+        local root = containing_root(leaf.id)
+        if root then detach(root.id) end
+      end
+    end
+  end
+  local stale = {}
+  for window in pairs(model.windows) do if not seen[window] then stale[#stale + 1] = window end end
+  for _, window in ipairs(stale) do remove_window(window) end
+  for _, state in pairs(model.tags) do compact_strips(state) end
+  local state, focused = tag_state(snapshot.tag.id), snapshot.tag.focused_window
+  if state.focus and state.focus_anchor ~= focused then state.focus, state.focus_anchor = nil, nil end
+  if focused then
+    local current = node(model.window_nodes[focused])
+    while current and current.parent do
+      local parent = node(current.parent)
+      parent.active = child_index(parent, current.id) or parent.active
+      current = parent
+    end
+    local owner, strip = location_for_node(model.window_nodes[focused])
+    if owner == state and strip then state.current = strip end
+  end
+  return state
+end
+
+local function focused_descriptor(state, snapshot)
+  return state.focus or (snapshot.tag.focused_window and {
+    kind = "window", window = snapshot.tag.focused_window,
+  } or nil)
+end
+local function descriptor_node(target)
+  if not target then return nil end
+  if target.kind == "window" then return node(model.window_nodes[target.window]) end
+  if target.kind == "node" then return node(target.id) end
+end
+local function descriptor_roots(state, target)
+  if not target then return {} end
+  local current = descriptor_node(target)
+  if current then return { current.id } end
+  local result = {}
+  if target.kind == "strip" then
+    local strip = strip_by_id(state, target.id)
+    if strip then for _, slot in ipairs(strip.roots) do result[#result + 1] = slot.node end end
+  elseif target.kind == "state" then
+    for window, fact in pairs(model.windows) do
+      local leaf = node(model.window_nodes[window])
+      if leaf and leaf.tag == state.id and leaf.state == target.state then result[#result + 1] = leaf.id end
+    end
+  end
+  return result
+end
+local function target_windows(state, target)
+  local result, seen = {}, {}
+  for _, root_id in ipairs(descriptor_roots(state, target)) do
+    for _, leaf in ipairs(leaves(root_id, false, true)) do
+      if not seen[leaf.window] then result[#result + 1], seen[leaf.window] = leaf.window, true end
+    end
+  end
+  return result
+end
+local function set_focus(state, target, snapshot)
+  state.focus, state.focus_anchor = target and copy(target) or nil,
+    target and snapshot.tag.focused_window or nil
+end
+local function focus_parent(state, snapshot)
+  local target, current = focused_descriptor(state, snapshot)
+  current = descriptor_node(target)
+  if current and current.parent then set_focus(state, { kind = "node", id = current.parent }, snapshot)
+  elseif current then
+    if current.state ~= "tiled" then
+      set_focus(state, { kind = "state", state = current.state }, snapshot)
+    else
+      local _, strip = location_for_node(current.id)
+      if strip then set_focus(state, { kind = "strip", id = strip.id }, snapshot) end
+    end
+  elseif target and target.kind == "state" then set_focus(state, nil, snapshot) end
+end
+local function focus_child(state, snapshot)
+  local target = state.focus
+  if not target then return end
+  if target.kind == "strip" then
+    local strip = strip_by_id(state, target.id)
+    local leaf = strip and strip.roots[1] and active_leaf(strip.roots[1].node)
+    set_focus(state, leaf and { kind = "window", window = leaf.window } or nil, snapshot)
+  elseif target.kind == "node" then
+    local current = node(target.id)
+    local child = current and current.children[current.active]
+    local next_node = child and node(child.node)
+    set_focus(state, next_node and (next_node.kind == "window"
+      and { kind = "window", window = next_node.window } or { kind = "node", id = next_node.id }) or nil, snapshot)
+  elseif target.kind == "state" then
+    local windows = target_windows(state, target)
+    set_focus(state, windows[1] and { kind = "window", window = windows[1] } or nil, snapshot)
+  else set_focus(state, nil, snapshot) end
+end
+
+local function physical_axis(direction)
+  local horizontal, axis, step = main_axis == "horizontal"
+  if direction == "left" then axis, step = horizontal and "main" or "cross", -1
+  elseif direction == "right" then axis, step = horizontal and "main" or "cross", 1
+  elseif direction == "up" then axis, step = horizontal and "cross" or "main", -1
+  elseif direction == "down" then axis, step = horizontal and "cross" or "main", 1 end
+  if axis == "main" and main_reverse then step = -step end
+  if axis == "cross" and cross_reverse then step = -step end
+  return axis, step
+end
+local function neighbor(state, start_id, direction)
+  local axis, step = physical_axis(direction)
+  local owner, strip, strip_index, root_index = location_for_node(start_id)
+  if owner ~= state then return nil end
+  local root = containing_root(start_id)
+  if axis == "main" then
+    local slot = strip.roots[root_index + step]
+    return slot and active_leaf(slot.node), false, strip, root_index + step
+  end
+  local visible, leaf_index = leaves(root.id, true, true)
+  for index, leaf in ipairs(visible) do if leaf.id == start_id then leaf_index = index end end
+  if leaf_index and visible[leaf_index + step] then
+    return visible[leaf_index + step], false, strip, root_index
+  end
+  local target_strip = state.strips[strip_index + step]
+  local slot = target_strip and target_strip.roots[clamp(root_index, 1, #target_strip.roots)]
+  return slot and active_leaf(slot.node), target_strip ~= nil, target_strip, root_index
+end
+local function swap_positions(first_id, second_id)
+  if first_id == second_id or is_ancestor(first_id, second_id) or is_ancestor(second_id, first_id) then return end
+  local first, second = node(first_id), node(second_id)
+  if not first or not second then return end
+  local first_parent, second_parent = node(first.parent), node(second.parent)
+  local first_index = first_parent and child_index(first_parent, first.id)
+  local second_index = second_parent and child_index(second_parent, second.id)
+  local _, _, _, _, first_slot = root_location(first.id)
+  local _, _, _, _, second_slot = root_location(second.id)
+  if first_parent then first_parent.children[first_index].node = second.id else first_slot.node = second.id end
+  if second_parent then second_parent.children[second_index].node = first.id else second_slot.node = first.id end
+  first.parent, second.parent = second_parent and second_parent.id or nil, first_parent and first_parent.id or nil
+end
+local function wrap_pair(focused_id, other_id, axis, other_first)
+  local focused, other = node(focused_id), node(other_id)
+  if not focused or not other then return end
+  local parent_id = focused.parent
+  local _, _, _, _, slot = root_location(focused.id)
+  detach(other.id)
+  local group = new_group("split", axis)
+  if parent_id then
+    local parent = node(parent_id)
+    parent.children[child_index(parent, focused.id)].node, group.parent = group.id, parent.id
+  elseif slot then slot.node = group.id else retire_group(group); return end
+  focused.parent, other.parent = group.id, group.id
+  local a, b = { node = focused.id, weight = 1 }, { node = other.id, weight = 1 }
+  group.children, group.active = other_first and { b, a } or { a, b }, other_first and 2 or 1
+end
+local function reparent(id, target_id)
+  if id == target_id or is_ancestor(id, target_id) then return end
+  local moved, target = node(id), node(target_id)
+  if not moved or not target then return end
+  local saved = detach(moved.id)
+  if target.kind == "group" then
+    moved.parent = target.id
+    target.children[#target.children + 1] = { node = moved.id, weight = saved.weight or 1 }
+    target.active = #target.children
+  elseif target.parent then
+    local parent = node(target.parent)
+    local index = child_index(parent, target.id)
+    moved.parent = parent.id
+    table.insert(parent.children, index + 1, { node = moved.id, weight = saved.weight or 1 })
+    parent.active = index + 1
+  else
+    local state, strip, _, index = root_location(target.id)
+    if state then attach_root(state, strip, moved.id, index + 1, saved.width) end
+  end
+end
+local function move_target(source, target, destination, strip, after)
+  local roots, windows = descriptor_roots(source, target), target_windows(source, target)
+  local index = after or #strip.roots + 1
+  for _, id in ipairs(roots) do
+    local saved = detach(id)
+    local current = node(id)
+    if saved and not (current.kind == "window" and current.state ~= "tiled") then
+      attach_root(destination, strip, id, index, saved.width)
+      index = index + 1
+    end
+    walk(id, function(candidate)
+      if candidate.kind == "window" then candidate.tag = destination.id end
+    end)
+  end
+  compact_strips(source); compact_strips(destination)
+  return windows
+end
+local function move_effects(windows, tag, output)
+  local result = {}
+  for _, window in ipairs(windows) do
+    result[#result + 1] = { name = "move-window", window = window, tag = tag, output = output }
+  end
+  return result
+end
+
+local function resolve_tag(snapshot, ordinal)
+  local value = snapshot.tags and snapshot.tags[tonumber(ordinal)] or tonumber(ordinal)
+  return type(value) == "table" and value.id or value
+end
+
+local function mutate_action(snapshot, request)
+  local state = sync(snapshot)
+  local target, name = focused_descriptor(state, snapshot), request.name
+  if name == "focus-window" then
+    local window = tonumber(request.args[1])
+    if not window or not model.window_nodes[window] then return {} end
+    set_focus(state, nil, snapshot)
+    return { { name = "focus-window", window = window } }
+  end
+  if name == "focus-parent" then focus_parent(state, snapshot); return {} end
+  if name == "focus-child" then focus_child(state, snapshot); return {} end
+  if name == "close-focused" then
+    local result = {}
+    for _, window in ipairs(target_windows(state, target)) do result[#result + 1] = { name = "close-window", window = window } end
+    return result
+  end
+  if name == "mark" then
+    local mark_name = tostring(request.args[1] or "")
+    if mark_name ~= "" and target then
+      local windows = target_windows(state, target)
+      model.marks[mark_name] = { tag = state.id, target = copy(target), anchor_window = windows[1] }
+    end
+    return {}
+  end
+  if name == "clear-mark" then model.marks[tostring(request.args[1] or "")] = nil; return {} end
+  if name == "focus-mark" then
+    local mark = model.marks[tostring(request.args[1] or "")]
+    if not mark or not mark.anchor_window then return {} end
+    local destination = tag_state(mark.tag)
+    destination.focus, destination.focus_anchor = copy(mark.target), mark.anchor_window
+    local result = {}
+    if mark.tag ~= state.id then result[#result + 1] = { name = "set-active-tag", output = snapshot.output.id, tag = mark.tag } end
+    result[#result + 1] = { name = "focus-window", window = mark.anchor_window }
+    return result
+  end
+  if name == "summon-mark" then
+    local mark = model.marks[tostring(request.args[1] or "")]
+    if not mark or not mark.target then return {} end
+    local windows = move_target(tag_state(mark.tag), mark.target, state, state.current)
+    mark.tag, state.focus, state.focus_anchor = state.id, copy(mark.target), mark.anchor_window
+    local result = move_effects(windows, state.id, snapshot.output.id)
+    if mark.anchor_window then result[#result + 1] = { name = "focus-window", window = mark.anchor_window } end
+    return result
+  end
+  if name == "send-to-mark" then
+    local mark = model.marks[tostring(request.args[1] or "")]
+    if not mark or not mark.target then return {} end
+    for _, window in ipairs(target_windows(state, target)) do
+      if window == mark.anchor_window then return {} end
+    end
+    local destination = tag_state(mark.tag)
+    local marked, strip, marked_index = descriptor_node(mark.target)
+    if marked then local _; _, strip, _, marked_index = location_for_node(marked.id) end
+    strip = strip or destination.current
+    local windows = move_target(state, target, destination, strip, marked_index and marked_index + 1)
+    set_focus(state, nil, snapshot)
+    return move_effects(windows, destination.id, destination.id == state.id and snapshot.output.id or nil)
+  end
+  if name == "focus-tag" then
+    local id = resolve_tag(snapshot, request.args[1])
+    if not id then return {} end
+    local destination, result = tag_state(id), { { name = "set-active-tag", output = snapshot.output.id, tag = id } }
+    local windows = target_windows(destination, destination.focus)
+    if windows[1] then result[#result + 1] = { name = "focus-window", window = windows[1] } end
+    return result
+  end
+  if name == "send-to-tag" then
+    local id = resolve_tag(snapshot, request.args[1])
+    if not id then return {} end
+    local destination = tag_state(id)
+    return move_effects(move_target(state, target, destination, destination.current), id, nil)
+  end
+  if name == "cycle-container-mode" then
+    local current = descriptor_node(target)
+    local group = current and (current.kind == "group" and current or node(current.parent))
+    if group then
+      if group.mode == "tabbed" then group.mode, group.axis = "split", "horizontal"
+      elseif group.axis == "horizontal" then group.axis = "vertical"
+      else group.mode, group.axis = "tabbed", "vertical" end
+    end
+    return {}
+  end
+  if name == "focus-tab-next" or name == "focus-tab-prev" then
+    local current = descriptor_node(target)
+    local group = current and node(current.parent)
+    if group and group.mode == "tabbed" and #group.children > 1 then
+      local step = name == "focus-tab-next" and 1 or -1
+      group.active = (group.active - 1 + step) % #group.children + 1
+      local leaf = active_leaf(group.children[group.active].node)
+      return leaf and { { name = "focus-window", window = leaf.window } } or {}
+    end
+    return {}
+  end
+  if name == "grow-width" or name == "shrink-width" then
+    local current, slot = descriptor_node(target)
+    local root = current and containing_root(current.id)
+    if root then local _; _, _, _, _, slot = root_location(root.id) end
+    if slot then
+      local presets, nearest = { 0.25, 0.5, 0.75, 1, 1.5, 2 }, 1
+      for index, value in ipairs(presets) do
+        if math.abs(value - slot.width) < math.abs(presets[nearest] - slot.width) then nearest = index end
+      end
+      nearest = clamp(nearest + (name == "grow-width" and 1 or -1), 1, #presets)
+      slot.width = presets[nearest]
+    end
+    return {}
+  end
+  if name == "toggle-float" or name == "toggle-fullscreen" then
+    local desired, result = name == "toggle-fullscreen" and "fullscreen" or "floating", {}
+    for _, window in ipairs(target_windows(state, target)) do
+      local leaf = node(model.window_nodes[window])
+      local next_state = leaf.state == desired and "tiled" or desired
+      if next_state ~= "tiled" then
+        local root = containing_root(leaf.id); if root then detach(root.id) end
+      elseif not location_for_node(leaf.id) then attach_root(state, state.current, leaf.id, nil, 0.5) end
+      leaf.state = next_state
+      result[#result + 1] = { name = "set-window-state", window = window, state = next_state }
+    end
+    return result
+  end
+  if name == "focus-output-next" or name == "focus-output-prev" then
+    local outputs, current_index = snapshot.outputs or {}, nil
+    for index, output in ipairs(outputs) do if output.id == snapshot.output.id then current_index = index end end
+    if not current_index or #outputs < 2 then return {} end
+    local step = name == "focus-output-next" and 1 or -1
+    local destination = outputs[(current_index - 1 + step) % #outputs + 1]
+    local destination_state = tag_state(destination.active_tag)
+    local windows = target_windows(destination_state, destination_state.focus)
+    local wanted = windows[1]
+    if not wanted then for _, tag in ipairs(snapshot.tags or {}) do
+      if tag.id == destination.active_tag then wanted = tag.focused_window end
+    end end
+    return wanted and { { name = "focus-window", window = wanted } } or {}
+  end
+
+  local verb, direction = name:match("^(focus)%-(.+)$")
+  if not verb then verb, direction = name:match("^(swap)%-(.+)$") end
+  if direction ~= "left" and direction ~= "right" and direction ~= "up" and direction ~= "down" then
+    verb, direction = nil, nil
+  end
+  if verb then
+    local current = descriptor_node(target)
+    local start = current and (current.kind == "window" and current or active_leaf(current.id))
+    local adjacent, crossed, crossed_strip, crossed_index
+    if start then adjacent, crossed, crossed_strip, crossed_index = neighbor(state, start.id, direction) end
+    if verb == "focus" then
+      set_focus(state, nil, snapshot)
+      return adjacent and { { name = "focus-window", window = adjacent.window } } or {}
+    end
+    if not current then return {} end
+    if crossed then
+      local saved = detach(current.id)
+      if saved then attach_root(state, crossed_strip, current.id, crossed_index, saved.width) end
+      compact_strips(state)
+      return {}
+    end
+    if adjacent then swap_positions(current.id, adjacent.id); return {} end
+    local axis, step = physical_axis(direction)
+    if axis == "cross" then
+      local _, _, strip_index, root_index = location_for_node(current.id)
+      local destination = state.strips[strip_index + step]
+      if not destination then
+        destination = new_strip()
+        table.insert(state.strips, clamp(strip_index + step, 1, #state.strips + 1), destination)
+      end
+      local saved = detach(current.id)
+      if saved then attach_root(state, destination, current.id, root_index, saved.width) end
+      compact_strips(state)
+    end
+    return {}
+  end
+
+  local structural, direction = name:match("^(absorb)%-(.+)$")
+  if not structural then structural, direction = name:match("^(expel)%-(.+)$") end
+  if direction ~= "left" and direction ~= "right" and direction ~= "up" and direction ~= "down" then
+    structural, direction = nil, nil
+  end
+  local current = descriptor_node(target)
+  if structural == "absorb" and current then
+    local start = current.kind == "window" and current or active_leaf(current.id)
+    local adjacent = start and neighbor(state, start.id, direction)
+    if adjacent then
+      local axis, step = physical_axis(direction)
+      local split_axis = axis == "main" and (main_axis == "horizontal" and "vertical" or "horizontal")
+        or (main_axis == "horizontal" and "horizontal" or "vertical")
+      wrap_pair(current.id, adjacent.id, split_axis, step < 0)
+    end
+    return {}
+  end
+  if (name == "eject" or structural == "expel") and current then
+    if not current.parent then return {} end
+    local _, strip, _, root_index = location_for_node(current.id)
+    local saved = detach(current.id)
+    local step = 1
+    if direction then local _; _, step = physical_axis(direction) end
+    if saved and strip then attach_root(state, strip, current.id, root_index + (step > 0 and 1 or 0), 0.5) end
+    return {}
+  end
+  if name == "reparent" then
+    local mark = model.marks[tostring(request.args[1] or "")]
+    local destination = mark and descriptor_node(mark.target)
+    if current and destination then reparent(current.id, destination.id) end
+    return {}
+  end
+  return {}
+end
+
+-- Structural actions stage the complete controller graph. A Lua error cannot
+-- leave half of a mutation behind, and the host acknowledges the complete
+-- action batch only after every returned leaf effect has applied atomically.
+local function begin_actions()
+  assert(action_checkpoint == nil, "action batch already active")
+  action_checkpoint = model
+end
+local function action(snapshot, request)
+  local previous = model
+  model = copy(model)
+  local ok, result = pcall(mutate_action, snapshot, request)
+  if not ok then
+    model = previous
+    error(result)
+  end
+  return result
+end
+local function finish_actions(commit)
+  assert(action_checkpoint ~= nil, "no action batch active")
+  if not commit then model = action_checkpoint end
+  action_checkpoint = nil
 end
 
 local function ease_out_cubic(progress)
   local remaining = 1 - progress
   return 1 - remaining * remaining * remaining
 end
-
-local function sample_number(motion, now)
+local function sample_motion(motion, now)
   if motion.from == motion.to then return motion.to, false end
   local progress = clamp((now - motion.started) / animation_duration_ms, 0, 1)
-  if progress >= 1 then
-    motion.from = motion.to
-    return motion.to, false
-  end
-  local eased = ease_out_cubic(progress)
-  return motion.from + (motion.to - motion.from) * eased, true
+  if progress >= 1 then motion.from = motion.to; return motion.to, false end
+  return motion.from + (motion.to - motion.from) * ease_out_cubic(progress), true
+end
+local function animate(owner, key, target, now)
+  local motion = owner[key]
+  if not motion then motion = { from = target, to = target, started = now }; owner[key] = motion end
+  local current = sample_motion(motion, now)
+  if target ~= motion.to then motion.from, motion.to, motion.started = current, target, now end
+  return sample_motion(motion, now)
 end
 
-local function animate_number(motion, target, now)
-  local current = sample_number(motion, now)
-  if target ~= motion.to then
-    motion.from, motion.to, motion.started = current, target, now
+local function window_minimum(fact)
+  local hints = fact.size_hints or {}
+  local minimum = hints.min or { width = hints.min_width or 0, height = hints.min_height or 0 }
+  local width, height = minimum.width or 0, minimum.height or 0
+  -- An actual size larger than the last proposal is an observed constraint,
+  -- not merely stale geometry. Feed it back through the same recursive
+  -- constraint calculation so every sibling sharing that extent agrees.
+  if fact.actual and fact.proposed then
+    if fact.actual.width > fact.proposed.width then width = math.max(width, fact.actual.width) end
+    if fact.actual.height > fact.proposed.height then height = math.max(height, fact.actual.height) end
   end
-  return sample_number(motion, now)
-end
-
-local function animate_window_y(motions, id, target, now, enabled)
-  local motion = motions[id]
-  if not motion or not enabled then
-    motions[id] = { from = target, to = target, started = now }
-    return target, false
-  end
-  return animate_number(motion, target, now)
-end
-
-local function leaf_minimum(window)
-  if window.placement ~= "tiled" then return { width = 0, height = 0 } end
-  local hints = window.size_hints or {}
-  local width = math.max(0, hints.min_width or 0)
-  local height = math.max(0, hints.min_height or 0)
   return {
     width = width > 0 and width + 2 * border_width or 0,
     height = height > 0 and height + decoration_height + 2 * border_width or 0,
   }
 end
-
-local function measure(node)
-  if node.window then return leaf_minimum(node.window) end
+local function minimum_for(root_id)
+  local current = node(root_id)
+  if not current then return { width = 0, height = 0 } end
+  if current.kind == "window" then return window_minimum(model.windows[current.window] or {}) end
   local width, height = 0, 0
-  if node.mode == "tabbed" then
-    for _, child in ipairs(node.children) do
-      local child_min = measure(child.node)
-      width = math.max(width, child_min.width)
-      height = math.max(height, child_min.height)
-    end
-    return { width = width, height = height }
-  end
-  local horizontal = node.axis == "horizontal"
-  for index, child in ipairs(node.children) do
-    local child_min = measure(child.node)
-    if horizontal then
-      width = width + child_min.width
-      height = math.max(height, child_min.height)
+  for index, child in ipairs(current.children) do
+    local child_minimum = minimum_for(child.node)
+    if current.mode == "tabbed" then
+      width, height = math.max(width, child_minimum.width), math.max(height, child_minimum.height)
+    elseif current.axis == "horizontal" then
+      width, height = width + child_minimum.width, math.max(height, child_minimum.height)
+      if index > 1 then width = width + inner_gap end
     else
-      width = math.max(width, child_min.width)
-      height = height + child_min.height
-    end
-    if index > 1 then
-      if horizontal then width = width + inner_gap else height = height + inner_gap end
+      width, height = math.max(width, child_minimum.width), height + child_minimum.height
+      if index > 1 then height = height + inner_gap end
     end
   end
   return { width = width, height = height }
 end
-
-local function constrained_sizes(children, available, horizontal)
-  local minimums, minimum_total, weight_total = {}, 0, 0
+local function distribute(children, available, horizontal)
+  local sizes, minimums, minimum_total, weight_total = {}, {}, 0, 0
   for index, child in ipairs(children) do
-    local child_min = measure(child.node)
-    local minimum = horizontal and child_min.width or child_min.height
-    minimums[index] = minimum
-    minimum_total = minimum_total + minimum
-    weight_total = weight_total + child.weight
+    local minimum = minimum_for(child.node)
+    minimums[index] = horizontal and minimum.width or minimum.height
+    minimum_total = minimum_total + minimums[index]
+    weight_total = weight_total + (child.weight or 1)
   end
-  assert(weight_total > 0, "split weight must be positive")
-  local distributable = math.max(minimum_total, available) - minimum_total
-  local result, used = {}, 0
+  assert(weight_total > 0, "non-empty group must have positive weight")
+  local total, used = math.max(minimum_total, available), 0
   for index, child in ipairs(children) do
-    local extent = minimums[index] + math.floor(distributable * child.weight / weight_total)
-    result[index], used = extent, used + extent
+    sizes[index] = minimums[index]
+      + math.floor((total - minimum_total) * (child.weight or 1) / weight_total)
+    used = used + sizes[index]
   end
-  local remainder = math.max(minimum_total, available) - used
   local index = 1
-  while remainder > 0 do
-    result[index] = result[index] + 1
-    remainder, index = remainder - 1, index % #children + 1
+  while used < total do
+    sizes[index], used, index = sizes[index] + 1, used + 1, index % #sizes + 1
   end
-  return result
+  return sizes
 end
-
-local function contains_tiled(node)
-  if node.window then
-    return node.window.lifecycle == "managed"
-      and node.window.placement ~= "floating" and node.window.placement ~= "scratchpad"
-  end
-  for _, child in ipairs(node.children) do
-    if contains_tiled(child.node) then return true end
-  end
-  return false
-end
-
-local function walk(node, column, rect, active, entries, node_columns)
-  node_columns[node.id] = column.id
-  if node.window then
-    local window = node.window
-    local floating = window.placement == "floating"
-    local virtual = floating and {
-      x = window.floating.x, y = window.floating.y,
-      width = window.floating.width, height = window.floating.height,
-    } or {
-      x = rect.x, y = rect.y + decoration_height,
-      width = math.max(1, rect.width - 2 * border_width),
-      height = math.max(1, rect.height - decoration_height - 2 * border_width),
-    }
+local function layout_node(root_id, rect, active, entries, z)
+  local current = node(root_id)
+  if not current then return z end
+  if current.kind == "window" then
+    local fact = model.windows[current.window]
+    if not fact then return z end
     entries[#entries + 1] = {
-      window = window.id,
-      column = column.id,
-      placement = window.placement,
-      virtual = virtual,
-      actual = window.actual,
-      visible = active and window.lifecycle == "managed"
-        and window.placement ~= "scratchpad",
-      focus_serial = window.focus_serial,
+      window = current.window, state = current.state, target = rect,
+      propose = {
+        width = math.max(1, rect.width - 2 * border_width),
+        height = math.max(1, rect.height - decoration_height - 2 * border_width),
+      },
+      visible = active and fact.lifecycle == "managed", z = z,
     }
-    return
+    return z + 1
   end
-
-  if node.mode == "tabbed" then
-    for index, child in ipairs(node.children) do
-      walk(child.node, column, rect, active and index == node.active, entries, node_columns)
+  if current.mode == "tabbed" then
+    for index, child in ipairs(current.children) do
+      z = layout_node(child.node, rect, active and index == current.active, entries, z)
     end
-    return
+    return z
   end
-
-  local horizontal = node.axis == "horizontal"
+  local horizontal = current.axis == "horizontal"
   local available = horizontal and rect.width or rect.height
-  local gap = math.min(inner_gap, math.max(0, math.floor(available)))
-  local usable = math.max(0, available - gap * math.max(0, #node.children - 1))
-  local sizes = constrained_sizes(node.children, usable, horizontal)
+  local gap = math.min(inner_gap, math.max(0, available))
+  local sizes = distribute(current.children,
+    math.max(0, available - gap * math.max(0, #current.children - 1)), horizontal)
   local cursor = horizontal and rect.x or rect.y
-  for index, child in ipairs(node.children) do
+  for index, child in ipairs(current.children) do
     local extent = sizes[index]
-    local child_rect
-    if horizontal then
-      child_rect = { x = cursor, y = rect.y, width = extent, height = rect.height }
-    else
-      child_rect = { x = rect.x, y = cursor, width = rect.width, height = extent }
-    end
-    walk(child.node, column, child_rect, active, entries, node_columns)
+    local child_rect = horizontal
+      and { x = cursor, y = rect.y, width = extent, height = rect.height }
+      or { x = rect.x, y = cursor, width = rect.width, height = extent }
+    z = layout_node(child.node, child_rect, active, entries, z)
     cursor = cursor + extent + gap
   end
-end
-
-local function clipped(screen, usable)
-  local left = math.max(screen.x, usable.x)
-  local top = math.max(screen.y, usable.y)
-  local right = math.min(screen.x + screen.width, usable.x + usable.width)
-  local bottom = math.min(screen.y + screen.height, usable.y + usable.height)
-  if right <= left or bottom <= top then return { x = 0, y = 0, width = 0, height = 0 } end
-  return { x = left - screen.x, y = top - screen.y, width = right - left, height = bottom - top }
-end
-
-local function clipped_window(screen, usable)
-  local frame = {
-    x = screen.x - border_width,
-    y = screen.y - decoration_height - border_width,
-    width = screen.width + 2 * border_width,
-    height = screen.height + decoration_height + 2 * border_width,
-  }
-  local left = math.max(frame.x, usable.x)
-  local top = math.max(frame.y, usable.y)
-  local right = math.min(frame.x + frame.width, usable.x + usable.width)
-  local bottom = math.min(frame.y + frame.height, usable.y + usable.height)
-  if right <= left or bottom <= top then return { x = 0, y = 0, width = 0, height = 0 } end
-  -- River's whole-window clip is relative to the content origin; negative
-  -- coordinates retain the title surface and borders above/left of content.
-  return { x = left - screen.x, y = top - screen.y, width = right - left, height = bottom - top }
-end
-
-local function walk_nodes(node, visit, parent)
-  visit(node, parent)
-  for _, child in ipairs(node.children) do walk_nodes(child.node, visit, node) end
-end
-
-local function index_snapshot(snapshot)
-  local index = { columns = {}, nodes = {}, windows = {}, node_columns = {}, parents = {} }
-  for _, column in ipairs(snapshot.tag.columns) do
-    index.columns[column.id] = column
-    if column.root then
-      walk_nodes(column.root, function(node, parent)
-        index.nodes[node.id] = node
-        index.parents[node.id] = parent and parent.id or nil
-        index.node_columns[node.id] = column.id
-        if node.window then index.windows[node.window.id] = node end
-      end)
-    end
-  end
-  return index
-end
-
-local function strip_location(state, column_id)
-  for strip_index, strip in ipairs(state.strips) do
-    for column_index, candidate in ipairs(strip.columns) do
-      if candidate == column_id then return strip_index, column_index end
-    end
-  end
-end
-
-local function remove_column(state, column_id)
-  local strip_index, column_index = strip_location(state, column_id)
-  if strip_index then table.remove(state.strips[strip_index].columns, column_index) end
-end
-
-local function compact_strips(state)
-  local kept = {}
-  for _, strip in ipairs(state.strips) do
-    if #strip.columns > 0 then kept[#kept + 1] = strip end
-  end
-  if #kept == 0 then kept[1] = new_strip(state) end
-  state.strips = kept
-  local current_kept = false
-  for _, strip in ipairs(kept) do if strip == state.current then current_kept = true end end
-  if not current_kept then state.current = kept[1] end
-end
-
-local function column_contains_window(column, window_id)
-  local found = false
-  if column.root then walk_nodes(column.root, function(node)
-    if node.window and node.window.id == window_id then found = true end
-  end) end
-  return found
-end
-
-local function sync_topology(snapshot)
-  local state = tag_layouts[snapshot.tag.id]
-  local created = false
-  if not state then
-    state = { strips = {}, pending = {}, next_strip_id = 1 }
-    state.strips[1] = new_strip(state)
-    state.current = state.strips[1]
-    tag_layouts[snapshot.tag.id] = state
-    created = true
-  end
-  local index = index_snapshot(snapshot)
-  if created then
-    for _, column in ipairs(snapshot.tag.columns) do
-      state.strips[1].columns[#state.strips[1].columns + 1] = column.id
-    end
-    return state, index
-  end
-  for _, strip in ipairs(state.strips) do
-    local kept = {}
-    for _, column_id in ipairs(strip.columns) do
-      if index.columns[column_id] then kept[#kept + 1] = column_id end
-    end
-    strip.columns = kept
-  end
-  local focused_column = snapshot.tag.focused and index.node_columns[snapshot.tag.focused] or nil
-  local focused_strip = focused_column and strip_location(state, focused_column) or nil
-  if focused_strip then state.current = state.strips[focused_strip] end
-  for _, column in ipairs(snapshot.tag.columns) do
-    if not strip_location(state, column.id) then
-      local destination
-      for window_id, strip in pairs(state.pending) do
-        if column_contains_window(column, window_id) then
-          destination, state.pending[window_id] = strip, nil
-          break
-        end
-      end
-      if destination then
-        for window_id, strip in pairs(state.pending) do
-          if strip == destination and column_contains_window(column, window_id) then
-            state.pending[window_id] = nil
-          end
-        end
-      end
-      if not destination then
-        destination = state.current or state.strips[1]
-      end
-      local insert_at = #destination.columns + 1
-      if focused_column then
-        local focused_strip, focused_index = strip_location(state, focused_column)
-        if focused_strip and state.strips[focused_strip] == destination then insert_at = focused_index + 1 end
-      end
-      table.insert(destination.columns, insert_at, column.id)
-      if focused_column == column.id then state.current = destination end
-    end
-  end
-  compact_strips(state)
-  return state, index
-end
-
-local function collect_leaves(node, leaves, visible_only, active)
-  if node.window then
-    if not visible_only or active then leaves[#leaves + 1] = node end
-    return
-  end
-  if node.mode == "tabbed" then
-    for child_index, child in ipairs(node.children) do
-      collect_leaves(child.node, leaves, visible_only, active and child_index == node.active)
-    end
-  else
-    for _, child in ipairs(node.children) do collect_leaves(child.node, leaves, visible_only, active) end
-  end
-end
-
-local function column_leaves(column, visible_only)
-  local leaves = {}
-  if column and column.root then collect_leaves(column.root, leaves, visible_only, true) end
-  return leaves
-end
-
-local function direction_step(name)
-  local physical, motion = name:match("^(focus)%-(.+)$")
-  if not physical then physical, motion = name:match("^(swap)%-(.+)$") end
-  if not physical then return end
-  local horizontal = main_axis == "horizontal"
-  local axis, step
-  if motion == "left" then axis, step = horizontal and "main" or "cross", -1
-  elseif motion == "right" then axis, step = horizontal and "main" or "cross", 1
-  elseif motion == "up" then axis, step = horizontal and "cross" or "main", -1
-  elseif motion == "down" then axis, step = horizontal and "cross" or "main", 1
-  else return end
-  if axis == "main" and main_reverse then step = -step end
-  if axis == "cross" and cross_reverse then step = -step end
-  return physical, axis, step
-end
-
-local function focus_operation(node)
-  return node and { name = "focus-window", window = node.window.id } or nil
-end
-
-local function strip_by_id(state, id)
-  for index, strip in ipairs(state.strips) do if strip.id == id then return strip, index end end
-end
-
-local function leaves_for_node(node)
-  local leaves = {}
-  if node then collect_leaves(node, leaves, false, true) end
-  return leaves
-end
-
-local function tiled_roots(node, result)
-  if node.window then
-    if node.window.lifecycle == "managed" and node.window.placement == "tiled" then
-      result[#result + 1] = node
-      return true
-    end
-    return false
-  end
-  local child_results, all_tiled, has_tiled = {}, true, false
-  for _, child in ipairs(node.children) do
-    local roots = {}
-    local child_all = tiled_roots(child.node, roots)
-    child_results[#child_results + 1] = roots
-    all_tiled = all_tiled and child_all
-    has_tiled = has_tiled or #roots > 0
-  end
-  if all_tiled and has_tiled then
-    result[#result + 1] = node
-    return true
-  end
-  for _, roots in ipairs(child_results) do
-    for _, root in ipairs(roots) do result[#result + 1] = root end
-  end
-  return false
-end
-
-local function selected_nodes(state, index, focused)
-  local selection = state.selection
-  if not selection then return focused and { focused } or {} end
-  if selection.kind == "node" then
-    local node = index.nodes[selection.id]
-    if not node then return {} end
-    if node.window then return { node } end
-    local nodes = {}
-    tiled_roots(node, nodes)
-    return nodes
-  end
-  if selection.kind == "strip" then
-    local strip = strip_by_id(state, selection.id)
-    local nodes = {}
-    if strip then for _, column_id in ipairs(strip.columns) do
-      local column = index.columns[column_id]
-      if column and column.root then tiled_roots(column.root, nodes) end
-    end end
-    return nodes
-  end
-  if selection.kind == "placement" then
-    local nodes = {}
-    for _, node in pairs(index.nodes) do
-      if node.window and node.window.placement == selection.placement then nodes[#nodes + 1] = node end
-    end
-    table.sort(nodes, function(a, b) return a.window.focus_serial < b.window.focus_serial end)
-    return nodes
-  end
-  return {}
-end
-
-local function selection_windows(state, index, focused)
-  local windows, seen = {}, {}
-  for _, node in ipairs(selected_nodes(state, index, focused)) do
-    for _, leaf in ipairs(leaves_for_node(node)) do
-      if leaf.window and not seen[leaf.window.id] then
-        windows[#windows + 1], seen[leaf.window.id] = leaf.window.id, true
-      end
-    end
-  end
-  return windows
-end
-
-local function select_parent(state, index, focused)
-  local selection = state.selection
-  if not selection then
-    if not focused then return end
-    if focused.window and focused.window.placement ~= "tiled" then
-      state.selection = { kind = "placement", placement = focused.window.placement }
-    elseif index.parents[focused.id] and index.nodes[index.parents[focused.id]] then
-      state.selection = { kind = "node", id = index.parents[focused.id] }
-    else
-      local strip_index = strip_location(state, index.node_columns[focused.id])
-      if strip_index then state.selection = { kind = "strip", id = state.strips[strip_index].id } end
-    end
-    return
-  end
-  if selection.kind == "node" then
-    local node = index.nodes[selection.id]
-    local parent = node and index.parents[node.id] or nil
-    if parent and index.nodes[parent] then
-      state.selection = { kind = "node", id = parent }
-    elseif node then
-      local strip_index = strip_location(state, index.node_columns[node.id])
-      if strip_index then state.selection = { kind = "strip", id = state.strips[strip_index].id } end
-    else state.selection = nil end
-  else
-    state.selection = nil
-  end
-end
-
-local function select_child(state, index, focused)
-  local selection = state.selection
-  if not selection then return end
-  if selection.kind == "strip" then
-    local column_id = focused and index.node_columns[focused.id]
-    local strip = strip_by_id(state, selection.id)
-    if strip and column_id then
-      local in_strip = strip_location({ strips = { strip } }, column_id)
-      local column = in_strip and index.columns[column_id]
-      if column and column.root then state.selection = { kind = "node", id = column.root.id } end
-    end
-  elseif selection.kind == "placement" then
-    if focused then state.selection = { kind = "node", id = focused.id } end
-  elseif selection.kind == "node" then
-    local node = index.nodes[selection.id]
-    if node and not node.window and node.children[node.active] then
-      state.selection = { kind = "node", id = node.children[node.active].node.id }
-    else
-      state.selection = nil
-    end
-  end
-end
-
-local function handle_structural_action(snapshot, request, state, index, focused)
-  if request.name == "select-parent" then
-    select_parent(state, index, focused)
-    return {}
-  elseif request.name == "select-child" then
-    select_child(state, index, focused)
-    return {}
-  elseif request.name == "clear-selection" then
-    state.selection = nil
-    return {}
-  elseif request.name == "close-selection" then
-    local operations = {}
-    for _, window in ipairs(selection_windows(state, index, focused)) do
-      operations[#operations + 1] = { name = "close-window", window = window }
-    end
-    state.selection = nil
-    return operations
-  elseif request.name == "mark" then
-    local name = tostring(request.args[1] or "primary")
-    local nodes, windows = selected_nodes(state, index, focused), selection_windows(state, index, focused)
-    if #nodes > 0 then
-      local node_ids = {}
-      for _, node in ipairs(nodes) do node_ids[#node_ids + 1] = node.id end
-      layout_marks[name] = { nodes = node_ids, windows = windows }
-    end
-    return {}
-  elseif request.name == "focus-mark" then
-    local mark = layout_marks[tostring(request.args[1] or "primary")]
-    return mark and mark.windows[1] and { { name = "focus-window", window = mark.windows[1] } } or {}
-  elseif request.name == "summon" then
-    local mark = layout_marks[tostring(request.args[1] or "primary")]
-    if not mark then return {} end
-    local destination = state.current or state.strips[1]
-    for _, window in ipairs(mark.windows) do state.pending[window] = destination end
-    local operations = {}
-    for _, node in ipairs(mark.nodes) do
-      operations[#operations + 1] = { name = "summon-node", node = node, output = snapshot.output.id }
-    end
-    state.selection = nil
-    return operations
-  end
-end
-
-local function action(snapshot, request)
-  local state, index = sync_topology(snapshot)
-  local focused = snapshot.tag.focused and index.nodes[snapshot.tag.focused] or nil
-  local structural = handle_structural_action(snapshot, request, state, index, focused)
-  if structural then return structural end
-  local kind, axis, step = direction_step(request.name)
-  if not kind then return {} end
-  if not focused or not focused.window then return {} end
-  if kind == "focus" then state.selection = nil end
-  if kind == "swap" and state.selection then
-    if state.selection.kind == "strip" then
-      if axis ~= "cross" then return {} end
-      local _, source = strip_by_id(state, state.selection.id)
-      local destination = source and source + step or nil
-      if destination and destination >= 1 and destination <= #state.strips then
-        state.strips[source], state.strips[destination] = state.strips[destination], state.strips[source]
-      end
-      return {}
-    elseif state.selection.kind ~= "node" then
-      return {}
-    end
-    local selected = index.nodes[state.selection.id]
-    if selected and not selected.window then
-      local selected_column_id = index.node_columns[selected.id]
-      local selected_strip, selected_column = strip_location(state, selected_column_id)
-      if not selected_strip then return {} end
-      local projected = selected_nodes(state, index, focused)
-      if #projected ~= 1 or projected[1].id ~= selected.id then
-        local destination = state.strips[selected_strip]
-        if axis == "cross" then
-          destination = state.strips[selected_strip + step]
-          if not destination then
-            destination = new_strip(state)
-            if selected_strip + step < 1 then table.insert(state.strips, 1, destination)
-            else state.strips[#state.strips + 1] = destination end
-          end
-        end
-        local operations = {}
-        for _, node in ipairs(projected) do
-          local leaves = leaves_for_node(node)
-          if leaves[1] and leaves[1].window then
-            state.pending[leaves[1].window.id] = destination
-            operations[#operations + 1] = {
-              name = "expel", node = node.id, direction = step < 0 and "left" or "right",
-            }
-          end
-        end
-        return operations
-      end
-      local column = index.columns[selected_column_id]
-      local is_root = column and column.root and column.root.id == selected.id
-      if axis == "main" and is_root then
-        local columns = state.strips[selected_strip].columns
-        local destination = selected_column + step
-        if destination >= 1 and destination <= #columns then
-          columns[selected_column], columns[destination] = columns[destination], columns[selected_column]
-        end
-        return {}
-      end
-      if axis == "cross" and is_root then
-        local destination_index = selected_strip + step
-        local destination = state.strips[destination_index]
-        if not destination then
-          destination = new_strip(state)
-          if destination_index < 1 then
-            table.insert(state.strips, 1, destination)
-            selected_strip = selected_strip + 1
-          else state.strips[#state.strips + 1] = destination end
-        end
-        table.remove(state.strips[selected_strip].columns, selected_column)
-        table.insert(destination.columns, selected_column_id)
-        state.current = destination
-        compact_strips(state)
-        return {}
-      end
-      local leaves = leaves_for_node(selected)
-      if leaves[1] and leaves[1].window then
-        local destination = axis == "cross" and state.strips[selected_strip + step] or state.strips[selected_strip]
-        if not destination then
-          destination = new_strip(state)
-          if selected_strip + step < 1 then table.insert(state.strips, 1, destination)
-          else state.strips[#state.strips + 1] = destination end
-        end
-        state.pending[leaves[1].window.id] = destination
-        return { { name = "expel", node = selected.id, direction = step < 0 and "left" or "right" } }
-      end
-      return {}
-    end
-  end
-  local column_id = index.node_columns[focused.id]
-  local strip_index, column_index = strip_location(state, column_id)
-  if not strip_index then return {} end
-  local column = index.columns[column_id]
-  local leaves = column_leaves(column, true)
-  local leaf_index
-  for candidate, node in ipairs(leaves) do if node.id == focused.id then leaf_index = candidate end end
-  if not leaf_index then return {} end
-
-  local target
-  if axis == "main" then
-    local target_column_id = state.strips[strip_index].columns[column_index + step]
-    local target_leaves = column_leaves(index.columns[target_column_id], true)
-    target = step < 0 and target_leaves[#target_leaves] or target_leaves[1]
-  else
-    target = leaves[leaf_index + step]
-    if not target and kind == "focus" then
-      local target_strip = state.strips[strip_index + step]
-      if target_strip then
-        local target_column_id = target_strip.columns[clamp(column_index, 1, #target_strip.columns)]
-        local target_leaves = column_leaves(index.columns[target_column_id], true)
-        target = step < 0 and target_leaves[#target_leaves] or target_leaves[1]
-      end
-    end
-  end
-
-  if kind == "focus" then
-    local operation = focus_operation(target)
-    return operation and { operation } or {}
-  end
-  if target then return { { name = "swap-nodes", first = focused.id, second = target.id } } end
-  if axis ~= "cross" then return {} end
-
-  local destination_index = strip_index + step
-  local destination = state.strips[destination_index]
-  if not destination then
-    destination = new_strip(state)
-    if destination_index < 1 then
-      table.insert(state.strips, 1, destination)
-      strip_index, destination_index = strip_index + 1, 1
-    else
-      state.strips[#state.strips + 1] = destination
-      destination_index = #state.strips
-    end
-  end
-  local all_leaves = column_leaves(column, false)
-  if #all_leaves == 1 then
-    table.remove(state.strips[strip_index].columns, column_index)
-    table.insert(destination.columns, clamp(column_index, 1, #destination.columns + 1), column_id)
-    compact_strips(state)
-    return {}
-  end
-  state.pending[focused.window.id] = destination
-  return { { name = "expel", node = focused.id, direction = "right" } }
-end
-
-local function axis_extent(rect, axis)
-  if axis == "main" then return main_axis == "horizontal" and rect.width or rect.height end
-  return main_axis == "horizontal" and rect.height or rect.width
+  return z
 end
 
 local function logical_rect(main, cross, main_size, cross_size)
@@ -700,312 +795,265 @@ local function logical_rect(main, cross, main_size, cross_size)
   end
   return { x = cross, y = main, width = cross_size, height = main_size }
 end
-
-local function logical_components(rect)
+local function components(rect)
   if main_axis == "horizontal" then return rect.x, rect.y, rect.width, rect.height end
   return rect.y, rect.x, rect.height, rect.width
 end
-
-local function screen_rect(virtual, usable, main_camera, cross_camera)
-  local main, cross, main_size, cross_size = logical_components(virtual)
+local function axis_extent(rect, axis)
+  if axis == "main" then return main_axis == "horizontal" and rect.width or rect.height end
+  return main_axis == "horizontal" and rect.height or rect.width
+end
+local function screen_rect(target, usable, main_camera, cross_camera)
+  local main, cross, main_size, cross_size = components(target)
   main, cross = main - main_camera, cross - cross_camera
-  local viewport_main, viewport_cross = axis_extent(usable, "main"), axis_extent(usable, "cross")
-  if main_reverse then main = viewport_main - main - main_size end
-  if cross_reverse then cross = viewport_cross - cross - cross_size end
-  local rect = logical_rect(main, cross, main_size, cross_size)
-  rect.x, rect.y = rect.x + usable.x, rect.y + usable.y
-  return rect
+  if main_reverse then main = axis_extent(usable, "main") - main - main_size end
+  if cross_reverse then cross = axis_extent(usable, "cross") - cross - cross_size end
+  local result = logical_rect(main, cross, main_size, cross_size)
+  result.x, result.y = result.x + usable.x, result.y + usable.y
+  return result
 end
-
-local function target_for_metric(current, metric, index, count, total, viewport)
+local function camera_target(current, metric, index, count, total, viewport)
   if not metric then return 0 end
-  local peek_total = peek + border_width
-  local required_start = index > 1 and metric.start - inner_gap - peek_total or metric.start
-  local required_end = index < count and metric.start + metric.size + inner_gap + peek_total
+  local extra = peek + border_width
+  local first = index > 1 and metric.start - inner_gap - extra or metric.start
+  local last = index < count and metric.start + metric.size + inner_gap + extra
     or metric.start + metric.size
-  local needed_start, needed_end = required_start - outer_gap, required_end + outer_gap
-  local target = current
-  if needed_end - needed_start > viewport then
-    target = metric.start + (metric.size - viewport) / 2
+  local result = current
+  if last - first > viewport then result = metric.start + (metric.size - viewport) / 2
   else
-    if target + viewport < needed_end then target = needed_end - viewport end
-    if target > needed_start then target = needed_start end
+    if result + viewport < last + outer_gap then result = last + outer_gap - viewport end
+    if result > first - outer_gap then result = first - outer_gap end
   end
-  return clamp(target, 0, math.max(0, total - viewport))
+  return clamp(result, 0, math.max(0, total - viewport))
+end
+local function clipped(screen, usable, chrome)
+  local frame = chrome and {
+    x = screen.x - border_width, y = screen.y - decoration_height - border_width,
+    width = screen.width + 2 * border_width,
+    height = screen.height + decoration_height + 2 * border_width,
+  } or screen
+  local left, top = math.max(frame.x, usable.x), math.max(frame.y, usable.y)
+  local right = math.min(frame.x + frame.width, usable.x + usable.width)
+  local bottom = math.min(frame.y + frame.height, usable.y + usable.height)
+  if right <= left or bottom <= top then return { x = 0, y = 0, width = 0, height = 0 } end
+  return { x = left - screen.x, y = top - screen.y, width = right - left, height = bottom - top }
 end
 
-local function ensure_camera(owner, key, initial, now)
-  if not owner[key] then owner[key] = { from = initial, to = initial, started = now } end
-  return owner[key]
-end
-
-local function layout(snapshot, sampled_camera)
-  local usable = snapshot.output.usable
-  local now = snapshot.clock.monotonic_ms
+local function layout(snapshot)
+  local state = sync(snapshot)
+  local usable, now = snapshot.output.usable, snapshot.clock.monotonic_ms
   assert(usable.width > 0 and usable.height > 0, "empty usable output")
-  local state, index = sync_topology(snapshot)
-  local entries, node_columns, strip_metrics = {}, {}, {}
-  local viewport_main = axis_extent(usable, "main")
-  local viewport_cross = axis_extent(usable, "cross")
+  local viewport_main, viewport_cross = axis_extent(usable, "main"), axis_extent(usable, "cross")
   local base_main = math.max(1, viewport_main - 2 * (outer_gap + peek + border_width + inner_gap))
   local base_cross = math.max(1, #state.strips > 1
     and viewport_cross - 2 * (outer_gap + peek + border_width + inner_gap)
-    or viewport_cross - outer_gap * 2 - border_width)
-  local cross_cursor = outer_gap
-
+    or viewport_cross - 2 * outer_gap - border_width)
+  local entries, strip_metrics, cross_cursor, z = {}, {}, outer_gap, 1
   for strip_index, strip in ipairs(state.strips) do
-    local main_cursor, metrics = outer_gap, {}
-    local strip_cross = base_cross
-    for _, column_id in ipairs(strip.columns) do
-      local column = index.columns[column_id]
-      if column and column.root and contains_tiled(column.root) then
-        local minimum = measure(column.root)
-        strip_cross = math.max(strip_cross,
-          main_axis == "horizontal" and minimum.height or minimum.width)
-      end
+    local strip_cross, main_cursor, metrics = base_cross, outer_gap, {}
+    for _, slot in ipairs(strip.roots) do
+      local minimum = minimum_for(slot.node)
+      strip_cross = math.max(strip_cross,
+        main_axis == "horizontal" and minimum.height or minimum.width)
     end
-    for _, column_id in ipairs(strip.columns) do
-      local column = index.columns[column_id]
-      if column and column.root and contains_tiled(column.root) then
-        local minimum = measure(column.root)
-        local minimum_main = main_axis == "horizontal" and minimum.width or minimum.height
-        local requested = math.floor(base_main
-          * clamp(column.width, min_column_width, max_column_width) + 0.5)
-        local main_size = math.max(1, requested, minimum_main)
-        metrics[#metrics + 1] = { id = column.id, start = main_cursor, size = main_size }
-        local entry_start = #entries + 1
-        local rect = logical_rect(main_cursor, cross_cursor + border_width, main_size, strip_cross)
-        walk(column.root, column, rect, true, entries, node_columns)
-        for entry_index = entry_start, #entries do entries[entry_index].strip_index = strip_index end
-        main_cursor = main_cursor + main_size + inner_gap
-      elseif column and column.root then
-        local entry_start = #entries + 1
-        walk(column.root, column, { x = 0, y = 0, width = 1, height = 1 }, true, entries, node_columns)
-        for entry_index = entry_start, #entries do entries[entry_index].strip_index = strip_index end
-      end
+    for _, slot in ipairs(strip.roots) do
+      local minimum = minimum_for(slot.node)
+      local minimum_main = main_axis == "horizontal" and minimum.width or minimum.height
+      local size = math.max(1,
+        math.floor(base_main * clamp(slot.width, min_root_width, max_root_width) + 0.5), minimum_main)
+      metrics[#metrics + 1] = { node = slot.node, start = main_cursor, size = size }
+      z = layout_node(slot.node,
+        logical_rect(main_cursor, cross_cursor + border_width, size, strip_cross), true, entries, z)
+      main_cursor = main_cursor + size + inner_gap
     end
-    local total = #metrics == 0 and outer_gap * 2 or main_cursor - inner_gap + outer_gap
-    strip.metrics, strip.total = metrics, total
+    strip.metrics = metrics
+    strip.total = #metrics == 0 and 2 * outer_gap or main_cursor - inner_gap + outer_gap
     strip_metrics[strip_index] = { start = cross_cursor, size = strip_cross }
     cross_cursor = cross_cursor + strip_cross + inner_gap
   end
-  local cross_total = #state.strips == 0 and outer_gap * 2 or cross_cursor - inner_gap + outer_gap
-
-  local fullscreen, fullscreen_serial
-  for _, entry in ipairs(entries) do
-    if entry.visible and entry.placement == "fullscreen"
-      and (not fullscreen or entry.focus_serial >= fullscreen_serial) then
-      fullscreen, fullscreen_serial = entry, entry.focus_serial
-    end
+  local cross_total = cross_cursor - inner_gap + outer_gap
+  local focused_root = containing_root(snapshot.tag.focused_window
+    and model.window_nodes[snapshot.tag.focused_window])
+  local focused_strip, focused_strip_index
+  if focused_root then
+    local _
+    _, focused_strip, focused_strip_index = root_location(focused_root.id)
   end
-  if fullscreen then
-    for _, entry in ipairs(entries) do
-      entry.visible = entry == fullscreen
-      if entry == fullscreen then entry.virtual = { x = 0, y = 0, width = usable.width, height = usable.height } end
-    end
-  end
-
-  local focused_column = snapshot.tag.focused and node_columns[snapshot.tag.focused] or nil
-  local focused_strip = focused_column and strip_location(state, focused_column) or nil
-  local main_active, focused_main_current, focused_main_target, focused_main_total = false, 0, 0, viewport_main
-  for strip_index, strip in ipairs(state.strips) do
-    local camera = ensure_camera(strip, "camera", strip_index == 1 and sampled_camera or 0, now)
-    local current = sample_number(camera, now)
+  local active = false
+  for _, strip in ipairs(state.strips) do
     local metric, metric_index
-    if strip_index == focused_strip then
-      for candidate_index, candidate in ipairs(strip.metrics) do
-        if candidate.id == focused_column then metric, metric_index = candidate, candidate_index end
+    if strip == focused_strip then
+      for index, candidate in ipairs(strip.metrics) do
+        if candidate.node == focused_root.id then metric, metric_index = candidate, index end
       end
     end
-    local target
-    if fullscreen then
-      target = 0
-    elseif strip_index == focused_strip then
-      target = target_for_metric(
-        current, metric, metric_index or 0, #strip.metrics, strip.total, viewport_main)
-    else
-      target = camera.to
-    end
-    local active
-    if fullscreen then
-      camera.from, camera.to, camera.started, current, active = 0, 0, now, 0, false
-    else current, active = animate_number(camera, target, now) end
-    strip.camera_current, strip.camera_target = current, target
-    main_active = main_active or active
-    if strip_index == focused_strip then
-      focused_main_current, focused_main_target, focused_main_total = current, target, strip.total
+    local current = strip.camera and sample_motion(strip.camera, now) or 0
+    local target = strip == focused_strip
+      and camera_target(current, metric, metric_index or 0, #strip.metrics, strip.total, viewport_main)
+      or (strip.camera and strip.camera.to or 0)
+    local moving
+    strip.camera_current, moving = animate(strip, "camera", target, now)
+    active = active or moving
+  end
+  local cross_current = state.cross_camera and sample_motion(state.cross_camera, now) or 0
+  local cross_target = camera_target(cross_current,
+    focused_strip_index and strip_metrics[focused_strip_index] or nil,
+    focused_strip_index or 0, #state.strips, cross_total, viewport_cross)
+  local cross_moving
+  cross_current, cross_moving = animate(state, "cross_camera", cross_target, now)
+  active = active or cross_moving
+
+  local fullscreen, fullscreen_serial = nil, -1
+  for window, fact in pairs(model.windows) do
+    local leaf = node(model.window_nodes[window])
+    if leaf and leaf.tag == state.id and leaf.state ~= "tiled" then
+      local geometry = leaf.state == "fullscreen" and copy(usable) or copy(fact.floating or {
+        x = usable.x + math.floor(usable.width / 4), y = usable.y + math.floor(usable.height / 4),
+        width = math.max(1, math.floor(usable.width / 2)),
+        height = math.max(1, math.floor(usable.height / 2)),
+      })
+      entries[#entries + 1] = {
+        window = window, state = leaf.state, target = geometry,
+        propose = leaf.state == "fullscreen" and { width = geometry.width, height = geometry.height } or nil,
+        visible = leaf.state ~= "scratchpad" and fact.lifecycle == "managed", z = z,
+      }
+      z = z + 1
+      if leaf.state == "fullscreen" and (fact.focus_serial or 0) >= fullscreen_serial then
+        fullscreen, fullscreen_serial = window, fact.focus_serial or 0
+      end
     end
   end
-
-  local cross_camera = ensure_camera(state, "cross_camera", 0, now)
-  local cross_current = sample_number(cross_camera, now)
-  local cross_target = fullscreen and 0 or target_for_metric(
-    cross_current, focused_strip and strip_metrics[focused_strip] or nil,
-    focused_strip or 0, #state.strips, cross_total, viewport_cross)
-  local cross_active
-  if fullscreen then
-    cross_camera.from, cross_camera.to, cross_camera.started, cross_current, cross_active = 0, 0, now, 0, false
-  else cross_current, cross_active = animate_number(cross_camera, cross_target, now) end
-
-  local motions = window_y_motion[snapshot.tag.id]
-  if not motions then motions = {}; window_y_motion[snapshot.tag.id] = motions end
-  local seen, window_active = {}, false
+  if fullscreen then for _, entry in ipairs(entries) do entry.visible = entry.window == fullscreen end end
   for _, entry in ipairs(entries) do
-    local virtual = entry.virtual
-    local floating = entry.placement == "floating"
-    seen[entry.window] = true
-    local strip = state.strips[entry.strip_index or focused_strip or 1]
-    local screen = floating and {
-      x = virtual.x, y = virtual.y, width = virtual.width, height = virtual.height,
-    } or screen_rect(virtual, usable, strip and strip.camera_current or 0, cross_current)
-    local animated_y, active = animate_window_y(
-      motions, entry.window, screen.y, now,
-      main_axis == "horizontal" and #state.strips == 1
-        and entry.visible and entry.placement == "tiled")
-    window_active = window_active or active
-    if main_axis == "horizontal" and not floating then screen.y = animated_y end
-    local rendered = entry.actual or virtual
+    local fact = model.windows[entry.window] or {}
+    local root = containing_root(model.window_nodes[entry.window])
+    local strip
+    if root then local _; _, strip = root_location(root.id) end
+    local target = entry.state == "tiled"
+      and screen_rect(entry.target, usable, strip and strip.camera_current or 0, cross_current)
+      or entry.target
+    local actual = fact.actual or entry.propose or { width = target.width, height = target.height }
     entry.screen = {
-      x = math.floor(screen.x), y = math.floor(screen.y),
-      width = math.ceil(math.max(0, rendered.width)),
-      height = math.ceil(math.max(0, rendered.height)),
+      x = math.floor(target.x), y = math.floor(target.y),
+      width = math.max(1, math.ceil(actual.width)), height = math.max(1, math.ceil(actual.height)),
     }
-    entry.clip = entry.visible and clipped(entry.screen, usable)
+    entry.clip = entry.visible and clipped(entry.screen, usable, false)
       or { x = 0, y = 0, width = 0, height = 0 }
-    entry.window_clip = entry.visible and clipped_window(entry.screen, usable)
+    entry.window_clip = entry.visible and clipped(entry.screen, usable, true)
       or { x = 0, y = 0, width = 0, height = 0 }
-    entry.propose = entry.visible and entry.placement ~= "scratchpad"
-      and entry.placement ~= "fullscreen"
-    entry.focus_serial, entry.strip_index = nil, nil
+    local focused = entry.window == snapshot.tag.focused_window
+    entry.border = {
+      edges = 0xf, width = border_width,
+      rgba = focused
+        and { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff }
+        or { 0x64646464, 0x64646464, 0x64646464, 0xffffffff },
+    }
+    entry.decoration_height = decoration_height
+    entry.target = nil
   end
-  for id in pairs(motions) do if not seen[id] then motions[id] = nil end end
   return {
-    epoch = snapshot.epoch,
-    tag = snapshot.tag.id,
-    camera_current = focused_main_current,
-    camera_target = focused_main_target,
-    strip_width = focused_main_total,
-    entries = entries,
-    needs_frame = main_active or cross_active or window_active,
+    epoch = snapshot.epoch, output = snapshot.output.id, tag = snapshot.tag.id,
+    entries = entries, needs_frame = active,
   }
 end
 
-local function projection_marks()
-  local nodes, windows = {}, {}
-  local names = {}
-  for name in pairs(layout_marks) do names[#names + 1] = name end
+local function mark_badges()
+  local nodes, windows, strips, names = {}, {}, {}, {}
+  for name in pairs(model.marks) do names[#names + 1] = name end
   table.sort(names)
-  local function add_badge(target, id, name)
-    local badge = name == "primary" and "*" or name
-    target[id] = target[id] and (target[id] .. "," .. badge) or badge
+  local function add(target, id, name)
+    if not id then return end
+    target[id] = string.sub(target[id] and (target[id] .. "," .. name) or name, 1, 24)
   end
   for _, name in ipairs(names) do
-    local mark = layout_marks[name]
-    for _, id in ipairs(mark.nodes) do add_badge(nodes, id, name) end
-    for _, id in ipairs(mark.windows) do add_badge(windows, id, name) end
-  end
-  return nodes, windows
-end
-
-local function project_node(tokens, node, state, marked_nodes, marked_windows)
-  if node.window then
-    local window = node.window
-    if window.lifecycle ~= "managed" or window.placement ~= "tiled" then return false end
-    tokens[#tokens + 1] = {
-      kind = "window", window = window.id,
-      focused = state.focused_node == node.id,
-      selected = state.selection and state.selection.kind == "node" and state.selection.id == node.id,
-      mark = marked_windows[window.id],
-    }
-    return true
-  end
-  local start = #tokens
-  tokens[#tokens + 1] = {
-    kind = "group_open",
-    label = node.mode == "tabbed" and "t" or node.axis == "horizontal" and "h" or "v",
-    selected = state.selection and state.selection.kind == "node" and state.selection.id == node.id,
-    mark = marked_nodes[node.id],
-  }
-  local has_window = false
-  for _, child in ipairs(node.children) do
-    has_window = project_node(tokens, child.node, state, marked_nodes, marked_windows) or has_window
-  end
-  if not has_window then
-    while #tokens > start do table.remove(tokens) end
-    return false
-  end
-  tokens[#tokens + 1] = { kind = "group_close" }
-  return true
-end
-
-local function project(snapshot)
-  local state, index = sync_topology(snapshot)
-  state.focused_node = snapshot.tag.focused
-  local tokens = {}
-  local marked_nodes, marked_windows = projection_marks()
-  local focused_column = snapshot.tag.focused and index.node_columns[snapshot.tag.focused] or nil
-
-  for _, strip in ipairs(state.strips) do
-    local start = #tokens
-    local strip_marked = false
-    for _, column_id in ipairs(strip.columns) do
-      local column = index.columns[column_id]
-      if column and column.root and marked_nodes[column.root.id] then
-        strip_marked = strip_marked and (strip_marked .. "," .. marked_nodes[column.root.id])
-          or marked_nodes[column.root.id]
-      end
+    local target = model.marks[name].target
+    if target then
+      if target.kind == "window" then add(windows, target.window, name)
+      elseif target.kind == "node" then add(nodes, target.id, name)
+      elseif target.kind == "strip" then add(strips, target.id, name) end
     end
-    tokens[#tokens + 1] = {
-      kind = "group_open", label = main_axis == "horizontal" and "h" or "v",
-      selected = state.selection and state.selection.kind == "strip" and state.selection.id == strip.id,
-      mark = strip_marked or nil,
-    }
+  end
+  return nodes, windows, strips
+end
+local function append_item(items, style, text, focused, detail, window, width, action)
+  items[#items + 1] = {
+    style = style, text = text or "", focused = focused == true,
+    detail = detail or "", window = window, width = width, action = action,
+    args = action and window and { tostring(window) } or nil,
+  }
+end
+local function append_open(items, label, selected, mark)
+  local text = "( " .. label .. (mark and mark ~= "" and " " .. mark or "")
+  append_item(items, "group", text, selected, "", nil, math.max(46, 24 + #text * 9))
+end
+local function append_close(items)
+  append_item(items, "group", ")", false, "", nil, 18)
+end
+local function project_node(items, id, focus, node_marks, window_marks)
+  local current = node(id)
+  if not current then return end
+  if current.kind == "window" then
+    append_item(items, "window", "",
+      focus and focus.kind == "window" and focus.window == current.window,
+      window_marks[current.window], current.window, 148, "focus-window")
+    return
+  end
+  append_open(items,
+    current.mode == "tabbed" and "t" or current.axis == "horizontal" and "h" or "v",
+    focus and focus.kind == "node" and focus.id == current.id,
+    node_marks[current.id])
+  for _, child in ipairs(current.children) do
+    project_node(items, child.node, focus, node_marks, window_marks)
+  end
+  append_close(items)
+end
+local function project(snapshot)
+  local state = sync(snapshot)
+  local focus = focused_descriptor(state, snapshot)
+  local node_marks, window_marks, strip_marks = mark_badges()
+  local items = {}
+  local focused_root = containing_root(snapshot.tag.focused_window
+    and model.window_nodes[snapshot.tag.focused_window])
+  for _, strip in ipairs(state.strips) do
+    append_open(items, main_axis == "horizontal" and "h" or "v",
+      focus and focus.kind == "strip" and focus.id == strip.id,
+      strip_marks[strip.id])
     local inserted = false
-    for _, column_id in ipairs(strip.columns) do
-      local column = index.columns[column_id]
-      if column and column.root then project_node(tokens, column.root, state, marked_nodes, marked_windows) end
-      if strip == state.current and column_id == focused_column then
-        tokens[#tokens + 1] = { kind = "insertion", label = "+" }
+    for _, slot in ipairs(strip.roots) do
+      project_node(items, slot.node, focus, node_marks, window_marks)
+      if strip == state.current and focused_root and slot.node == focused_root.id then
+        append_item(items, "insertion", "+", false, "", nil, 18)
         inserted = true
       end
     end
-    if strip == state.current and not inserted then tokens[#tokens + 1] = { kind = "insertion", label = "+" } end
-    if #tokens == start + 1 and strip ~= state.current then
-      table.remove(tokens)
-    else
-      tokens[#tokens + 1] = { kind = "group_close" }
+    if strip == state.current and not inserted then
+      append_item(items, "insertion", "+", false, "", nil, 18)
     end
+    append_close(items)
   end
-
-  for _, group in ipairs({
-    { placement = "floating", label = "float" },
-    { placement = "fullscreen", label = "full" },
-    { placement = "scratchpad", label = "scratch" },
+  for _, wanted in ipairs({
+    { state = "floating", label = "float" },
+    { state = "fullscreen", label = "full" },
+    { state = "scratchpad", label = "scratch" },
   }) do
-    local group_start = #tokens
-    tokens[#tokens + 1] = {
-      kind = "group_open", label = group.label,
-      selected = state.selection and state.selection.kind == "placement"
-        and state.selection.placement == group.placement,
-    }
-    local has_window = false
-    for _, column in ipairs(snapshot.tag.columns) do
-      if column.root then walk_nodes(column.root, function(node)
-        if node.window and node.window.lifecycle == "managed" and node.window.placement == group.placement then
-          has_window = true
-          tokens[#tokens + 1] = {
-            kind = "window", window = node.window.id,
-            focused = snapshot.tag.focused == node.id,
-            selected = state.selection and state.selection.kind == "node" and state.selection.id == node.id,
-            mark = marked_windows[node.window.id],
-          }
-        end
-      end) end
+    local start = #items
+    append_open(items, wanted.label,
+      focus and focus.kind == "state" and focus.state == wanted.state)
+    for window, fact in pairs(model.windows) do
+      local leaf = node(model.window_nodes[window])
+      if leaf and leaf.tag == state.id and leaf.state == wanted.state then
+        append_item(items, "window", "",
+          focus and focus.kind == "window" and focus.window == window,
+          window_marks[window], window, 148, "focus-window")
+      end
     end
-    if has_window then tokens[#tokens + 1] = { kind = "group_close" }
-    else while #tokens > group_start do table.remove(tokens) end end
+    if #items == start + 1 then table.remove(items)
+    else append_close(items) end
   end
-  return tokens
+  return items
 end
 
-return { layout = layout, action = action, project = project }
+return {
+  layout = layout, action = action, project = project,
+  begin_actions = begin_actions, finish_actions = finish_actions,
+}

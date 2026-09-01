@@ -16,12 +16,13 @@ revision in `npins/sources.json`; the Nix build rejects any pin/vendor drift.
 
 - Whirlpool owns the River connection, window/output model, event loop, and
   graphics context.
-- The Zig WM kernel is a pure, strongly tested state machine. It owns durable
-  compositor state but no protocol proxies, sockets, rendering handles, Lua
-  values, or user layout algorithms.
-- Lua owns configuration, rules, named actions, and retained shell composition.
-  It reads immutable WM snapshots and emits typed semantic intents; River and
-  graphics objects never cross the boundary.
+- The Zig WM kernel is a pure, strongly tested state machine. It owns flat
+  compositor facts—windows, outputs, tags, focus, lifecycle, and sizing—but no
+  layout topology, protocol proxies, sockets, rendering handles, or Lua values.
+- Lua owns configuration, rules, the complete layout graph, logical focus,
+  marks, placement policy, animation, and retained shell composition. It reads
+  immutable flat WM snapshots and emits generic per-window effects and frame
+  plans; River and graphics objects never cross the boundary.
 - The shared retained UI and renderer-neutral draw contract are the reusable
   part of the Shoal idea. Skia owns native 2D rasterization; Whirlpool owns its
   Wayland surfaces and one Vulkan graphics context.
@@ -32,9 +33,9 @@ revision in `npins/sources.json`; the Nix build rejects any pin/vendor drift.
   UI; layer-shell roles provide portable panels and overlays under other
   compositors without changing the UI composition.
 
-The checked-in source contains a generation-checked WM kernel with lifecycle
-reconciliation, retained UI composition, callback-lifetime Lua WM snapshots
-and typed intents, PUC Lua protected calls, generated Wayland registry and
+The checked-in source contains a generation-checked flat WM kernel with
+lifecycle reconciliation, retained UI composition, callback-lifetime Lua WM
+snapshots and generic leaf effects, PUC Lua protected calls, generated Wayland registry and
 River-manager lifecycle, and same-epoch WM-plan translation. The River path has live
 window/output/seat facts, same-epoch plan application, per-output shell-role
 ownership, WM-driven decoration selection, and bounded named input intents.
@@ -84,22 +85,26 @@ widgets, an audio OSD, and title/tab decorations. The same retained shell
 content is used by River's integrated shell role and the portable layer-shell
 adapter; River additionally supplies live desktop state and bar interaction.
 
-The sample layout normally focuses leaf windows. `Alt+g` selects the containing
-group (repeat to walk outward), `Alt+Shift+g` walks inward, and `Alt+Escape`
-returns to leaf targeting. Directional `Alt+Shift+h/j/k/l` moves the selected
-window, subtree, or strip; `Alt+Shift+q` closes the selection. `Alt+m` marks it
-and `Alt+Shift+m` summons it to the current strip. Five persistent mark slots
-are available with `Alt+Ctrl+1..5`, summoned with
-`Alt+Ctrl+Shift+1..5`. The bar highlights structural selection, prints mark
-badges, separates every strip and non-tiled placement group, and shows `+` at
-the insertion point for newly opened windows.
+The sample layout has one logical focus, normally a leaf window. `Alt+g` focuses
+its parent (repeat to walk outward), while `Alt+Shift+g` walks back toward the
+active leaf. Directional `Alt+Shift+h/j/k/l`, `Alt+Shift+q`, and mark operations
+all act on that focused Lua node, whether it is a window, group, placement
+group, or strip. Whirlpool itself has no corresponding node or subtree type.
+
+Marks use one-shot Vim-style letter prefixes: `Alt+m a` sets mark `a`,
+`Alt+' a` focuses it, `Alt+Shift+m a` summons it to the current strip,
+`Alt+Ctrl+m a` sends the focused container to it, and `Alt+Ctrl+Shift+m a`
+clears it. `Escape` cancels a pending prefix. The bar highlights the same
+logical focus, prints mark badges, separates every strip and non-tiled
+placement group, and shows `+` at the insertion point for newly opened
+windows.
 
 ## Testing strategy
 
 Window behavior is tested at three layers:
 
-1. Pure model tests cover lifecycle, focus repair, tags, output removal, and
-   cross-output moves with no compositor involved.
+1. Pure Zig model tests cover flat lifecycle, tags, output removal, focus, and
+   per-window effects; Lua controller tests cover topology and layout policy.
 2. River trace tests replay representative staged events, assert ordered
    requests, and verify every started v5 manage/render sequence finishes.
 3. Surface-host and nested-host fixtures cover generated role lifecycles,

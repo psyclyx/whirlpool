@@ -15,8 +15,6 @@ pub const NamedAction = enum {
     close,
     toggle_floating,
     toggle_fullscreen,
-    next_column,
-    previous_column,
 };
 
 pub const Source = union(enum) {

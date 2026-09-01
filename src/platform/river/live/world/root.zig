@@ -21,7 +21,6 @@ const types = host.types;
 const staged_facts = host.staged_facts;
 const composition = host.composition;
 const wm_bridge = host.wm_bridge;
-const window_border_width: i32 = 4;
 pub const input_intents = @import("input.zig");
 pub const live_objects = @import("objects.zig");
 pub const events = @import("events.zig");
@@ -66,12 +65,9 @@ pub const PlanConfig = struct {
         std.mem.Allocator,
         *const wm.WorldView,
         wm.OutputId,
-        f32,
         f64,
     ) anyerror!wm.LayoutPlans = null,
     monotonic_ms: f64 = 0,
-    camera_context: ?*anyopaque = null,
-    sample_camera: ?*const fn (?*anyopaque, types.OutputId, wm.OutputId) anyerror!f32 = null,
 };
 
 /// Result of decoding one generated manager event.  Child creation is kept as
@@ -199,10 +195,6 @@ pub const Adapter = struct {
         self.reserved_bottom = height;
     }
 
-    pub fn windowBorderWidth(_: *const Adapter) i32 {
-        return window_border_width;
-    }
-
     pub fn needsDimensionProposal(self: *const Adapter, proposal: types.WindowSize) !bool {
         const record = self.objects.windows.get(proposal.window) orelse return error.UnknownWindow;
         return record.actual_size == null or record.last_proposed_size == null or
@@ -273,6 +265,7 @@ pub const Adapter = struct {
             if (record.placement_applied == .fullscreen and state.placement != .fullscreen)
                 try operations.append(self.allocator, .{ .exit_fullscreen = window });
             switch (state.placement) {
+                .unplaced => {},
                 .fullscreen => {
                     const wm_output = state.output orelse return error.UnknownOutput;
                     const output = self.objects.wm_to_output.get(wm_output) orelse return error.UnknownOutput;
@@ -285,13 +278,30 @@ pub const Adapter = struct {
         }
     }
 
-    pub fn commitWindowPlacementRequests(self: *Adapter) void {
-        for (self.objects.window_order.items) |window| {
-            const record = self.objects.windows.getPtr(window) orelse continue;
-            const wm_id = record.wm_id orelse continue;
-            const state = self.world.getWindow(wm_id) orelse continue;
-            record.placement_applied = state.placement;
-        }
+    pub fn needsWindowPlacementRequest(self: *const Adapter, operation: types.ManageOperation) bool {
+        const desired: struct { window: types.WindowId, placement: wm.Placement } = switch (operation) {
+            .set_tiled => |value| .{ .window = value.window, .placement = if (value.edges == 0) .floating else .tiled },
+            .fullscreen => |value| .{ .window = value.window, .placement = .fullscreen },
+            else => return true,
+        };
+        const record = self.objects.windows.get(desired.window) orelse return false;
+        return record.placement_applied != desired.placement;
+    }
+
+    pub fn commitWindowPlacementRequests(self: *Adapter, operations: []const types.ManageOperation) void {
+        for (operations) |operation| switch (operation) {
+            .set_tiled => |value| {
+                if (self.objects.windows.getPtr(value.window)) |record|
+                    record.placement_applied = if (value.edges == 0) .floating else .tiled;
+            },
+            .fullscreen => |value| {
+                if (self.objects.windows.getPtr(value.window)) |record| record.placement_applied = .fullscreen;
+            },
+            .exit_fullscreen => |window| {
+                if (self.objects.windows.getPtr(window)) |record| record.placement_applied = null;
+            },
+            else => {},
+        };
     }
 
     pub fn appendPointerOperationRequests(self: *const Adapter, operations: *std.ArrayList(types.ManageOperation)) !void {
@@ -345,29 +355,6 @@ pub const Adapter = struct {
             if (record.layer_focus == .exclusive) continue;
             record.applied_window_focus = focused;
             record.focus_needs_reassert = false;
-        }
-    }
-
-    /// Match the active Tidepool profile: four-pixel borders on every edge,
-    /// white for the globally focused window and gray for every other window.
-    /// River retains border state, so render sequences carry only transitions.
-    pub fn appendWindowBorderRequests(self: *const Adapter, operations: *std.ArrayList(types.RenderOperation)) !void {
-        const focused = self.focusedWindow();
-        for (self.objects.window_order.items) |window| {
-            const record = self.objects.windows.get(window) orelse continue;
-            const desired = windowBorders(window, record.wm_id != null and record.wm_id == focused);
-            if (record.borders_applied != null and std.meta.eql(record.borders_applied.?, desired)) continue;
-            try operations.append(self.allocator, .{ .set_borders = desired });
-        }
-    }
-
-    /// Record border requests only once the complete render transaction was
-    /// accepted, leaving failed transitions eligible for retry.
-    pub fn commitWindowBorderRequests(self: *Adapter) void {
-        const focused = self.focusedWindow();
-        for (self.objects.window_order.items) |window| {
-            const record = self.objects.windows.getPtr(window) orelse continue;
-            record.borders_applied = windowBorders(window, record.wm_id != null and record.wm_id == focused);
         }
     }
 
@@ -557,12 +544,8 @@ pub const Adapter = struct {
         for (self.objects.output_order.items) |river_output| {
             const output_record = self.objects.outputs.get(river_output) orelse continue;
             const output = output_record.wm_id orelse continue;
-            const camera = if (config.sample_camera) |sample|
-                try sample(config.camera_context, river_output, output)
-            else
-                try currentCamera(&self.world, output);
             const build_layout = config.build_layout orelse return error.MissingLayoutProvider;
-            const layout_plans = try build_layout(config.layout_context, self.allocator, &snapshot, output, camera, config.monotonic_ms);
+            const layout_plans = try build_layout(config.layout_context, self.allocator, &snapshot, output, config.monotonic_ms);
             var plans = try composition.translateFrame(self.allocator, layout_plans, self.hostResolver());
             errdefer plans.deinit();
             if (plans.epoch != epoch or plans.manage.context.epoch != plans.render.context.epoch)
@@ -607,34 +590,9 @@ pub const Adapter = struct {
     }
 
     fn focusedWindow(self: *const Adapter) ?wm.WindowId {
-        var focused: ?wm.WindowId = null;
-        var best_serial: u64 = 0;
-        for (self.objects.output_order.items) |river_output| {
-            const output = (self.objects.outputs.get(river_output) orelse continue).wm_id orelse continue;
-            const window_id = self.world.view().focusedWindow(output) orelse continue;
-            const window = self.world.getWindow(window_id) orelse continue;
-            if (focused == null or window.focus_serial > best_serial) {
-                focused = window_id;
-                best_serial = window.focus_serial;
-            }
-        }
-        return focused;
+        return self.world.view().focusedWindow();
     }
 };
-
-fn windowBorders(window: types.WindowId, focused: bool) types.WindowBorders {
-    const component_max = std.math.maxInt(u32);
-    const normal = @as(u32, 0x64) * @as(u32, 0x01010101);
-    return .{
-        .window = window,
-        .edges = 0xf,
-        .width = window_border_width,
-        .rgba = if (focused)
-            .{ component_max, component_max, component_max, component_max }
-        else
-            .{ normal, normal, normal, component_max },
-    };
-}
 
 fn resolveSelectionOutput(raw: ?*anyopaque, id: types.OutputId) ?wm.OutputId {
     const self: *const Adapter = @ptrCast(@alignCast(raw.?));
@@ -662,12 +620,6 @@ test "River layer-shell usable area replaces full output bounds" {
     try std.testing.expectEqual(@as(u32, 1080), spec.bounds.height);
 }
 
-fn currentCamera(world: *const wm.World, output: wm.OutputId) !f32 {
-    const output_value = world.getOutput(output) orelse return error.UnknownOutput;
-    const tag = world.getTag(output_value.active_tag) orelse return error.UnknownTag;
-    return tag.camera.current;
-}
-
 fn protocolBits(value: anytype) u32 {
     return switch (@typeInfo(@TypeOf(value))) {
         .@"enum" => @intCast(@intFromEnum(value)),
@@ -689,64 +641,28 @@ fn testBuildLayout(
     allocator: std.mem.Allocator,
     snapshot: *const wm.WorldView,
     output_id: wm.OutputId,
-    sampled_camera: f32,
     _: f64,
 ) !wm.LayoutPlans {
     const output = snapshot.getOutput(output_id) orelse return error.UnknownOutput;
-    const tag = snapshot.getTag(output.active_tag) orelse return error.UnknownTag;
-    const camera: wm.CameraTarget = .{
-        .tag = tag.id,
-        .current = sampled_camera,
-        .target = sampled_camera,
-        .strip_width = @floatFromInt(output.usable.width),
-    };
     var result: wm.LayoutPlans = .{
-        .manage = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id, .camera = camera } },
-        .render = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id, .camera = camera } },
+        .manage = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id } },
+        .render = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id } },
     };
     errdefer result.deinit();
-    for (tag.columns.items) |column_id| {
-        const column = snapshot.getColumn(column_id) orelse return error.UnknownColumn;
-        if (column.root) |root| try appendTestNode(allocator, snapshot, root, column_id, output.usable, &result);
-    }
-    return result;
-}
-
-fn appendTestNode(
-    allocator: std.mem.Allocator,
-    snapshot: *const wm.WorldView,
-    node_id: wm.NodeId,
-    column: wm.ColumnId,
-    rect: wm.Rect,
-    result: *wm.LayoutPlans,
-) !void {
-    const node = snapshot.getNode(node_id) orelse return error.UnknownNode;
-    if (node.window) |window_id| {
+    var ordinal: usize = 0;
+    while (snapshot.windowAt(ordinal)) |window_id| : (ordinal += 1) {
         const window = snapshot.getWindow(window_id) orelse return error.UnknownWindow;
-        const virtual: wm.FRect = .{
-            .x = @floatFromInt(rect.x),
-            .y = @floatFromInt(rect.y),
-            .width = @floatFromInt(rect.width),
-            .height = @floatFromInt(rect.height),
-        };
-        try result.manage.dimensions.append(allocator, .{
-            .window = window_id,
-            .column = column,
-            .size = .{ .width = rect.width, .height = rect.height },
-            .virtual = virtual,
-        });
+        if (window.output != output_id or window.tag != output.active_tag or window.lifecycle != .managed) continue;
+        try result.manage.dimensions.append(allocator, .{ .window = window_id, .size = .{ .width = output.usable.width, .height = output.usable.height } });
         try result.render.entries.append(allocator, .{
             .window = window_id,
-            .column = column,
-            .placement = window.placement,
-            .target_virtual = virtual,
-            .screen = rect,
-            .clip = .{ .x = 0, .y = 0, .width = rect.width, .height = rect.height },
+            .screen = output.usable,
+            .clip = .{ .x = 0, .y = 0, .width = output.usable.width, .height = output.usable.height },
             .visible = true,
+            .z_index = @intCast(ordinal),
         });
-        return;
     }
-    for (node.children.items) |child| try appendTestNode(allocator, snapshot, child.id, column, rect, result);
+    return result;
 }
 
 test "generated River v5 forwarding edge type-checks" {
@@ -856,43 +772,6 @@ test "seat focus requests follow world focus and are edge triggered" {
     try std.testing.expectEqual(first, operations.items[0].focus_window.window);
 }
 
-test "window border requests follow focus and are edge triggered" {
-    var adapter = Adapter.init(std.testing.allocator, .{});
-    defer adapter.deinit();
-
-    const seat = try adapter.objects.bindSeat(fakeRef(0xf200));
-    const output = try adapter.objects.bindOutput(fakeRef(0xf210));
-    try adapter.stageManageFact(.{ .output_position = .{ .output = output, .position = .{ .x = 0, .y = 0 } } });
-    try adapter.stageManageFact(.{ .output_dimensions = .{ .output = output, .size = .{ .width = 800, .height = 600 } } });
-    const first = try adapter.objects.bindWindow(fakeRef(0xf220), fakeRef(0xf221));
-    const second = try adapter.objects.bindWindow(fakeRef(0xf230), fakeRef(0xf231));
-    var initial = try adapter.beginManage(testPlanConfig());
-    initial.deinit();
-
-    var operations = std.ArrayList(types.RenderOperation).empty;
-    defer operations.deinit(std.testing.allocator);
-    try adapter.appendWindowBorderRequests(&operations);
-    try std.testing.expectEqual(@as(usize, 2), operations.items.len);
-    try std.testing.expectEqual(@as(u32, 0x64646464), operations.items[0].set_borders.rgba[0]);
-    try std.testing.expectEqual(std.math.maxInt(u32), operations.items[1].set_borders.rgba[0]);
-    try std.testing.expectEqual(@as(i32, 4), operations.items[1].set_borders.width);
-
-    adapter.commitWindowBorderRequests();
-    operations.clearRetainingCapacity();
-    try adapter.appendWindowBorderRequests(&operations);
-    try std.testing.expectEqual(@as(usize, 0), operations.items.len);
-
-    try adapter.stageManageFact(.{ .seat_window_interaction = .{ .seat = seat, .window = first } });
-    var focused = try adapter.beginManage(testPlanConfig());
-    focused.deinit();
-    try adapter.appendWindowBorderRequests(&operations);
-    try std.testing.expectEqual(@as(usize, 2), operations.items.len);
-    try std.testing.expectEqual(first, operations.items[0].set_borders.window);
-    try std.testing.expectEqual(std.math.maxInt(u32), operations.items[0].set_borders.rgba[0]);
-    try std.testing.expectEqual(second, operations.items[1].set_borders.window);
-    try std.testing.expectEqual(@as(u32, 0x64646464), operations.items[1].set_borders.rgba[0]);
-}
-
 test "fake River facts reconcile a WM world and compose one immutable frame epoch" {
     var adapter = Adapter.init(std.testing.allocator, .{});
     defer adapter.deinit();
@@ -961,7 +840,7 @@ test "output reconciliation preserves workspace changes and places new windows t
     try std.testing.expectEqual(second, adapter.world.getWindow(try adapter.objects.wmWindowId(window)).?.tag);
 }
 
-test "new windows become focused half-width columns after current focus" {
+test "new windows are admitted as flat managed resources on the active tag" {
     var adapter = Adapter.init(std.testing.allocator, .{});
     defer adapter.deinit();
 
@@ -976,28 +855,22 @@ test "new windows become focused half-width columns after current focus" {
 
     const first_id = try adapter.objects.wmWindowId(first);
     const second_id = try adapter.objects.wmWindowId(second);
-    const first_node = adapter.world.nodeForWindow(first_id).?;
-    const second_node = adapter.world.nodeForWindow(second_id).?;
-    const first_column = adapter.world.getNode(first_node).?.column;
-    const second_column = adapter.world.getNode(second_node).?.column;
-    try std.testing.expect(first_column != second_column);
-    const tag = adapter.world.getWindow(first_id).?.tag;
-    const columns = adapter.world.tagColumns(tag).?;
-    try std.testing.expectEqual(@as(usize, 2), columns.len);
-    try std.testing.expectEqual(first_column, columns[0]);
-    try std.testing.expectEqual(second_column, columns[1]);
-    try std.testing.expectEqual(@as(f32, 0.5), adapter.world.getColumn(first_column).?.width);
-    try std.testing.expectEqual(@as(f32, 0.5), adapter.world.getColumn(second_column).?.width);
-    try std.testing.expectEqual(second_node, adapter.world.getTag(tag).?.focused.?);
+    const first_window = adapter.world.getWindow(first_id).?;
+    const second_window = adapter.world.getWindow(second_id).?;
+    try std.testing.expectEqual(wm.Lifecycle.managed, first_window.lifecycle);
+    try std.testing.expectEqual(wm.Lifecycle.managed, second_window.lifecycle);
+    try std.testing.expectEqual(first_window.tag, second_window.tag);
+    try std.testing.expectEqual(first_window.output, second_window.output);
+    try std.testing.expectEqual(second_id, adapter.world.focusedWindow().?);
 
     try adapter.stageManageFact(.{ .window_closed = first });
     var closed = try adapter.beginManage(testPlanConfig());
     defer closed.deinit();
-    const remaining = adapter.world.tagColumns(tag).?;
-    try std.testing.expectEqualSlices(wm.ColumnId, &.{second_column}, remaining);
+    try std.testing.expect(adapter.world.getWindow(first_id) == null);
+    try std.testing.expect(adapter.world.getWindow(second_id) != null);
 }
 
-test "default placement floats dialogs and preserves later explicit policy" {
+test "default placement stays neutral and preserves later explicit policy" {
     var adapter = Adapter.init(std.testing.allocator, .{});
     defer adapter.deinit();
 
@@ -1023,31 +896,41 @@ test "default placement floats dialogs and preserves later explicit policy" {
     const fixed_id = try adapter.objects.wmWindowId(fixed);
     const constrained_id = try adapter.objects.wmWindowId(constrained);
     const child_id = try adapter.objects.wmWindowId(child);
-    try std.testing.expectEqual(wm.Placement.tiled, adapter.world.getWindow(normal_id).?.placement);
-    try std.testing.expectEqual(wm.Placement.floating, adapter.world.getWindow(fixed_id).?.placement);
-    try std.testing.expectEqual(wm.Placement.floating, adapter.world.getWindow(constrained_id).?.placement);
-    try std.testing.expectEqual(wm.Placement.floating, adapter.world.getWindow(child_id).?.placement);
+    try std.testing.expectEqual(wm.Placement.unplaced, adapter.world.getWindow(normal_id).?.placement);
+    try std.testing.expectEqual(wm.Placement.unplaced, adapter.world.getWindow(fixed_id).?.placement);
+    try std.testing.expectEqual(wm.Placement.unplaced, adapter.world.getWindow(constrained_id).?.placement);
+    try std.testing.expectEqual(wm.Placement.unplaced, adapter.world.getWindow(child_id).?.placement);
     var placement_operations = std.ArrayList(types.ManageOperation).empty;
     defer placement_operations.deinit(std.testing.allocator);
     try adapter.appendWindowPlacementRequests(&placement_operations);
-    try std.testing.expectEqual(@as(usize, 4), placement_operations.items.len);
-    try std.testing.expectEqual(@as(u32, 0xf), placement_operations.items[0].set_tiled.edges);
-    for (placement_operations.items[1..]) |operation|
-        try std.testing.expectEqual(@as(u32, 0), operation.set_tiled.edges);
-    adapter.commitWindowPlacementRequests();
+    try std.testing.expectEqual(@as(usize, 0), placement_operations.items.len);
+    adapter.commitWindowPlacementRequests(placement_operations.items);
 
+    const admitted_fullscreen: types.ManageOperation = .{ .fullscreen = .{ .window = fixed, .output = output } };
+    adapter.commitWindowPlacementRequests(&.{admitted_fullscreen});
+    try std.testing.expect(!adapter.needsWindowPlacementRequest(admitted_fullscreen));
     _ = try adapter.world.applyAtomically(&.{.{ .window = .{ .set_placement = .{
         .window = fixed_id,
         .placement = .tiled,
     } } }});
+    try adapter.appendWindowPlacementRequests(&placement_operations);
+    try std.testing.expectEqual(@as(usize, 2), placement_operations.items.len);
+    try std.testing.expectEqual(fixed, placement_operations.items[0].exit_fullscreen);
+    try std.testing.expectEqual(@as(u32, 0xf), placement_operations.items[1].set_tiled.edges);
+    adapter.commitWindowPlacementRequests(placement_operations.items);
+
+    _ = try adapter.world.applyAtomically(&.{.{ .window = .{ .set_placement = .{
+        .window = fixed_id,
+        .placement = .floating,
+    } } }});
     var subsequent = try adapter.beginManage(testPlanConfig());
     subsequent.deinit();
-    try std.testing.expectEqual(wm.Placement.tiled, adapter.world.getWindow(fixed_id).?.placement);
+    try std.testing.expectEqual(wm.Placement.floating, adapter.world.getWindow(fixed_id).?.placement);
     placement_operations.clearRetainingCapacity();
     try adapter.appendWindowPlacementRequests(&placement_operations);
     try std.testing.expectEqual(@as(usize, 1), placement_operations.items.len);
     try std.testing.expectEqual(fixed, placement_operations.items[0].set_tiled.window);
-    try std.testing.expectEqual(@as(u32, 0xf), placement_operations.items[0].set_tiled.edges);
+    try std.testing.expectEqual(@as(u32, 0), placement_operations.items[0].set_tiled.edges);
 }
 
 test "late dimensions for a window closed in the preceding manage cycle are ignored" {

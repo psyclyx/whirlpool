@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwp_linux_dmabuf_v1", 3);
     scanner.generate("zwlr_layer_shell_v1", 4);
     scanner.generate("river_window_manager_v1", 5);
-    scanner.generate("river_xkb_bindings_v1", 1);
+    scanner.generate("river_xkb_bindings_v1", 3);
     scanner.generate("river_layer_shell_v1", 1);
 
     const wayland = b.createModule(.{

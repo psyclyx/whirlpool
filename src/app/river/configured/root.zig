@@ -70,7 +70,12 @@ pub const Services = struct {
         };
         if (self.layout) |*layout| options.layout = .{
             .context = @ptrCast(layout),
-            .action = .{ .context = @ptrCast(layout), .run = river_layout.Runtime.actionHook },
+            .action = .{
+                .context = @ptrCast(layout),
+                .begin = river_layout.Runtime.beginActionsHook,
+                .run = river_layout.Runtime.actionHook,
+                .finish = river_layout.Runtime.finishActionsHook,
+            },
             .build = river_layout.Runtime.buildHook,
             .project = river_layout.Runtime.projectHook,
         };
@@ -104,6 +109,7 @@ pub const Services = struct {
         const actions = try keybindings.takeActions();
         defer self.allocator.free(actions);
         for (actions) |action| try host.queueConfiguredAction(action);
+        if (keybindings.hasPendingModeChange()) host.requestManage();
     }
 
     /// Return one configured surface borrowed from the owned config.
@@ -121,7 +127,7 @@ pub const Services = struct {
 
     fn onManage(raw: ?*anyopaque) !void {
         const keybindings: *river_keybindings.Runtime = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-        try keybindings.enablePending();
+        try keybindings.applyPendingMode();
     }
 
     fn spawn(raw: ?*anyopaque, argv: []const []const u8) !void {

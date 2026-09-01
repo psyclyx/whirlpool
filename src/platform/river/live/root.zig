@@ -208,9 +208,13 @@ pub const Manager = struct {
         }
     }
 
-    pub fn placeDecorationRoles(self: *Manager, height: i32, border_width: i32) !void {
-        const position = try decorationPosition(height, border_width);
-        for (self.decoration_roles.items) |role| role.decoration.setOffset(position.x, position.y);
+    pub fn placeDecorationRoles(
+        self: *Manager,
+        context: ?*anyopaque,
+        resolve: *const fn (?*anyopaque, *wayland.client.river.WindowV1) ?DecorationPosition,
+    ) void {
+        for (self.decoration_roles.items) |role| if (resolve(context, role.window)) |position|
+            role.decoration.setOffset(position.x, position.y);
     }
 
     /// Create a compositor-owned surface and assign it a River decoration
@@ -471,7 +475,7 @@ pub const Manager = struct {
     }
 };
 
-fn decorationPosition(height: i32, border_width: i32) !DecorationPosition {
+pub fn decorationPosition(height: i32, border_width: i32) !DecorationPosition {
     if (height < 0 or border_width < 0) return error.InvalidDecorationGeometry;
     return .{
         .x = try std.math.sub(i32, 0, border_width),

@@ -80,8 +80,8 @@ local function build(parent)
     role = "shell",
     selected = 1,
     occupied = {},
-    tokens = {},
-    token_count = 0,
+    items = {},
+    item_count = 0,
   }
 
   local root = parent:stack()
@@ -109,8 +109,8 @@ local function build(parent)
 
   local strip = bar:stack({ height = BAR_HEIGHT, flex = 1, clip = true })
   local strip_content = strip:row({ width = 1, height = BAR_HEIGHT, gap = 4 })
-  local window_tokens = {}
-  local function create_window_token()
+  local display_items = {}
+  local function create_display_item()
     local cell = strip_content:stack({ width = 1, height = BAR_HEIGHT, opacity = 0, clip = true })
     local background = cell:shape({ fill = CLEAR, radius = 3 })
     local group_label = cell:text({ text = "", font_size = 17, text_color = theme.bright, padding = { 8, 5, 0, 5 } })
@@ -120,7 +120,7 @@ local function build(parent)
     local labels = window:column({ gap = 1 })
     local app_id = labels:text({ text = "", height = 12, font_size = 11, text_color = theme.text })
     local title = labels:text({ text = "", height = 10, font_size = 9, text_color = theme.muted })
-    window_tokens[#window_tokens + 1] = {
+    display_items[#display_items + 1] = {
       cell = cell,
       background = background,
       group_label = group_label,
@@ -202,8 +202,8 @@ local function build(parent)
   local function update_desktop(values)
     state.selected = math.floor(tonumber(values[1]) or state.selected)
     state.occupied = type(values[2]) == "table" and values[2] or state.occupied
-    state.tokens = type(values[3]) == "table" and values[3] or {}
-    while #window_tokens < #state.tokens do create_window_token() end
+    state.items = type(values[3]) == "table" and values[3] or {}
+    while #display_items < #state.items do create_display_item() end
 
     for index, item in ipairs(workspace_cells) do
       local active = index == state.selected
@@ -213,51 +213,44 @@ local function build(parent)
       item.background:set("fill", active and theme.accent or CLEAR)
       item.label:set("text_color", active and theme.bg or theme.text)
     end
-    for index = 1, math.max(state.token_count, #state.tokens) do
-      local item = window_tokens[index]
-      local token = state.tokens[index]
-      if token then
-        local kind = math.floor(tonumber(token[1]) or 0)
-        local is_window = kind == 2
-        local is_insertion = kind == 3
-        local focused = token[5] == true
-        local selected = token[8] == true
-        local mark_text = tostring(token[9] or "")
-        local marked = mark_text ~= ""
-        local app_id = tostring(token[3] or "")
-        local title = tostring(token[4] or "")
-        item.cell:set("width", math.max(1, math.floor(tonumber(token[6]) or 1)))
-        item.cell:set("opacity", 1)
-        local group_text = ""
-        if kind == 0 then group_text = "( " .. tostring(token[2] or "") .. (marked and " " .. mark_text or "")
-        elseif kind == 1 then group_text = ")"
-        elseif is_insertion then group_text = "+"
-        end
-        item.group_label:set("text", group_text)
-        item.group_label:set("opacity", is_window and 0 or 1)
-        item.window:set("opacity", is_window and 1 or 0)
-        item.background:set("fill", selected and theme.blend(theme.accent, 112)
-          or focused and theme.blend(theme.accent, 72)
+    for index = 1, math.max(state.item_count, #state.items) do
+      local view = display_items[index]
+      local item = state.items[index]
+      if item then
+        local style = tostring(item[1] or "")
+        local is_window = style == "window"
+        local is_insertion = style == "insertion"
+        local focused = item[5] == true
+        local detail = tostring(item[8] or "")
+        local marked = detail ~= ""
+        local app_id = tostring(item[3] or "")
+        local title = tostring(item[4] or "")
+        view.cell:set("width", math.max(1, math.floor(tonumber(item[6]) or 1)))
+        view.cell:set("opacity", 1)
+        view.group_label:set("text", tostring(item[2] or ""))
+        view.group_label:set("opacity", is_window and 0 or 1)
+        view.window:set("opacity", is_window and 1 or 0)
+        view.background:set("fill", focused and theme.blend(theme.accent, 112)
           or is_insertion and theme.blend(theme.accent, 48)
-          or (kind == 0 or kind == 1) and theme.blend(theme.blue, 26)
+          or style == "group" and theme.blend(theme.blue, 26)
           or CLEAR)
-        local width = math.max(1, math.floor(tonumber(token[6]) or 1))
+        local width = math.max(1, math.floor(tonumber(item[6]) or 1))
         local app_limit = math.max(4, math.floor((width - 48) / 7))
         local title_limit = math.max(5, math.floor((width - 48) / 6))
-        item.icon:set("icon_source", is_window and tostring(token[7] or "") or "")
-        item.mark:set("text", mark_text)
-        item.mark:set("width", marked and math.max(10, #mark_text * 7) or 1)
-        item.mark:set("opacity", marked and 1 or 0)
-        item.app_id:set("text", is_window and ellipsis(app_id, app_limit) or "")
-        item.app_id:set("text_color", focused and theme.bright or theme.text)
-        item.title:set("text", is_window and ellipsis(title, title_limit) or "")
-        item.title:set("text_color", focused and theme.text or theme.muted)
+        view.icon:set("icon_source", is_window and tostring(item[7] or "") or "")
+        view.mark:set("text", detail)
+        view.mark:set("width", marked and math.max(10, #detail * 7) or 1)
+        view.mark:set("opacity", marked and 1 or 0)
+        view.app_id:set("text", is_window and ellipsis(app_id, app_limit) or "")
+        view.app_id:set("text_color", focused and theme.bright or theme.text)
+        view.title:set("text", is_window and ellipsis(title, title_limit) or "")
+        view.title:set("text_color", focused and theme.text or theme.muted)
       else
-        item.cell:set("width", 1)
-        item.cell:set("opacity", 0)
+        view.cell:set("width", 1)
+        view.cell:set("opacity", 0)
       end
     end
-    state.token_count = #state.tokens
+    state.item_count = #state.items
     strip_content:set("width", math.max(1, math.floor(tonumber(values[5]) or 1)))
     strip_content:set("offset_x", -math.max(0, math.floor(tonumber(values[4]) or 0)))
     left_fade:set("opacity", values[6] == true and 1 or 0)

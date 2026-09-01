@@ -12,6 +12,7 @@ pub const Spawn = struct {
 /// Invoke one opaque configured action in the retained layout controller.
 pub const Layout = struct {
     context: ?*anyopaque = null,
+    begin: ?*const fn (?*anyopaque) anyerror!void = null,
     run: *const fn (
         ?*anyopaque,
         *const script.Snapshot,
@@ -20,6 +21,7 @@ pub const Layout = struct {
         []const []const u8,
         *script.IntentBatch,
     ) anyerror!void,
+    finish: ?*const fn (?*anyopaque, bool) anyerror!void = null,
 };
 
 pub fn append(
@@ -59,99 +61,10 @@ const Runner = struct {
     fn appendOne(self: *Runner, action: script.config.Action) !void {
         switch (action) {
             .layout => |value| if (self.focus_output) |output| if (self.layout) |hook|
-                hook.run(hook.context, self.snapshot, output, value.name, value.args, self.intents) catch |err|
-                    std.log.warn("layout action '{s}' failed: {s}", .{ value.name, @errorName(err) }),
-            .absorb => |direction| if (self.focus_output) |output| try self.intents.append(.{ .absorb = .{ .output = output, .direction = direction } }),
-            .eject => if (focusedNode(self.snapshot)) |node| try self.intents.append(.{ .eject = node }),
-            .expel => |direction| if (focusedNode(self.snapshot)) |node| try self.intents.append(.{ .expel = .{ .node = node, .direction = direction } }),
-            .close_focused => if (self.focusedWindow()) |window| try self.intents.append(.{ .close_window = window }),
-            .toggle_float => try self.togglePlacement(.floating, .tiled, .floating),
-            .toggle_fullscreen => try self.togglePlacement(.fullscreen, .exit_fullscreen, .fullscreen),
-            .cycle_width => |step| if (focusedNode(self.snapshot)) |node_id| {
-                const node = self.snapshot.getNode(node_id) orelse return;
-                try self.intents.append(.{ .cycle_column_width = .{ .column = node.column, .step = step } });
-            },
-            .cycle_container_mode => try self.cycleContainerMode(),
-            .focus_tab => |step| try self.focusTab(step),
-            .focus_output => |step| try self.focusOutput(step),
-            .focus_tag => |ordinal| try self.focusTag(ordinal),
-            .send_to_tag => |ordinal| try self.sendToTag(ordinal),
+                try hook.run(hook.context, self.snapshot, output, value.name, value.args, self.intents),
+            .enter_mode => {},
             .spawn => |args| try self.spawnCommand(args),
         }
-    }
-
-    fn focusedWindow(self: *const Runner) ?wm.WindowId {
-        const output = self.focus_output orelse return null;
-        return self.snapshot.focusedWindow(output);
-    }
-
-    fn togglePlacement(self: *Runner, current: wm.Placement, otherwise: wm.PlacementTransition, selected: wm.PlacementTransition) !void {
-        const window = self.focusedWindow() orelse return;
-        const state = self.snapshot.getWindow(window) orelse return;
-        try self.intents.append(.{ .transition_placement = .{
-            .window = window,
-            .transition = if (state.placement == current) otherwise else selected,
-        } });
-    }
-
-    fn cycleContainerMode(self: *Runner) !void {
-        const parent = focusedParent(self.snapshot) orelse return;
-        const next = nextContainerState(parent.mode orelse return, parent.axis);
-        try self.intents.append(.{ .set_container_mode = .{
-            .node = parent.id,
-            .mode = next.mode,
-            .axis = next.axis,
-        } });
-    }
-
-    fn focusTab(self: *Runner, step: script.config.TabStep) !void {
-        const parent = focusedParent(self.snapshot) orelse return;
-        if (parent.mode != .tabbed or parent.children.items.len < 2) return;
-        std.debug.assert(parent.active_child < parent.children.items.len);
-        const next = switch (step) {
-            .previous => if (parent.active_child == 0) parent.children.items.len - 1 else parent.active_child - 1,
-            .next => (parent.active_child + 1) % parent.children.items.len,
-        };
-        try self.intents.append(.{ .set_active_tab = .{
-            .container = parent.id,
-            .child = parent.children.items[next].id,
-        } });
-    }
-
-    fn focusOutput(self: *Runner, step: script.config.TabStep) !void {
-        const count = self.snapshot.liveOutputCount();
-        if (count < 2) return;
-        const current = self.focus_output orelse return;
-        var current_index: usize = 0;
-        while (current_index < count and self.snapshot.outputAt(current_index) != current) : (current_index += 1) {}
-        if (current_index == count) return;
-        const next_index = switch (step) {
-            .previous => if (current_index == 0) count - 1 else current_index - 1,
-            .next => (current_index + 1) % count,
-        };
-        const output = self.snapshot.outputAt(next_index) orelse return;
-        self.focus_output = output;
-        if (self.snapshot.focusedWindow(output)) |window| try self.intents.append(.{ .focus_window = window });
-    }
-
-    fn focusTag(self: *Runner, ordinal: u8) !void {
-        std.debug.assert(ordinal > 0);
-        const output = self.focusedWindowOutput() orelse return;
-        const tag = self.snapshot.tagAt(ordinal - 1) orelse return;
-        try self.intents.append(.{ .set_active_tag = .{ .output = output, .tag = tag } });
-    }
-
-    fn sendToTag(self: *Runner, ordinal: u8) !void {
-        std.debug.assert(ordinal > 0);
-        const output = self.focus_output orelse return;
-        const tag = self.snapshot.tagAt(ordinal - 1) orelse return;
-        try self.intents.append(.{ .send_focused_window = .{ .source_output = output, .tag = tag } });
-    }
-
-    fn focusedWindowOutput(self: *const Runner) ?wm.OutputId {
-        const focused_output = self.focus_output orelse return null;
-        const window = self.snapshot.focusedWindow(focused_output) orelse return focused_output;
-        return (self.snapshot.getWindow(window) orelse return null).output;
     }
 
     fn spawnCommand(self: *Runner, args: []const []const u8) !void {
@@ -166,58 +79,9 @@ const Runner = struct {
     }
 };
 
-fn focusedNode(snapshot: *const script.Snapshot) ?wm.NodeId {
-    const output = focusedOutput(snapshot) orelse return null;
-    const window = snapshot.focusedWindow(output) orelse return null;
-    return snapshot.nodeForWindow(window);
-}
-
 fn focusedOutput(snapshot: *const script.Snapshot) ?wm.OutputId {
-    var result = snapshot.firstOutput();
-    var best_serial: u64 = 0;
-    var output_index: usize = 0;
-    while (snapshot.outputAt(output_index)) |output| : (output_index += 1) {
-        const window_id = snapshot.focusedWindow(output) orelse continue;
-        const window = snapshot.getWindow(window_id) orelse continue;
-        if (result == null or window.focus_serial > best_serial) {
-            result = output;
-            best_serial = window.focus_serial;
-        }
-    }
-    return result;
-}
-
-fn focusedParent(snapshot: *const script.Snapshot) ?*const wm.Node {
-    const node = snapshot.getNode(focusedNode(snapshot) orelse return null) orelse return null;
-    return snapshot.getNode(node.parent orelse return null);
-}
-
-const ContainerState = struct {
-    mode: wm.ContainerMode,
-    axis: wm.Axis,
-};
-
-fn nextContainerState(mode: wm.ContainerMode, axis: wm.Axis) ContainerState {
-    return switch (mode) {
-        .tabbed => .{ .mode = .split, .axis = .horizontal },
-        .split => switch (axis) {
-            .horizontal => .{ .mode = .split, .axis = .vertical },
-            .vertical => .{ .mode = .tabbed, .axis = .vertical },
-        },
-    };
-}
-
-test "container mode cycle visits tabbed horizontal and vertical" {
-    const horizontal = nextContainerState(.tabbed, .vertical);
-    try std.testing.expectEqual(wm.ContainerMode.split, horizontal.mode);
-    try std.testing.expectEqual(wm.Axis.horizontal, horizontal.axis);
-
-    const vertical = nextContainerState(horizontal.mode, horizontal.axis);
-    try std.testing.expectEqual(wm.ContainerMode.split, vertical.mode);
-    try std.testing.expectEqual(wm.Axis.vertical, vertical.axis);
-
-    const tabbed = nextContainerState(vertical.mode, vertical.axis);
-    try std.testing.expectEqual(wm.ContainerMode.tabbed, tabbed.mode);
+    const window = snapshot.focusedWindow() orelse return snapshot.firstOutput();
+    return (snapshot.getWindow(window) orelse return snapshot.firstOutput()).output orelse snapshot.firstOutput();
 }
 
 test "configured spawn failures do not escape into the compositor loop" {

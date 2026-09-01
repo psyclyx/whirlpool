@@ -41,7 +41,6 @@ pub const LayoutHook = struct {
         std.mem.Allocator,
         *const wm.WorldView,
         wm.OutputId,
-        f32,
         f64,
     ) anyerror!wm.LayoutPlans,
 };
@@ -114,8 +113,21 @@ pub const Stats = struct {
     committed_surfaces: u64 = 0,
     discarded_surfaces: u64 = 0,
 };
+pub const WindowChrome = struct { decoration_height: i32, border_width: i32 };
 
 const Boundary = enum { none, manage, render };
+const PendingLayoutAction = struct {
+    output: wm.OutputId,
+    name: []u8,
+    args: [][]u8,
+
+    pub fn deinit(self: *PendingLayoutAction, allocator: std.mem.Allocator) void {
+        for (self.args) |arg| allocator.free(arg);
+        allocator.free(self.args);
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     adapter: world.Adapter,
@@ -129,6 +141,7 @@ pub const Runtime = struct {
     queued_intents: script.IntentBatch,
     config_program: ?*const script.config.Config = null,
     configured_actions: std.ArrayList(usize) = .empty,
+    layout_actions: std.ArrayList(PendingLayoutAction) = .empty,
     surface_queue: SurfaceQueue,
     shell_requested: bool = false,
     manage_dirty_requested: bool = false,
@@ -199,6 +212,51 @@ pub const Runtime = struct {
         self.assertValid();
     }
 
+    /// Queue one opaque controller action for the next transaction boundary.
+    pub fn queueLayoutAction(self: *Runtime, output: wm.OutputId, name: []const u8, args: []const []const u8) !void {
+        self.assertValid();
+        if (self.layout_actions.items.len >= self.options.max_intents) return error.IntentLimitExceeded;
+        var owned = PendingLayoutAction{
+            .output = output,
+            .name = try self.allocator.dupe(u8, name),
+            .args = undefined,
+        };
+        errdefer self.allocator.free(owned.name);
+        owned.args = try self.allocator.alloc([]u8, args.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned.args[0..initialized]) |arg| self.allocator.free(arg);
+            self.allocator.free(owned.args);
+        }
+        for (args) |arg| {
+            owned.args[initialized] = try self.allocator.dupe(u8, arg);
+            initialized += 1;
+        }
+        try self.layout_actions.append(self.allocator, owned);
+        self.manage_dirty_requested = true;
+        self.assertValid();
+    }
+
+    /// Ask River for a manage cycle so external protocol state can be updated
+    /// at the transaction boundary even when no WM command is queued.
+    pub fn requestManage(self: *Runtime) void {
+        self.assertValid();
+        self.manage_dirty_requested = true;
+        self.assertValid();
+    }
+
+    pub fn windowChrome(self: *const Runtime, window: wm.WindowId) ?WindowChrome {
+        const frames = &(self.frames orelse return null);
+        for (frames.frames()) |frame| for (frame.plans.render.entries.items) |entry| {
+            if (entry.window != window) continue;
+            return .{
+                .decoration_height = entry.decoration_height,
+                .border_width = if (entry.border) |border| border.width else 0,
+            };
+        };
+        return null;
+    }
+
     /// Install the sole surface-presentation hook owner.
     pub fn setSurfaceHooks(self: *Runtime, hooks_value: SurfaceHooks) !void {
         self.assertValid();
@@ -255,6 +313,8 @@ pub const Runtime = struct {
         else
             self.surface_queue.deinit(null, null);
         self.configured_actions.deinit(self.allocator);
+        for (self.layout_actions.items) |*action| action.deinit(self.allocator);
+        self.layout_actions.deinit(self.allocator);
         self.queued_intents.deinit();
         self.adapter.deinit();
         self.* = undefined;
@@ -364,6 +424,8 @@ pub const Runtime = struct {
         for (cycle.frames.frames()) |frame| for (frame.plans.river_manage.operations.items) |operation| switch (operation) {
             .propose_dimensions => |proposal| if (try self.adapter.needsDimensionProposal(proposal))
                 try operations.append(self.allocator, operation),
+            .set_tiled, .fullscreen => if (self.adapter.needsWindowPlacementRequest(operation))
+                try operations.append(self.allocator, operation),
             else => try operations.append(self.allocator, operation),
         };
         try self.adapter.appendServerDecorationRequests(&operations);
@@ -376,7 +438,7 @@ pub const Runtime = struct {
             else => {},
         };
         self.adapter.commitServerDecorationRequests();
-        self.adapter.commitWindowPlacementRequests();
+        self.adapter.commitWindowPlacementRequests(operations.items);
         self.adapter.commitPointerOperationRequests();
         self.adapter.commitSeatFocusRequests();
         // River guarantees at least one render sequence after every completed
@@ -398,7 +460,7 @@ pub const Runtime = struct {
         self.render = render_cycle;
         if (self.manager) |manager| {
             manager.placeOutputShellRoles(self, resolveShellPosition);
-            try manager.placeDecorationRoles(28, self.adapter.windowBorderWidth());
+            manager.placeDecorationRoles(self, resolveDecorationPosition);
         }
         defer {
             self.render.?.deinit();
@@ -408,12 +470,10 @@ pub const Runtime = struct {
         var operations = std.ArrayList(types.RenderOperation).empty;
         defer operations.deinit(self.allocator);
         for (frames.frames()) |frame| try operations.appendSlice(self.allocator, frame.plans.river_render.operations.items);
-        try self.adapter.appendWindowBorderRequests(&operations);
         var commits = std.ArrayList(coordinator.SubmittedCommit).empty;
         defer commits.deinit(self.allocator);
         try self.surface_queue.appendReady(self.allocator, &commits);
         try coordinator.runRender(.{ .operations = operations.items }, commits.items, transport.renderEmitter(Runtime, self));
-        self.adapter.commitWindowBorderRequests();
         if (render_cycle.dimensions_changed or frames.needs_frame) self.manage_dirty_requested = true;
     }
 
@@ -472,12 +532,21 @@ pub const Runtime = struct {
         return .{ .x = position.x, .y = position.y };
     }
 
+    fn resolveDecorationPosition(raw: ?*anyopaque, window: *wayland.client.river.WindowV1) ?live.DecorationPosition {
+        const self: *Runtime = @ptrCast(@alignCast(raw orelse return null));
+        const live_window = self.adapter.objects.maps.windows.idFor(world.live_objects.proxyRef(window)) orelse return null;
+        const wm_window = (self.adapter.objects.windows.get(live_window) orelse return null).wm_id orelse return null;
+        const chrome = self.windowChrome(wm_window) orelse return null;
+        return live.decorationPosition(chrome.decoration_height, chrome.border_width) catch null;
+    }
+
     fn assertValid(self: *const Runtime) void {
         std.debug.assert(self.options.max_intents > 0);
         std.debug.assert(self.options.max_pending_commits > 0);
         std.debug.assert(self.queued_intents.count() <= self.options.max_intents);
         std.debug.assert(self.surface_queue.count() <= self.options.max_pending_commits);
         std.debug.assert(self.config_program != null or self.configured_actions.items.len == 0);
+        std.debug.assert(self.layout_actions.items.len <= self.options.max_intents);
         std.debug.assert(self.render == null or self.frames != null);
         std.debug.assert(self.driver == null or self.manager == null);
     }
@@ -533,31 +602,23 @@ const TestTrace = struct {
         allocator: std.mem.Allocator,
         snapshot: *const wm.WorldView,
         output_id: wm.OutputId,
-        camera_value: f32,
         _: f64,
     ) !wm.LayoutPlans {
         const output = snapshot.getOutput(output_id).?;
-        const tag = snapshot.getTag(output.active_tag).?;
-        const column = snapshot.getColumn(tag.columns.items[0]).?;
-        const node = snapshot.getNode(column.root.?).?;
-        const window = snapshot.getWindow(node.window.?).?;
-        const camera: wm.CameraTarget = .{ .tag = tag.id, .current = camera_value, .target = camera_value, .strip_width = 800 };
+        const window = snapshot.getWindow(snapshot.windowAt(0).?).?;
         var result: wm.LayoutPlans = .{
-            .manage = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id, .camera = camera } },
-            .render = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id, .camera = camera } },
+            .manage = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id } },
+            .render = .{ .context = .{ .allocator = allocator, .epoch = snapshot.epoch(), .output = output_id } },
             .needs_frame = from(raw).needs_frame,
         };
         errdefer result.deinit();
-        const virtual: wm.FRect = .{ .x = 0, .y = 0, .width = 800, .height = 600 };
-        try result.manage.dimensions.append(allocator, .{ .window = window.id, .column = column.id, .size = .{ .width = 800, .height = 600 }, .virtual = virtual });
+        try result.manage.dimensions.append(allocator, .{ .window = window.id, .size = .{ .width = 800, .height = 600 } });
         try result.render.entries.append(allocator, .{
             .window = window.id,
-            .column = column.id,
-            .placement = window.placement,
-            .target_virtual = virtual,
             .screen = output.usable,
             .clip = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
             .visible = true,
+            .z_index = 0,
         });
         return result;
     }
@@ -635,19 +696,19 @@ test "compositor-free coordinator runs policy and retained commits only after bo
     try std.testing.expectEqual(@as(usize, 0), trace.policy_calls);
     try runtime.afterDispatch();
     try std.testing.expectEqual(@as(usize, 1), trace.policy_calls);
-    try std.testing.expectEqualSlices(u8, "pmmM", trace.events.items);
+    try std.testing.expectEqualSlices(u8, "pmM", trace.events.items);
 
     try runtime.queueSubmittedCommit(.{ .role = .{ .decoration = decoration }, .generation = 1, .token = 9 });
     runtime.requestShellPhase();
     try runtime.stageRenderBoundary();
     try runtime.afterDispatch();
-    try std.testing.expectEqualSlices(u8, "pmmMascrrrrrRblkd", trace.events.items);
+    try std.testing.expectEqualSlices(u8, "pmMascrrrrrRblkd", trace.events.items);
     try std.testing.expectEqual(@as(u64, 1), runtime.stats.committed_surfaces);
     try std.testing.expectEqual(@as(u64, 1), runtime.stats.shell_callbacks);
 
     try runtime.stageRenderBoundary();
     try runtime.afterDispatch();
-    try std.testing.expectEqualSlices(u8, "pmmMascrrrrrRblkdrrrrR", trace.events.items);
+    try std.testing.expectEqualSlices(u8, "pmMascrrrrrRblkdrrrrrR", trace.events.items);
 }
 
 test "surface retirement discards queued work before presenter teardown" {
