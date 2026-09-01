@@ -757,7 +757,7 @@ local function layout_node(root_id, rect, active, entries, z)
     local fact = model.windows[current.window]
     if not fact then return z end
     entries[#entries + 1] = {
-      window = current.window, state = current.state, target = rect,
+      window = current.window, state = current.state, frame = rect,
       propose = {
         width = math.max(1, rect.width - 2 * border_width),
         height = math.max(1, rect.height - decoration_height - 2 * border_width),
@@ -812,6 +812,14 @@ local function screen_rect(target, usable, main_camera, cross_camera)
   result.x, result.y = result.x + usable.x, result.y + usable.y
   return result
 end
+local function content_rect(frame)
+  return {
+    x = frame.x + border_width,
+    y = frame.y + decoration_height + border_width,
+    width = math.max(1, frame.width - 2 * border_width),
+    height = math.max(1, frame.height - decoration_height - 2 * border_width),
+  }
+end
 local function camera_target(current, metric, index, count, total, viewport)
   if not metric then return 0 end
   local extra = peek + border_width
@@ -863,7 +871,7 @@ local function layout(snapshot)
         math.floor(base_main * clamp(slot.width, min_root_width, max_root_width) + 0.5), minimum_main)
       metrics[#metrics + 1] = { node = slot.node, start = main_cursor, size = size }
       z = layout_node(slot.node,
-        logical_rect(main_cursor, cross_cursor + border_width, size, strip_cross), true, entries, z)
+        logical_rect(main_cursor, cross_cursor, size, strip_cross), true, entries, z)
       main_cursor = main_cursor + size + inner_gap
     end
     strip.metrics = metrics
@@ -913,7 +921,7 @@ local function layout(snapshot)
         height = math.max(1, math.floor(usable.height / 2)),
       })
       entries[#entries + 1] = {
-        window = window, state = leaf.state, target = geometry,
+        window = window, state = leaf.state, frame = geometry,
         propose = leaf.state == "fullscreen" and { width = geometry.width, height = geometry.height } or nil,
         visible = leaf.state ~= "scratchpad" and fact.lifecycle == "managed", z = z,
       }
@@ -926,12 +934,21 @@ local function layout(snapshot)
   if fullscreen then for _, entry in ipairs(entries) do entry.visible = entry.window == fullscreen end end
   for _, entry in ipairs(entries) do
     local fact = model.windows[entry.window] or {}
+    local leaf = node(model.window_nodes[entry.window])
     local root = containing_root(model.window_nodes[entry.window])
     local strip
     if root then local _; _, strip = root_location(root.id) end
+    local frame = entry.frame
+    if entry.state == "tiled" and leaf then
+      local moving_x, moving_y
+      frame = copy(frame)
+      frame.x, moving_x = animate(leaf, "frame_x", frame.x, now)
+      frame.y, moving_y = animate(leaf, "frame_y", frame.y, now)
+      active = active or moving_x or moving_y
+    end
     local target = entry.state == "tiled"
-      and screen_rect(entry.target, usable, strip and strip.camera_current or 0, cross_current)
-      or entry.target
+      and screen_rect(content_rect(frame), usable, strip and strip.camera_current or 0, cross_current)
+      or frame
     local actual = fact.actual or entry.propose or { width = target.width, height = target.height }
     entry.screen = {
       x = math.floor(target.x), y = math.floor(target.y),
@@ -949,7 +966,7 @@ local function layout(snapshot)
         or { 0x64646464, 0x64646464, 0x64646464, 0xffffffff },
     }
     entry.decoration_height = decoration_height
-    entry.target = nil
+    entry.frame = nil
   end
   return {
     epoch = snapshot.epoch, output = snapshot.output.id, tag = snapshot.tag.id,

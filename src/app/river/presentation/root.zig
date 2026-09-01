@@ -342,7 +342,7 @@ pub const Context = struct {
 
         var item_storage: [item_flow.max_items][8]script.program_loader.Value = undefined;
         var items: [item_flow.max_items]script.program_loader.Value = undefined;
-        for (flow.slice(), 0..) |item, index| {
+        for (flow.slice(), 0..) |*item, index| {
             var app_id: []const u8 = "";
             var title: []const u8 = "";
             var icon_source: []const u8 = "";
@@ -352,16 +352,7 @@ pub const Context = struct {
                 title = record.title;
                 icon_source = try self.icons.pathFor(app_id);
             };
-            item_storage[index] = .{
-                .{ .string = item.style.slice() },
-                .{ .string = item.text.slice() },
-                .{ .string = app_id },
-                .{ .string = title },
-                .{ .boolean = item.focused },
-                .{ .number = @floatFromInt(item.width) },
-                .{ .string = icon_source },
-                .{ .string = item.detail.slice() },
-            };
+            writeDisplayItem(item, app_id, title, icon_source, &item_storage[index]);
             items[index] = .{ .array = &item_storage[index] };
         }
 
@@ -378,6 +369,25 @@ pub const Context = struct {
             .service = "desktop",
             .values = &values,
         });
+    }
+
+    fn writeDisplayItem(
+        item: *const item_flow.Item,
+        app_id: []const u8,
+        title: []const u8,
+        icon_source: []const u8,
+        target: *[8]script.program_loader.Value,
+    ) void {
+        target.* = .{
+            .{ .string = item.style.slice() },
+            .{ .string = item.text.slice() },
+            .{ .string = app_id },
+            .{ .string = title },
+            .{ .boolean = item.focused },
+            .{ .number = @floatFromInt(item.width) },
+            .{ .string = icon_source },
+            .{ .string = item.detail.slice() },
+        };
     }
 
     pub fn updateStatusServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
@@ -536,4 +546,53 @@ fn retire(self: *Context, role: host.river_coordinator.SurfaceRole) !river_role_
         .pending_release => .pending_release,
         .release_safe => .release_safe,
     };
+}
+
+test "display updates preserve distinct retained item labels and window metadata" {
+    var flow: item_flow.Flow = .{ .len = 3 };
+    flow.items[0] = .{
+        .x = 0,
+        .width = 48,
+        .style = try script.layout_projection.Label.init("group"),
+        .text = try script.layout_projection.Label.init("( h"),
+    };
+    flow.items[1] = .{
+        .x = 52,
+        .width = 148,
+        .style = try script.layout_projection.Label.init("window"),
+    };
+    flow.items[2] = .{
+        .x = 204,
+        .width = 18,
+        .style = try script.layout_projection.Label.init("insertion"),
+        .text = try script.layout_projection.Label.init("+"),
+    };
+
+    var storage: [3][8]script.program_loader.Value = undefined;
+    var items: [3]script.program_loader.Value = undefined;
+    for (flow.slice(), 0..) |*item, index| {
+        Context.writeDisplayItem(
+            item,
+            if (index == 1) "foot" else "",
+            if (index == 1) "shell" else "",
+            if (index == 1) "/icon/foot.svg" else "",
+            &storage[index],
+        );
+        items[index] = .{ .array = &storage[index] };
+    }
+    const values = [_]script.program_loader.Value{.{ .array = &items }};
+    var owned = try script.program_loader.OwnedUpdate.clone(std.testing.allocator, .{
+        .service = "desktop",
+        .values = &values,
+    });
+    defer owned.deinit();
+
+    const encoded = owned.value.values[0].array;
+    try std.testing.expectEqualStrings("group", encoded[0].array[0].string);
+    try std.testing.expectEqualStrings("( h", encoded[0].array[1].string);
+    try std.testing.expectEqualStrings("window", encoded[1].array[0].string);
+    try std.testing.expectEqualStrings("foot", encoded[1].array[2].string);
+    try std.testing.expectEqualStrings("shell", encoded[1].array[3].string);
+    try std.testing.expectEqualStrings("insertion", encoded[2].array[0].string);
+    try std.testing.expectEqualStrings("+", encoded[2].array[1].string);
 }
