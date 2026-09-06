@@ -8,6 +8,8 @@ const wayland_runtime = @import("whirlpool-wayland-runtime");
 const layer_shell_runtime = @import("whirlpool-wayland-layer-shell-runtime");
 const status_app = @import("whirlpool-app-status");
 
+const frame_interval_ms: f64 = 16;
+
 pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !void {
     const path = config_path orelse return error.MissingConfig;
     var config = try script.config.load(allocator, io, path);
@@ -73,16 +75,21 @@ const AfterDispatch = struct {
     io: std.Io,
     clock_origin: std.Io.Timestamp,
     status_revision: u64 = 0,
+    last_frame_ms: ?f64 = null,
 
     fn run(raw: ?*anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         if (self.status.latestAfter(self.status_revision)) |latest| {
             self.status_revision = latest.revision;
             var cpu_history: [status_app.cpu_history_len]script.program_loader.Value = undefined;
+            var cpu_cores: [status_app.max_cpu_count]script.program_loader.Value = undefined;
             var rx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
             var tx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
             for (0..status_app.cpu_history_len) |index|
                 cpu_history[index] = .{ .number = latest.value.cpu_history[index] };
+            const cpu_core_count: usize = latest.value.cpu_core_count;
+            for (0..cpu_core_count) |index|
+                cpu_cores[index] = .{ .number = latest.value.cpu_cores[index] };
             for (0..status_app.network_history_len) |index| {
                 rx_history[index] = .{ .number = latest.value.network_rx_history[index] };
                 tx_history[index] = .{ .number = latest.value.network_tx_history[index] };
@@ -106,11 +113,20 @@ const AfterDispatch = struct {
                 .{ .number = @floatFromInt(latest.value.battery_percent) },
                 .{ .boolean = latest.value.battery_charging },
                 .{ .number = @floatFromInt(latest.value.network_sample_sequence) },
+                .{ .number = @floatFromInt(latest.value.cpu_core_count) },
+                .{ .number = latest.value.cpu_core_equivalents },
+                .{ .array = cpu_cores[0..cpu_core_count] },
+                .{ .number = @floatFromInt(latest.value.cpu_sample_sequence) },
+                .{ .number = latest.value.network_capacity },
             };
             try self.runtime.update(.{ .service = "status", .values = &values });
         }
         const elapsed = self.clock_origin.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
-        try self.runtime.frame(@as(f64, @floatFromInt(@max(elapsed, 0))) / 1_000_000.0);
+        const now_ms = @as(f64, @floatFromInt(@max(elapsed, 0))) / 1_000_000.0;
+        if (frameDue(self.last_frame_ms, now_ms)) {
+            self.last_frame_ms = now_ms;
+            try self.runtime.frame(now_ms);
+        }
         _ = self.runtime.presentIfReady() catch |err| switch (err) {
             error.NotReady => return,
             error.SurfaceClosed => {
@@ -121,6 +137,11 @@ const AfterDispatch = struct {
         };
     }
 };
+
+fn frameDue(last_frame_ms: ?f64, now_ms: f64) bool {
+    const last = last_frame_ms orelse return true;
+    return now_ms - last >= frame_interval_ms;
+}
 
 fn bindCompositor(client: *wayland_client.Client) !*wayland.client.wl.Compositor {
     const globals = try client.enumerateGlobals();

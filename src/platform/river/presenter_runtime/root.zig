@@ -138,6 +138,8 @@ const RolePresenter = struct {
     pending: UpdateSet = .{},
     desired: UpdateSet = .{},
     desired_revision: u64 = 0,
+    frame_ms: ?f64 = null,
+    frame_callback: ?*wayland.client.wl.Callback = null,
     worker_active: bool = false,
     worker_error: ?anyerror = null,
     closing: bool = false,
@@ -145,6 +147,7 @@ const RolePresenter = struct {
     detached: bool = false,
     status: Registry.PresenterState = .waiting_for_buffer,
     ready_slot: ?usize = null,
+    ready_requires_sync: bool = false,
     generation: u64 = 0,
     token: u64 = 0,
 
@@ -233,6 +236,7 @@ const RolePresenter = struct {
             if (self.ready_slot) |index| {
                 self.slots[index].state = .free;
                 self.ready_slot = null;
+                self.ready_requires_sync = false;
                 self.status = .waiting_for_buffer;
             }
         }
@@ -278,13 +282,16 @@ const RolePresenter = struct {
                 return;
             }
             var requests = self.pending.take();
+            const requires_sync = !requests.isEmpty();
+            const frame_ms = self.frame_ms;
+            self.frame_ms = null;
             const revision = self.desired_revision;
             const slot_index = self.freeSlot() orelse unreachable;
             self.slots[slot_index].state = .rendering;
             self.worker_active = true;
             self.unlock();
 
-            const rendered = self.render(&renderer, slot_index, &requests);
+            const rendered = self.render(&renderer, slot_index, &requests, frame_ms);
             requests.deinit();
 
             self.lock();
@@ -295,6 +302,7 @@ const RolePresenter = struct {
                 } else {
                     self.slots[slot_index].state = .ready;
                     self.ready_slot = slot_index;
+                    self.ready_requires_sync = requires_sync;
                     self.status = .ready;
                 }
             } else |err| {
@@ -353,9 +361,19 @@ const RolePresenter = struct {
         self.unlock();
     }
 
-    fn render(self: *RolePresenter, renderer: *graphics.skia.GpuRenderer, slot_index: usize, updates: *UpdateSet) !void {
+    fn render(
+        self: *RolePresenter,
+        renderer: *graphics.skia.GpuRenderer,
+        slot_index: usize,
+        updates: *UpdateSet,
+        frame_ms: ?f64,
+    ) !void {
         const composition = &(self.composition orelse return error.CompositionUnavailable);
         try updates.apply(composition);
+        if (frame_ms) |now| {
+            const values = [_]script.program_loader.Value{.{ .number = now }};
+            try composition.update(.{ .service = "frame", .values = &values });
+        }
         var frame = try composition.snapshotAndLower(.{
             .width = self.extent.width,
             .height = self.extent.height,
@@ -386,6 +404,7 @@ const RolePresenter = struct {
             self.status = .submitted;
         self.unlock();
         abandoned.deinit();
+        self.cancelFrameCallback();
         // A compositor may retain the surface's current DMA-BUF indefinitely
         // until it is replaced. Detach exactly once so retirement can observe
         // wl_buffer.release without destroying a still-borrowed surface.
@@ -429,6 +448,8 @@ const RolePresenter = struct {
 
     fn commit(raw: *anyopaque) void {
         const self = from(raw);
+        self.ensureFrameCallback() catch |err|
+            std.log.warn("failed to request shell frame callback: {s}", .{@errorName(err)});
         self.lock();
         std.debug.assert(self.status == .armed);
         const index = self.ready_slot.?;
@@ -441,11 +462,75 @@ const RolePresenter = struct {
         self.lock();
         slot.state = .submitted;
         self.ready_slot = null;
+        self.ready_requires_sync = false;
         self.status = .submitted;
         self.changed.signal(self.owner.io);
         const first = self.token == 1;
         self.unlock();
         if (first and self.role == .shell) std.log.info("River shell surface committed its first frame", .{});
+    }
+
+    /// Commit a frame-only shell update without manufacturing a River
+    /// manage/render transaction. Persistent service updates still use the
+    /// registry transaction so they remain atomic with policy state.
+    fn presentAnimation(self: *RolePresenter) !bool {
+        if (self.role != .shell or self.frame_callback != null) return false;
+        self.lock();
+        if (self.worker_error) |err| {
+            self.unlock();
+            return err;
+        }
+        const index = self.ready_slot orelse {
+            self.unlock();
+            return false;
+        };
+        if (self.status != .ready or !mayBypassRiverSync(self.role, self.ready_requires_sync)) {
+            self.unlock();
+            return false;
+        }
+        self.unlock();
+
+        try self.ensureFrameCallback();
+        const slot = &self.slots[index];
+        self.surface.attach(slot.wl_buffer.?.proxy, 0, 0);
+        self.surface.damageBuffer(0, 0, @intCast(self.extent.width), @intCast(self.extent.height));
+        slot.wl_buffer.?.markAttached();
+        self.surface.commit();
+
+        self.lock();
+        std.debug.assert(self.ready_slot == index and self.status == .ready);
+        slot.state = .submitted;
+        self.ready_slot = null;
+        self.ready_requires_sync = false;
+        self.status = .submitted;
+        self.changed.signal(self.owner.io);
+        self.unlock();
+        return true;
+    }
+
+    fn ensureFrameCallback(self: *RolePresenter) !void {
+        if (self.role != .shell or self.frame_callback != null) return;
+        const callback = try self.surface.frame();
+        callback.setListener(*RolePresenter, onFrame, self);
+        self.frame_callback = callback;
+    }
+
+    fn cancelFrameCallback(self: *RolePresenter) void {
+        if (self.frame_callback) |callback| {
+            callback.destroy();
+            self.frame_callback = null;
+        }
+    }
+
+    fn onFrame(callback: *wayland.client.wl.Callback, event: wayland.client.wl.Callback.Event, self: *RolePresenter) void {
+        switch (event) {
+            .done => {
+                std.debug.assert(self.frame_callback == callback);
+                callback.destroy();
+                self.frame_callback = null;
+                self.owner.notifyWake();
+            },
+        }
     }
 
     fn discard(raw: *anyopaque, generation: u64, token: u64) void {
@@ -474,6 +559,7 @@ const RolePresenter = struct {
         const self = from(raw);
         const owner = self.owner;
         if (owner.created_product == self) owner.created_product = null;
+        self.cancelFrameCallback();
         var abandoned: UpdateSet = .{};
         var desired: UpdateSet = .{};
         self.lock();
@@ -503,7 +589,7 @@ const RolePresenter = struct {
         return false;
     }
     fn canRender(self: *RolePresenter) bool {
-        if (self.pending.isEmpty() or self.ready_slot != null) return false;
+        if ((self.pending.isEmpty() and self.frame_ms == null) or self.ready_slot != null) return false;
         if (self.status == .prepared or self.status == .armed) return false;
         return self.freeSlot() != null;
     }
@@ -674,11 +760,39 @@ pub const Runtime = struct {
         try record.product.enqueue(value);
     }
 
+    /// Coalesce animation time separately from persistent service state. A
+    /// newer clock sample must not invalidate a frame already being rendered.
+    pub fn requestFrame(self: *Runtime, role: SurfaceRole, monotonic_ms: f64) !void {
+        if (!std.math.isFinite(monotonic_ms) or monotonic_ms < 0) return error.InvalidFrameTime;
+        const record = self.findRole(role) orelse return error.SurfaceRoleNotBound;
+        const product = record.product;
+        if (product.role != .shell or product.frame_callback != null) return;
+        product.lock();
+        if (product.closing or product.retiring) {
+            product.unlock();
+            return error.SurfaceRoleRetiring;
+        }
+        // The compositor callback starts exactly one frame. Do not let later
+        // dispatches get ahead while that frame is rendering or waiting to be
+        // committed; its completion will install the next callback.
+        if (product.worker_active or product.ready_slot != null or
+            product.status == .prepared or product.status == .armed or
+            !product.pending.isEmpty())
+        {
+            product.unlock();
+            return;
+        }
+        product.frame_ms = monotonic_ms;
+        product.changed.signal(self.io);
+        product.unlock();
+    }
+
     pub fn presentAll(self: *Runtime, generation: u64) !void {
         if (generation == 0) return error.InvalidGeneration;
         const empty = graphics.skia.DrawList{ .ops = &.{} };
         for (self.roles.items) |record| {
             if (try self.registry.isRetiring(record.role)) continue;
+            if (try record.product.presentAnimation()) continue;
             const submitted = self.registry.prepareDrawList(record.role, generation, .{ 0, 0, 0, 0 }, empty) catch |err| switch (err) {
                 error.NotReady, error.ReleasePending, error.FrameAlreadyPending => continue,
                 else => return err,
@@ -714,4 +828,27 @@ fn createRoleProduct(raw: ?*anyopaque, info: Registry.CreateInfo) !Registry.Pres
     try product.init();
     owner.created_product = product;
     return .{ .context = product, .vtable = &RolePresenter.vtable };
+}
+
+fn mayBypassRiverSync(role: SurfaceRole, requires_sync: bool) bool {
+    return role == .shell and !requires_sync;
+}
+
+test "a transient frame sample is render work without a persistent revision" {
+    var product: RolePresenter = undefined;
+    product.pending = .{};
+    product.frame_ms = 12;
+    product.ready_slot = null;
+    product.status = .waiting_for_buffer;
+    for (&product.slots) |*slot| slot.state = .free;
+
+    try std.testing.expect(product.canRender());
+    product.frame_ms = null;
+    try std.testing.expect(!product.canRender());
+}
+
+test "only frame-only shell work may bypass River synchronization" {
+    try std.testing.expect(mayBypassRiverSync(.{ .shell = host.types.ShellSurfaceId.init(1) }, false));
+    try std.testing.expect(!mayBypassRiverSync(.{ .shell = host.types.ShellSurfaceId.init(1) }, true));
+    try std.testing.expect(!mayBypassRiverSync(.{ .decoration = host.types.DecorationId.init(2) }, false));
 }

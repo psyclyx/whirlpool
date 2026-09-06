@@ -271,43 +271,51 @@ test "sample shell and decoration modules mount as distinct compositions" {
     };
     try std.testing.expectEqual(second_app_x.?, marked_second_x orelse return error.MissingSecondShellWindow);
 
-    var cpu_history = [_]script.program_loader.Value{.{ .number = 0 }} ** 15;
-    var rx_history = [_]script.program_loader.Value{.{ .number = 256 * 1024 }} ** 16;
-    var tx_history = [_]script.program_loader.Value{.{ .number = 128 * 1024 }} ** 16;
+    var cpu_history = [_]script.program_loader.Value{.{ .number = 1 }} ** 24;
+    var cpu_cores = [_]script.program_loader.Value{.{ .number = 0 }} ** 32;
+    cpu_cores[0] = .{ .number = 100 };
+    var rx_history = [_]script.program_loader.Value{.{ .number = 256 * 1024 }} ** 24;
+    var tx_history = [_]script.program_loader.Value{.{ .number = 128 * 1024 }} ** 24;
     _ = &cpu_history;
+    _ = &cpu_cores;
     _ = &rx_history;
     _ = &tx_history;
     try shell.update(.{
         .service = "status",
         .values = &.{
-            .{ .string = "12:34" },    .{ .string = "Mon" },       .{ .string = "2026-09-01" },
-            .{ .number = 0 },          .{ .array = &cpu_history }, .{ .number = 0 },
-            .{ .number = 0 },          .{ .number = 256 * 1024 },  .{ .number = 128 * 1024 },
-            .{ .array = &rx_history }, .{ .array = &tx_history },  .{ .number = 0 },
-            .{ .boolean = false },     .{ .boolean = false },      .{ .boolean = false },
-            .{ .number = 0 },          .{ .boolean = false },      .{ .number = 1 },
+            .{ .string = "12:34" },    .{ .string = "Mon" },         .{ .string = "2026-09-01" },
+            .{ .number = 0 },          .{ .array = &cpu_history },   .{ .number = 0 },
+            .{ .number = 0 },          .{ .number = 256 * 1024 },    .{ .number = 128 * 1024 },
+            .{ .array = &rx_history }, .{ .array = &tx_history },    .{ .number = 0 },
+            .{ .boolean = false },     .{ .boolean = false },        .{ .boolean = false },
+            .{ .number = 0 },          .{ .boolean = false },        .{ .number = 1 },
+            .{ .number = 32 },         .{ .number = 1 },             .{ .array = &cpu_cores },
+            .{ .number = 1 },          .{ .number = 2_500_000_000 },
         },
     });
     try shell.update(.{ .service = "frame", .values = &.{.{ .number = 250 }} });
     var network_frame = try shell.snapshotAndLower(.{ .width = 1200, .height = 600 });
     defer network_frame.deinit();
-    var rx_reaches_center = false;
-    var tx_starts_at_center = false;
+    var rx_rises_from_center = false;
+    var tx_falls_from_center = false;
     for (network_frame.drawList().ops) |operation| switch (operation) {
         .polygon => |polygon| {
-            if (polygon.points.len != 4) continue;
-            const points = polygon.points.points;
-            const width = points[2].x - points[3].x;
-            if (@abs(width - 2) > 0.01) continue;
-            if (polygon.color.g > 0.88 and polygon.color.r > 0.64 and polygon.color.r < 0.67)
-                rx_reaches_center = @abs(points[2].y - 581) < 0.01;
-            if (polygon.color.g > 0.88 and polygon.color.r > 0.57 and polygon.color.r < 0.60)
-                tx_starts_at_center = @abs(points[0].y - 581) < 0.01;
+            if (polygon.points.len <= 4) continue;
+            var reaches_center = false;
+            var rises = false;
+            var falls = false;
+            for (polygon.points.points[0..polygon.points.len]) |point| {
+                reaches_center = reaches_center or @abs(point.y - 581) < 0.01;
+                rises = rises or point.y < 580;
+                falls = falls or point.y > 582;
+            }
+            rx_rises_from_center = rx_rises_from_center or (reaches_center and rises);
+            tx_falls_from_center = tx_falls_from_center or (reaches_center and falls);
         },
         else => {},
     };
-    try std.testing.expect(rx_reaches_center);
-    try std.testing.expect(tx_starts_at_center);
+    try std.testing.expect(rx_rises_from_center);
+    try std.testing.expect(tx_falls_from_center);
 
     var decoration = try Composition.init(std.testing.allocator,
         \\return require("whirlpool.decorator")

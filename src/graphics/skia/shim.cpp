@@ -49,6 +49,7 @@ struct WhirlpoolSkia {
     sk_sp<SkSurface> surface;
     SkCanvas *canvas = nullptr;
     sk_sp<SkFontMgr> font_manager;
+    sk_sp<SkTypeface> default_typeface;
     sk_sp<GrDirectContext> gpu_context;
     std::unordered_map<std::string, sk_sp<SkImage>> icon_cache;
 };
@@ -65,6 +66,9 @@ static bool initialize_fonts(WhirlpoolSkia *renderer) {
         renderer->font_manager = SkFontMgr_New_FontConfig(nullptr, SkFontScanner_Make_FreeType());
     if (!renderer->font_manager)
         renderer->font_manager = SkFontMgr_New_Custom_Empty();
+    if (renderer->font_manager)
+        renderer->default_typeface =
+            renderer->font_manager->legacyMakeTypeface(nullptr, SkFontStyle());
     return renderer->font_manager != nullptr;
 }
 
@@ -281,7 +285,7 @@ extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *te
     SkPaint paint;
     paint.setAntiAlias(true);
     paint.setColor4f(SkColor4f{r, g, b, a}, nullptr);
-    auto typeface = renderer->font_manager->legacyMakeTypeface(nullptr, SkFontStyle());
+    const auto& typeface = renderer->default_typeface;
     if (!typeface) return;
     const char *end = text + length;
     const char *cursor = text;
@@ -410,7 +414,11 @@ extern "C" int whirlpool_skia_end_vulkan(
         static_cast<VkImageLayout>(final_layout), final_queue_family);
     GrFlushInfo flush_info;
     renderer->gpu_context->flush(renderer->surface.get(), flush_info, &final_state);
-    const bool submitted = renderer->gpu_context->submit(GrSyncCpu::kYes);
+    // Queue ownership is released to VK_QUEUE_FAMILY_FOREIGN_EXT above, so
+    // the compositor observes completion through the DMA-BUF's implicit
+    // synchronization. Waiting for the entire Vulkan queue here needlessly
+    // serialized every frame on the CPU.
+    const bool submitted = renderer->gpu_context->submit(GrSyncCpu::kNo);
     renderer->surface.reset();
     return submitted ? 0 : 1;
 }

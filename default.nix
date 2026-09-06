@@ -73,6 +73,7 @@ in
       whirlpool-nested = whirlpoolNested;
     };
     inherit overlay;
+    homeManagerModules.default = import ./nix/hm-module.nix;
     shell = finalPkgs.callPackage ./nix/shell.nix { };
     default = packages.whirlpool;
     whirlpool-nested = whirlpoolNested;

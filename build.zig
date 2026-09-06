@@ -402,6 +402,22 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run Whirlpool").dependOn(&run.step);
 
+    const shell_bench = b.addExecutable(.{
+        .name = "whirlpool-shell-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_shell.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "whirlpool-host", .module = host },
+                .{ .name = "whirlpool-script", .module = script },
+                .{ .name = "whirlpool-graphics", .module = graphics },
+            },
+        }),
+    });
+    const run_shell_bench = b.addRunArtifact(shell_bench);
+    b.step("bench-shell", "Benchmark example shell frame phases").dependOn(&run_shell_bench.step);
+
     const test_step = b.step("test", "Run all unit tests");
     const graphics_test_step = b.step("graphics-test", "Run graphics and DMA-BUF tests");
     inline for (.{

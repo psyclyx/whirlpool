@@ -6,14 +6,18 @@ local theme = require("whirlpool.theme")
 local Status = require("whirlpool.status")
 
 local BAR_HEIGHT = 38
-local SPARK_COUNT = 15
-local NETWORK_SAMPLE_COUNT = 16
+local CPU_HISTORY_COUNT = 24
+local CPU_SAMPLE_MS = 500
+local CPU_CORE_DISPLAY_COUNT = 16
+local CPU_CORE_COLUMNS = 8
+local CPU_CORE_CELL_WIDTH = 3
+local CPU_CORE_CELL_GAP = 2
+local NETWORK_SAMPLE_COUNT = 24
 local NETWORK_SAMPLE_MS = 500
-local NETWORK_BAR_WIDTH = 2
-local NETWORK_BAR_GAP = 1
 local NETWORK_HALF_HEIGHT = BAR_HEIGHT / 2
-local NETWORK_ZOOM_FLOOR = 128 * 1024
-local NETWORK_HEADROOM = 0.78
+local NETWORK_FALLBACK_CAPACITY = 125 * 1000 * 1000
+local HISTORY_SAMPLE_WIDTH = 4
+local ENVELOPE_POINTS_PER_CHUNK = 14
 local SLANT = 0.30
 local CLEAR = { 0, 0, 0, 0 }
 
@@ -92,22 +96,51 @@ local function section(parent, width, background)
   return panel:row({ padding = { 0, 12, 0, 2 }, gap = 8, offset_x = visual_center_shift(BAR_HEIGHT) })
 end
 
-local function sparkline(parent, color)
-  local row = parent:row({ height = BAR_HEIGHT, gap = 2 })
-  local bars = {}
-  for index = 1, SPARK_COUNT do
-    local column = row:column({ width = 3, height = BAR_HEIGHT })
-    column:spacer({ flex = 1 })
-    bars[index] = column:polygon({
-      width = 3, height = 2, fill = color, points = angled_points(3, 2),
-    })
+-- A filled envelope reads as one signal at 1x instead of a row of tiny,
+-- unrelated needles. Chunks only exist because retained polygons have a
+-- deliberately small vertex cap; opaque chunks meet at the same sample.
+local function history_envelope(parent, sample_count, height, color)
+  local content_width = (sample_count - 1) * HISTORY_SAMPLE_WIDTH
+  local view_width = (sample_count - 2) * HISTORY_SAMPLE_WIDTH
+  local view = parent:stack({ width = view_width, height = height, clip = true })
+  local content = view:stack({ width = content_width, height = height })
+  local chunks = {}
+  local first = 1
+  while first < sample_count do
+    local last = math.min(sample_count, first + ENVELOPE_POINTS_PER_CHUNK - 1)
+    local x1 = (first - 1) / (sample_count - 1)
+    local x2 = (last - 1) / (sample_count - 1)
+    chunks[#chunks + 1] = {
+      first = first,
+      last = last,
+      node = content:polygon({
+        width = content_width,
+        height = height,
+        fill = color,
+        points = { { x1, 1 }, { x1, 1 }, { x2, 1 } },
+      }),
+    }
+    if last == sample_count then break end
+    -- Overlap one full segment so the antialiased closing edge is painted
+    -- over identical fill instead of showing as a hairline seam at 1x.
+    first = last - 1
   end
-  return function(values)
-    for index, bar in ipairs(bars) do
-      local value = values[index] or 0
-      local height = math.max(2, math.floor((BAR_HEIGHT - 2) * math.min(1, math.max(0, value)) + 0.5))
-      resize_angled(bar, 3, height)
+  return { content = content, chunks = chunks, sample_count = sample_count }
+end
+
+local function update_envelope(envelope, values, fraction, lower)
+  local baseline = lower and 0 or 1
+  for _, chunk in ipairs(envelope.chunks) do
+    local points = { { (chunk.first - 1) / (envelope.sample_count - 1), baseline } }
+    for index = chunk.first, chunk.last do
+      local level = math.min(1, math.max(0, fraction(values[index] or 0)))
+      points[#points + 1] = {
+        (index - 1) / (envelope.sample_count - 1),
+        lower and level or (1 - level),
+      }
     end
+    points[#points + 1] = { (chunk.last - 1) / (envelope.sample_count - 1), baseline }
+    chunk.node:set("points", points)
   end
 end
 
@@ -120,11 +153,16 @@ local function build(parent)
     item_count = 0,
     frame_ms = 0,
     network_sample_ms = 0,
-    network_sequence = 0,
+    cpu_sample_ms = 0,
+    cpu_sequence = -1,
+    cpu_count = 1,
+    cpu_history = {},
+    cpu_core_levels = {},
+    cpu_core_targets = {},
+    network_sequence = -1,
     network_rx = {},
     network_tx = {},
-    network_zoom = NETWORK_ZOOM_FLOOR,
-    network_zoom_target = NETWORK_ZOOM_FLOOR,
+    network_capacity = NETWORK_FALLBACK_CAPACITY,
   }
 
   local root = parent:stack()
@@ -202,60 +240,79 @@ local function build(parent)
 
   local right = bar:row({ height = BAR_HEIGHT })
 
-  local cpu = section(right, 112, theme.blend(theme.yellow))
-  local update_cpu_spark = sparkline(cpu, theme.yellow)
-  cpu:text({ text = "CPU", font_size = 12, text_color = theme.yellow, padding = { 11, 0, 0, 0 } })
+  -- CPU history is expressed in busy-core equivalents on a fixed logarithmic
+  -- scale. On a 32-thread machine, one saturated core therefore remains
+  -- visible instead of collapsing to a misleading 3% sliver.
+  local cpu = section(right, 205, theme.blend(theme.yellow))
+  local cpu_history_envelope = history_envelope(
+    cpu, CPU_HISTORY_COUNT, BAR_HEIGHT, theme.blend(theme.yellow, 220))
 
-  local network = section(right, 178, theme.blend(theme.cyan))
-  local network_view_width = SPARK_COUNT * NETWORK_BAR_WIDTH + (SPARK_COUNT - 1) * NETWORK_BAR_GAP
-  local network_content_width = NETWORK_SAMPLE_COUNT * NETWORK_BAR_WIDTH
-    + (NETWORK_SAMPLE_COUNT - 1) * NETWORK_BAR_GAP
-  local net_spark = network:stack({ width = network_view_width, height = BAR_HEIGHT, clip = true })
-  local net_content = net_spark:row({ width = network_content_width, height = BAR_HEIGHT, gap = NETWORK_BAR_GAP })
-  local rx_bars, tx_bars = {}, {}
-  for index = 1, NETWORK_SAMPLE_COUNT do
-    local pair = net_content:column({ width = NETWORK_BAR_WIDTH, height = BAR_HEIGHT })
-    local upper = pair:column({ width = NETWORK_BAR_WIDTH, height = NETWORK_HALF_HEIGHT })
-    upper:spacer({ flex = 1 })
-    rx_bars[index] = upper:polygon({
-      width = NETWORK_BAR_WIDTH, height = 1, fill = theme.green,
-      points = angled_points(NETWORK_BAR_WIDTH, 1), opacity = 0,
-    })
-    local lower = pair:column({ width = NETWORK_BAR_WIDTH, height = NETWORK_HALF_HEIGHT })
-    tx_bars[index] = lower:polygon({
-      width = NETWORK_BAR_WIDTH, height = 1, fill = theme.cyan,
-      points = angled_points(NETWORK_BAR_WIDTH, 1), opacity = 0,
-    })
-    lower:spacer({ flex = 1 })
+  -- The heat field shows the hottest sixteen logical cores, sorted by load.
+  -- One bright cell means single-thread saturation; a filled field means
+  -- genuinely parallel work, independent of the machine's total core count.
+  local cpu_core_field_width = CPU_CORE_COLUMNS * CPU_CORE_CELL_WIDTH
+    + (CPU_CORE_COLUMNS - 1) * CPU_CORE_CELL_GAP
+  local cpu_core_field = cpu:column({ width = cpu_core_field_width, height = BAR_HEIGHT, gap = 2, padding = { 9, 0, 9, 0 } })
+  local cpu_core_cells = {}
+  for row_index = 1, 2 do
+    local row = cpu_core_field:row({ width = cpu_core_field_width, height = 8, gap = CPU_CORE_CELL_GAP })
+    for column_index = 1, CPU_CORE_COLUMNS do
+      local index = (row_index - 1) * CPU_CORE_COLUMNS + column_index
+      cpu_core_cells[index] = row:shape({
+        width = CPU_CORE_CELL_WIDTH, height = 8, radius = 1,
+        fill = theme.yellow, opacity = 0.10,
+      })
+      state.cpu_core_levels[index] = 0
+      state.cpu_core_targets[index] = 0
+    end
   end
+  local cpu_text = cpu:column({ gap = 1, padding = { 4, 0, 0, 0 } })
+  local cpu_total_label = cpu_text:text({ text = "0.0c", font_size = 12, text_color = theme.yellow })
+  local cpu_peak_label = cpu_text:text({ text = "0% · 1", font_size = 9, text_color = theme.muted })
+
+  local network = section(right, 190, theme.blend(theme.cyan))
+  local net_graph = network:column({ height = BAR_HEIGHT })
+  local rx_envelope = history_envelope(
+    net_graph, NETWORK_SAMPLE_COUNT, NETWORK_HALF_HEIGHT, theme.blend(theme.green, 220))
+  local tx_envelope = history_envelope(
+    net_graph, NETWORK_SAMPLE_COUNT, NETWORK_HALF_HEIGHT, theme.blend(theme.cyan, 220))
   local net_text = network:column({ gap = 1, padding = { 4, 0, 0, 0 } })
-  local rx_label = net_text:text({ text = "rx 0B", font_size = 12, text_color = theme.green })
-  local tx_label = net_text:text({ text = "tx 0B", font_size = 12, text_color = theme.cyan })
+  local rx_label = net_text:text({ text = "↓ 0B", font_size = 12, text_color = theme.green })
+  local tx_label = net_text:text({ text = "↑ 0B", font_size = 12, text_color = theme.cyan })
+
+  local function logarithmic_fraction(value, ceiling)
+    value = math.max(0, tonumber(value) or 0)
+    ceiling = math.max(1, tonumber(ceiling) or 1)
+    return math.min(1, math.log(1 + value) / math.log(1 + ceiling))
+  end
+
+  local function draw_cpu(now_ms, elapsed)
+    local blend = elapsed > 0 and (1 - math.exp(-elapsed / 140)) or 0
+    for index = 1, CPU_CORE_DISPLAY_COUNT do
+      local level = state.cpu_core_levels[index]
+        + (state.cpu_core_targets[index] - state.cpu_core_levels[index]) * blend
+      state.cpu_core_levels[index] = level
+      cpu_core_cells[index]:set("opacity", 0.10 + 0.90 * math.min(1, math.max(0, level)))
+    end
+    local progress = math.max(0, math.min(0.99,
+      (now_ms - state.cpu_sample_ms) / CPU_SAMPLE_MS))
+    cpu_history_envelope.content:set("offset_x", -HISTORY_SAMPLE_WIDTH * progress)
+  end
 
   local function draw_network(now_ms)
+    local progress = math.max(0, math.min(0.99,
+      (now_ms - state.network_sample_ms) / NETWORK_SAMPLE_MS))
+    local offset = -HISTORY_SAMPLE_WIDTH * progress
+    rx_envelope.content:set("offset_x", offset)
+    tx_envelope.content:set("offset_x", offset)
+  end
+
+  local function draw_frame(now_ms)
     now_ms = math.max(state.frame_ms, tonumber(now_ms) or 0)
     local elapsed = math.max(0, now_ms - state.frame_ms)
     state.frame_ms = now_ms
-    local tau = state.network_zoom_target > state.network_zoom and 800 or 6000
-    local blend = elapsed > 0 and (1 - math.exp(-elapsed / tau)) or 0
-    state.network_zoom = state.network_zoom
-      + (state.network_zoom_target - state.network_zoom) * blend
-    local progress = math.max(0, math.min(0.99,
-      (now_ms - state.network_sample_ms) / NETWORK_SAMPLE_MS))
-    net_content:set("offset_x", -(NETWORK_BAR_WIDTH + NETWORK_BAR_GAP) * progress)
-    for index = 1, NETWORK_SAMPLE_COUNT do
-      local rx = math.max(0, tonumber(state.network_rx[index]) or 0)
-      local tx = math.max(0, tonumber(state.network_tx[index]) or 0)
-      local rx_height = math.max(1, math.floor(NETWORK_HALF_HEIGHT * math.min(1, rx / state.network_zoom) + 0.5))
-      local tx_height = math.max(1, math.floor(NETWORK_HALF_HEIGHT * math.min(1, tx / state.network_zoom) + 0.5))
-      local edge_opacity = index == 1 and (1 - progress)
-        or index == NETWORK_SAMPLE_COUNT and progress
-        or 1
-      resize_angled(rx_bars[index], NETWORK_BAR_WIDTH, rx_height)
-      resize_angled(tx_bars[index], NETWORK_BAR_WIDTH, tx_height)
-      rx_bars[index]:set("opacity", rx > 0 and edge_opacity or 0)
-      tx_bars[index]:set("opacity", tx > 0 and edge_opacity or 0)
-    end
+    draw_cpu(now_ms, elapsed)
+    draw_network(now_ms)
   end
 
   local audio = section(right, 44, theme.blend(theme.purple))
@@ -379,6 +436,11 @@ local function build(parent)
 
   local function update_status(values)
     local cpu_history = type(values[5]) == "table" and values[5] or {}
+    local cpu_count = math.max(1, math.floor(tonumber(values[19]) or 1))
+    local cpu_equivalents = math.max(0, tonumber(values[20])
+      or ((tonumber(values[4]) or 0) * cpu_count / 100))
+    local cpu_cores = type(values[21]) == "table" and values[21] or { tonumber(values[4]) or 0 }
+    local cpu_sequence = math.floor(tonumber(values[22]) or 0)
     local rx_history = type(values[10]) == "table" and values[10] or {}
     local tx_history = type(values[11]) == "table" and values[11] or {}
     local network_sequence = math.floor(tonumber(values[18]) or 0)
@@ -388,21 +450,37 @@ local function build(parent)
     local battery_percent = tonumber(values[16]) or 0
     local battery_charging = values[17] == true
 
-    update_cpu_spark(cpu_history)
-    rx_label:set("text", "rx " .. Status.format_rate(values[8]))
-    tx_label:set("text", "tx " .. Status.format_rate(values[9]))
+    if cpu_sequence ~= state.cpu_sequence then
+      state.cpu_sequence = cpu_sequence
+      state.cpu_sample_ms = state.frame_ms
+      state.cpu_count = cpu_count
+      state.cpu_history = cpu_history
+      update_envelope(cpu_history_envelope, cpu_history,
+        function(value) return logarithmic_fraction(value, cpu_count) end, false)
+      local sorted = {}
+      for index = 1, #cpu_cores do sorted[index] = math.max(0, tonumber(cpu_cores[index]) or 0) end
+      table.sort(sorted, function(left, right) return left > right end)
+      for index = 1, CPU_CORE_DISPLAY_COUNT do
+        state.cpu_core_targets[index] = math.min(1, (sorted[index] or 0) / 100)
+      end
+      local peak = sorted[1] or 0
+      cpu_total_label:set("text", string.format("%.1fc", cpu_equivalents))
+      cpu_peak_label:set("text", string.format("%.0f%% · %d", peak, cpu_count))
+    end
+    rx_label:set("text", "↓ " .. Status.format_rate(values[8]))
+    tx_label:set("text", "↑ " .. Status.format_rate(values[9]))
+    state.network_capacity = math.max(1, tonumber(values[23]) or NETWORK_FALLBACK_CAPACITY)
     if network_sequence ~= state.network_sequence then
       state.network_sequence = network_sequence
       state.network_sample_ms = state.frame_ms
       state.network_rx = rx_history
       state.network_tx = tx_history
-      local peak = NETWORK_ZOOM_FLOOR
-      for index = 1, NETWORK_SAMPLE_COUNT do
-        peak = math.max(peak, tonumber(rx_history[index]) or 0, tonumber(tx_history[index]) or 0)
-      end
-      state.network_zoom_target = math.max(NETWORK_ZOOM_FLOOR, peak / NETWORK_HEADROOM)
+      update_envelope(rx_envelope, rx_history,
+        function(value) return logarithmic_fraction(value, state.network_capacity) end, false)
+      update_envelope(tx_envelope, tx_history,
+        function(value) return logarithmic_fraction(value, state.network_capacity) end, true)
     end
-    draw_network(state.frame_ms)
+    draw_frame(state.frame_ms)
     local audio_color = audio_muted and theme.red or (audio_percent >= 100 and theme.yellow or theme.purple)
     update_audio(audio_percent, audio_color)
     audio_label:set("text", audio_muted and "X" or "A")
@@ -443,7 +521,7 @@ local function build(parent)
       elseif service == "status" then
         update_status(values)
       elseif service == "frame" then
-        draw_network(tonumber(values[1]) or state.frame_ms)
+        draw_frame(tonumber(values[1]) or state.frame_ms)
       end
     end,
   }

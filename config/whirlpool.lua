@@ -98,8 +98,6 @@ local bindings = {
   -- Launchers
   { modifiers = alt, key = "p", action = action("spawn", "rofi-rbw-wayland") },
   { modifiers = alt, key = "s", action = action("spawn", "whirlpool-screenshot-menu") },
-  { modifiers = { "alt", "shift" }, key = "s", action = action("spawn", "tidepool-sign-clipboard") },
-  { modifiers = { "alt", "shift" }, key = "e", action = action("spawn", "tidepool-power-menu") },
 }
 
 local mark_modes = { "mark", "focus-mark", "summon-mark", "send-to-mark", "clear-mark" }

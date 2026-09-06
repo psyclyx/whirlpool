@@ -6,9 +6,12 @@
 
 const std = @import("std");
 
-pub const cpu_history_len = 15;
-pub const network_history_len = 16;
+pub const cpu_history_len = 24;
+pub const network_history_len = 24;
+pub const max_cpu_count = 256;
+pub const cpu_sample_period_ms = 500;
 pub const network_sample_period_ms = 500;
+const network_ewma_seconds = 2.0;
 
 pub const Snapshot = struct {
     time: [5]u8 = "--:--".*,
@@ -16,6 +19,10 @@ pub const Snapshot = struct {
     date: [10]u8 = "----------".*,
     cpu_percent: u8 = 0,
     cpu_history: [cpu_history_len]f64 = [_]f64{0} ** cpu_history_len,
+    cpu_core_count: u16 = 0,
+    cpu_core_equivalents: f64 = 0,
+    cpu_cores: [max_cpu_count]f64 = [_]f64{0} ** max_cpu_count,
+    cpu_sample_sequence: u64 = 0,
     memory_percent: u8 = 0,
     disk_percent: u8 = 0,
     network_rx: f64 = 0,
@@ -23,6 +30,7 @@ pub const Snapshot = struct {
     network_rx_history: [network_history_len]f64 = [_]f64{0} ** network_history_len,
     network_tx_history: [network_history_len]f64 = [_]f64{0} ** network_history_len,
     network_sample_sequence: u64 = 0,
+    network_capacity: f64 = 0,
     audio_percent: u8 = 0,
     audio_muted: bool = false,
     audio_visible: bool = false,
@@ -116,25 +124,36 @@ pub const Service = struct {
     }
 
     fn cpuLoop(self: *Service) std.Io.Cancelable!void {
-        var previous: ?CpuSample = null;
+        var previous: ?CpuRead = null;
         while (true) {
             const current = readCpu(self.io) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 try std.Io.sleep(self.io, .fromSeconds(2), .awake);
                 continue;
             };
-            var percent: u8 = 0;
+            var aggregate: f64 = 0;
+            var core_equivalents: f64 = 0;
+            var core_percent = [_]f64{0} ** max_cpu_count;
             if (previous) |old| {
-                const total = current.total -| old.total;
-                const idle = current.idle -| old.idle;
-                if (total != 0) percent = @intCast(@min(100, ((total -| idle) * 100 + total / 2) / total));
+                aggregate = utilization(old.aggregate, current.aggregate);
+                const count = @min(old.count, current.count);
+                for (0..count) |index| {
+                    const value = utilization(old.cores[index], current.cores[index]);
+                    core_percent[index] = value * 100.0;
+                    core_equivalents += value;
+                }
             }
             previous = current;
             self.lock();
-            self.snapshot.cpu_percent = percent;
-            pushBoundedHistory(cpu_history_len, &self.snapshot.cpu_history, @as(f64, @floatFromInt(percent)) / 100.0);
+            self.snapshot.cpu_percent = @intFromFloat(@min(100.0, aggregate * 100.0 + 0.5));
+            self.snapshot.cpu_core_count = @intCast(current.count);
+            self.snapshot.cpu_core_equivalents = core_equivalents;
+            self.snapshot.cpu_cores = core_percent;
+            pushHistory(cpu_history_len, &self.snapshot.cpu_history, core_equivalents);
+            self.snapshot.cpu_sample_sequence +|= 1;
+            if (self.snapshot.cpu_sample_sequence == 0) self.snapshot.cpu_sample_sequence = 1;
             self.publish();
-            try std.Io.sleep(self.io, .fromSeconds(2), .awake);
+            try std.Io.sleep(self.io, .fromMilliseconds(cpu_sample_period_ms), .awake);
         }
     }
 
@@ -171,11 +190,21 @@ pub const Service = struct {
         var previous_at: ?std.Io.Timestamp = null;
         var interface_buffer: [64]u8 = undefined;
         var interface: ?[]const u8 = null;
+        var rx_ewma: f64 = 0;
+        var tx_ewma: f64 = 0;
         while (true) {
-            if (interface == null) interface = readDefaultInterface(self.io, &interface_buffer) catch |err| blk: {
-                if (err == error.Canceled) return error.Canceled;
-                break :blk null;
-            };
+            if (interface == null) {
+                interface = readDefaultInterface(self.io, &interface_buffer) catch |err| blk: {
+                    if (err == error.Canceled) return error.Canceled;
+                    break :blk null;
+                };
+                if (interface) |name| {
+                    const capacity = readNetworkCapacity(self.io, name) catch 0;
+                    self.lock();
+                    self.snapshot.network_capacity = capacity;
+                    self.publish();
+                }
+            }
             const current = if (interface) |name| readNetwork(self.io, name) catch |err| blk: {
                 if (err == error.Canceled) return error.Canceled;
                 break :blk null;
@@ -192,14 +221,17 @@ pub const Service = struct {
                 const elapsed_seconds = @as(f64, @floatFromInt(@max(elapsed_ns, 1))) / std.time.ns_per_s;
                 rx = @as(f64, @floatFromInt(sample.rx -| old.rx)) / elapsed_seconds;
                 tx = @as(f64, @floatFromInt(sample.tx -| old.tx)) / elapsed_seconds;
+                const alpha = 1.0 - @exp(-elapsed_seconds / network_ewma_seconds);
+                rx_ewma += (rx - rx_ewma) * alpha;
+                tx_ewma += (tx - tx_ewma) * alpha;
             }
             previous = sample;
             previous_at = now;
             self.lock();
-            self.snapshot.network_rx = rx;
-            self.snapshot.network_tx = tx;
-            pushRawHistory(&self.snapshot.network_rx_history, rx);
-            pushRawHistory(&self.snapshot.network_tx_history, tx);
+            self.snapshot.network_rx = rx_ewma;
+            self.snapshot.network_tx = tx_ewma;
+            pushHistory(network_history_len, &self.snapshot.network_rx_history, rx_ewma);
+            pushHistory(network_history_len, &self.snapshot.network_tx_history, tx_ewma);
             self.snapshot.network_sample_sequence +|= 1;
             if (self.snapshot.network_sample_sequence == 0) self.snapshot.network_sample_sequence = 1;
             self.publish();
@@ -336,27 +368,61 @@ pub const Service = struct {
 };
 
 const CpuSample = struct { total: u64, idle: u64 };
+const CpuRead = struct {
+    aggregate: CpuSample,
+    cores: [max_cpu_count]CpuSample = [_]CpuSample{.{ .total = 0, .idle = 0 }} ** max_cpu_count,
+    count: usize = 0,
+};
 const NetworkSample = struct { rx: u64, tx: u64 };
 const AudioSample = struct { percent: u8, muted: bool };
 const BatterySample = struct { present: bool = false, percent: u8 = 0, charging: bool = false };
 
-fn readCpu(io: std.Io) !CpuSample {
-    var buffer: [1024]u8 = undefined;
+fn readCpu(io: std.Io) !CpuRead {
+    var buffer: [32 * 1024]u8 = undefined;
     const data = try std.Io.Dir.cwd().readFile(io, "/proc/stat", &buffer);
-    const line = std.mem.sliceTo(data, '\n');
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    const aggregate_line = lines.next() orelse return error.InvalidCpuStat;
+    const aggregate = try parseCpuLine(aggregate_line, "cpu");
+    var result = CpuRead{ .aggregate = aggregate };
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const label = fields.next() orelse continue;
+        if (!std.mem.startsWith(u8, label, "cpu") or label.len == 3) break;
+        if (result.count == max_cpu_count) break;
+        result.cores[result.count] = try parseCpuFields(&fields);
+        result.count += 1;
+    }
+    if (result.count == 0) return error.InvalidCpuStat;
+    return result;
+}
+
+fn parseCpuLine(line: []const u8, expected_label: []const u8) !CpuSample {
     var fields = std.mem.tokenizeAny(u8, line, " \t");
-    if (!std.mem.eql(u8, fields.next() orelse return error.InvalidCpuStat, "cpu")) return error.InvalidCpuStat;
+    if (!std.mem.eql(u8, fields.next() orelse return error.InvalidCpuStat, expected_label))
+        return error.InvalidCpuStat;
+    return parseCpuFields(&fields);
+}
+
+fn parseCpuFields(fields: anytype) !CpuSample {
     var total: u64 = 0;
     var values: [5]u64 = [_]u64{0} ** 5;
     var count: usize = 0;
     while (fields.next()) |field| {
         const value = try std.fmt.parseUnsigned(u64, field, 10);
         if (count < values.len) values[count] = value;
+        // guest and guest_nice are already included in user and nice.
+        if (count < 8) total +|= value;
         count += 1;
-        total +|= value;
     }
     if (count < 4) return error.InvalidCpuStat;
     return .{ .total = total, .idle = values[3] +| values[4] };
+}
+
+fn utilization(previous: CpuSample, current: CpuSample) f64 {
+    const total = current.total -| previous.total;
+    if (total == 0) return 0;
+    const idle = current.idle -| previous.idle;
+    return @min(1.0, @as(f64, @floatFromInt(total -| idle)) / @as(f64, @floatFromInt(total)));
 }
 
 fn readMemory(io: std.Io) !u8 {
@@ -410,26 +476,41 @@ fn readNetwork(io: std.Io, interface: []const u8) !?NetworkSample {
     return null;
 }
 
-fn pushBoundedHistory(comptime len: usize, history: *[len]f64, value: f64) void {
+fn readNetworkCapacity(io: std.Io, interface: []const u8) !f64 {
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/sys/class/net/{s}/speed", .{interface});
+    var speed_buffer: [64]u8 = undefined;
+    const data = try std.Io.Dir.cwd().readFile(io, path, &speed_buffer);
+    const megabits = try std.fmt.parseUnsigned(u64, std.mem.trim(u8, data, " \t\r\n"), 10);
+    if (megabits == 0) return error.InvalidLinkSpeed;
+    return @as(f64, @floatFromInt(megabits)) * 1_000_000.0 / 8.0;
+}
+
+fn pushHistory(comptime len: usize, history: *[len]f64, value: f64) void {
     std.mem.copyForwards(f64, history[0 .. len - 1], history[1..]);
-    history[len - 1] = @min(1.0, @max(0.0, value));
+    history[len - 1] = if (std.math.isFinite(value)) @max(0, value) else 0;
 }
 
-fn pushRawHistory(history: *[network_history_len]f64, value: f64) void {
-    std.mem.copyForwards(f64, history[0 .. network_history_len - 1], history[1..]);
-    history[network_history_len - 1] = if (std.math.isFinite(value)) @max(0, value) else 0;
-}
-
-test "history retains the latest bounded samples" {
+test "history retains finite nonnegative samples" {
     var history = [_]f64{0} ** cpu_history_len;
-    pushBoundedHistory(cpu_history_len, &history, 0.25);
-    pushBoundedHistory(cpu_history_len, &history, 2.0);
+    pushHistory(cpu_history_len, &history, 0.25);
+    pushHistory(cpu_history_len, &history, 2.0);
     try std.testing.expectEqual(@as(f64, 0.25), history[cpu_history_len - 2]);
-    try std.testing.expectEqual(@as(f64, 1.0), history[cpu_history_len - 1]);
+    try std.testing.expectEqual(@as(f64, 2.0), history[cpu_history_len - 1]);
 }
 
-test "network history retains raw rates for drawing policy" {
+test "network history retains smoothed rates for drawing policy" {
     var history = [_]f64{0} ** network_history_len;
-    pushRawHistory(&history, 256 * 1024);
+    pushHistory(network_history_len, &history, 256 * 1024);
     try std.testing.expectEqual(@as(f64, 256 * 1024), history[network_history_len - 1]);
+}
+
+test "cpu parser excludes guest time and retains logical cores" {
+    const aggregate = try parseCpuLine("cpu  10 2 3 40 5 6 7 8 9 10", "cpu");
+    try std.testing.expectEqual(@as(u64, 81), aggregate.total);
+    try std.testing.expectEqual(@as(u64, 45), aggregate.idle);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), utilization(
+        .{ .total = 100, .idle = 50 },
+        .{ .total = 120, .idle = 60 },
+    ), 0.0001);
 }

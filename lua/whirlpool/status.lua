@@ -6,9 +6,10 @@ local Status = {}
 
 function Status.format_rate(value)
   value = tonumber(value) or 0
-  if value >= 1024 * 1024 then return string.format("%.1fM", value / (1024 * 1024)) end
-  if value >= 1024 then return string.format("%.0fK", value / 1024) end
-  return string.format("%.0fB", value)
+  if value >= 1024 * 1024 * 1024 then return string.format("%.2fG/s", value / (1024 * 1024 * 1024)) end
+  if value >= 1024 * 1024 then return string.format("%.1fM/s", value / (1024 * 1024)) end
+  if value >= 1024 then return string.format("%.0fK/s", value / 1024) end
+  return string.format("%.0fB/s", value)
 end
 
 return Status

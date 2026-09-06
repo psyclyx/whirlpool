@@ -86,14 +86,22 @@ stdenv.mkDerivation (finalAttrs: {
   zigBuildFlags = [
     "--system"
     "${finalAttrs.deps}"
+    "-Dcpu=baseline"
+    "--release=fast"
   ];
+  dontSetZigDefaultFlags = true;
 
   doCheck = true;
   preCheck = ''
     export LD_LIBRARY_PATH="${lua5_4}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export WHIRLPOOL_FONT_DIR=${dejavu_fonts}/share/fonts/truetype
   '';
-  zigCheckFlags = finalAttrs.zigBuildFlags ++ [ "test" ];
+  zigCheckFlags = [
+    "--system"
+    "${finalAttrs.deps}"
+    "-Dcpu=baseline"
+    "--release=safe"
+  ];
 
   meta = {
     description = "Window manager and graphical shell host for River";

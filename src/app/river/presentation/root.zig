@@ -97,9 +97,9 @@ pub const Bridge = struct {
             self.status_revision = latest.revision;
             self.context.status = latest.value;
         }
-        self.context.frame_ms = self.monotonicMilliseconds();
         try self.context.roles.forEachShell(&self.context, Context.updateShellServices);
         try self.context.roles.forEachShell(&self.context, Context.updateStatusServices);
+        self.context.frame_ms = self.monotonicMilliseconds();
         try self.context.roles.forEachShell(&self.context, Context.updateFrameServices);
         try self.context.roles.forEachDecoration(&self.context, Context.updateDecorationServices);
         try self.collectReady();
@@ -248,8 +248,8 @@ pub const Context = struct {
     const workspace_visible_width: u32 = 30;
     const workspace_hidden_width: u32 = 1;
     const workspace_padding_right: u32 = 8;
-    const right_width_without_battery: u32 = 549;
-    const right_width_with_battery: u32 = 592;
+    const right_width_without_battery: u32 = 654;
+    const right_width_with_battery: u32 = 697;
 
     fn deinit(self: *Context) void {
         self.flow_states.deinit(self.allocator);
@@ -408,10 +408,14 @@ pub const Context = struct {
     pub fn updateStatusServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
         const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         var cpu_history: [status_app.cpu_history_len]script.program_loader.Value = undefined;
+        var cpu_cores: [status_app.max_cpu_count]script.program_loader.Value = undefined;
         var rx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
         var tx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
         for (0..status_app.cpu_history_len) |index|
             cpu_history[index] = .{ .number = self.status.cpu_history[index] };
+        const cpu_core_count: usize = self.status.cpu_core_count;
+        for (0..cpu_core_count) |index|
+            cpu_cores[index] = .{ .number = self.status.cpu_cores[index] };
         for (0..status_app.network_history_len) |index| {
             rx_history[index] = .{ .number = self.status.network_rx_history[index] };
             tx_history[index] = .{ .number = self.status.network_tx_history[index] };
@@ -435,14 +439,18 @@ pub const Context = struct {
             .{ .number = @floatFromInt(self.status.battery_percent) },
             .{ .boolean = self.status.battery_charging },
             .{ .number = @floatFromInt(self.status.network_sample_sequence) },
+            .{ .number = @floatFromInt(self.status.cpu_core_count) },
+            .{ .number = self.status.cpu_core_equivalents },
+            .{ .array = cpu_cores[0..cpu_core_count] },
+            .{ .number = @floatFromInt(self.status.cpu_sample_sequence) },
+            .{ .number = self.status.network_capacity },
         };
         try self.graphics.update(.{ .shell = shell_id }, .{ .service = "status", .values = &values });
     }
 
     pub fn updateFrameServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
         const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-        const values = [_]script.program_loader.Value{.{ .number = self.frame_ms }};
-        try self.graphics.update(.{ .shell = shell_id }, .{ .service = "frame", .values = &values });
+        try self.graphics.requestFrame(.{ .shell = shell_id }, self.frame_ms);
     }
 
     pub fn updateDecorationServices(raw: ?*anyopaque, window_id: host.types.WindowId, decoration_id: host.types.DecorationId) !void {
