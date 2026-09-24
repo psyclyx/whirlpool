@@ -14,18 +14,23 @@ let
   # can refer to one another. Directory discovery uses `prev.lib` to avoid
   # asking for an attribute of the fixpoint while its overlay keys are still
   # being formed.
-  overlay = final: prev:
-    ((import "${npins.river}/overlay.nix") final prev)
-    // (mkPackages final prev.lib)
-    // {
-      whirlpoolRiverSource = npins.river;
-    };
 in
   {
-    nixpkgs ? npins.nixpkgs,
+    sources ? npins,
+    nixpkgs ? sources.nixpkgs,
+    # External dep — river is consumed as a source checkout (its overlay +
+    # the whirlpoolRiverSource fixture); default to whirlpool's own pin.
+    river ? npins.river,
     pkgs ? import nixpkgs { },
+    ...
   }:
   let
+    overlay = final: prev:
+      ((import "${river}/overlay.nix") final prev)
+      // (mkPackages final prev.lib)
+      // {
+        whirlpoolRiverSource = river;
+      };
     finalPkgs = pkgs.extend overlay;
     basePackages = mkPackages finalPkgs pkgs.lib;
     whirlpoolNested = finalPkgs.writeShellScriptBin "whirlpool-nested" ''
