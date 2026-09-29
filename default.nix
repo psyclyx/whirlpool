@@ -2,14 +2,13 @@ let
   npins = import ./npins;
 
   mkPackages = pkgs: lib:
-    if builtins.pathExists ./nix/packages then
+    if builtins.pathExists ./nix/packages
+    then
       lib.packagesFromDirectoryRecursive {
         inherit (pkgs) callPackage;
         directory = ./nix/packages;
       }
-    else
-      { };
-
+    else {};
   # Package calls are scoped against `final` so packages under nix/packages
   # can refer to one another. Directory discovery uses `prev.lib` to avoid
   # asking for an attribute of the fixpoint while its overlay keys are still
@@ -21,17 +20,20 @@ in
     # External dep — river is consumed as a source checkout (its overlay +
     # the whirlpoolRiverSource fixture); default to whirlpool's own pin.
     river ? npins.river,
-    pkgs ? import nixpkgs { },
+    pkgs ? import nixpkgs {},
     ...
-  }:
-  let
+  }: let
+    # The exported overlay only adds whirlpool's own packages: callers that
+    # compose river's overlay themselves (as nixclyx does, for the `river`
+    # producer) would otherwise get it applied twice, double-patching
+    # wlroots. `whirlpool-nested` is dev tooling only, built below against a
+    # locally river-overlaid `finalPkgs` that never escapes this file.
     overlay = final: prev:
-      ((import "${river}/overlay.nix") final prev)
-      // (mkPackages final prev.lib)
+      (mkPackages final prev.lib)
       // {
         whirlpoolRiverSource = river;
       };
-    finalPkgs = pkgs.extend overlay;
+    finalPkgs = pkgs.extend (final: prev: (import "${river}/overlay.nix" final prev) // overlay final prev);
     basePackages = mkPackages finalPkgs pkgs.lib;
     whirlpoolNested = finalPkgs.writeShellScriptBin "whirlpool-nested" ''
       set -eu
@@ -72,14 +74,15 @@ in
       exec ${finalPkgs.river}/bin/river -c \
         "exec ${basePackages.whirlpool}/bin/whirlpool river --config \"$config\""
     '';
-  in
-  rec {
-    packages = basePackages // {
-      whirlpool-nested = whirlpoolNested;
-    };
+  in rec {
+    packages =
+      basePackages
+      // {
+        whirlpool-nested = whirlpoolNested;
+      };
     inherit overlay;
     homeManagerModules.default = import ./nix/hm-module.nix;
-    shell = finalPkgs.callPackage ./nix/shell.nix { };
+    shell = finalPkgs.callPackage ./nix/shell.nix {};
     default = packages.whirlpool;
     whirlpool-nested = whirlpoolNested;
   }
