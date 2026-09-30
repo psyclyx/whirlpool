@@ -16,6 +16,9 @@ const river_host = @import("whirlpool-river-host-runtime");
 const river_presentation = @import("whirlpool-river-presentation");
 
 const coordinator = host.river_coordinator;
+/// Pause after a clock tick that drew nothing before asking for the next one.
+const idle_tick_ms = 90;
+
 const slot_count = 2;
 
 pub const Api = struct {
@@ -145,6 +148,7 @@ const RolePresenter = struct {
     closing: bool = false,
     retiring: bool = false,
     detached: bool = false,
+    surface_inert: bool = false,
     status: Registry.PresenterState = .waiting_for_buffer,
     ready_slot: ?usize = null,
     ready_requires_sync: bool = false,
@@ -296,8 +300,12 @@ const RolePresenter = struct {
 
             self.lock();
             self.worker_active = false;
-            if (rendered) |_| {
-                if (self.closing or self.retiring or revision != self.desired_revision) {
+            var idle_tick = false;
+            if (rendered) |drew| {
+                if (!drew) {
+                    self.slots[slot_index].state = .free;
+                    idle_tick = true;
+                } else if (self.closing or self.retiring or revision != self.desired_revision) {
                     self.slots[slot_index].state = .free;
                 } else {
                     self.slots[slot_index].state = .ready;
@@ -314,6 +322,9 @@ const RolePresenter = struct {
                 self.status = .ready;
             self.changed.signal(self.owner.io);
             self.unlock();
+            // An idle tick asks the host for the next one after a pause, so a
+            // quiet bar polls at a low rate instead of spinning.
+            if (idle_tick) std.Io.sleep(self.owner.io, .fromMilliseconds(idle_tick_ms), .awake) catch {};
             self.owner.notifyWake();
         }
     }
@@ -367,13 +378,18 @@ const RolePresenter = struct {
         slot_index: usize,
         updates: *UpdateSet,
         frame_ms: ?f64,
-    ) !void {
+    ) !bool {
         const composition = &(self.composition orelse return error.CompositionUnavailable);
+        const frame_only = updates.isEmpty();
         try updates.apply(composition);
         if (frame_ms) |now| {
             const values = [_]script.program_loader.Value{.{ .number = now }};
             try composition.update(.{ .service = "frame", .values = &values });
         }
+        // A clock tick that changed nothing draws nothing: no lowering, no GPU
+        // work, no commit. Most ticks are like this, because plots move in
+        // whole-pixel steps and unchanged properties do not dirty their nodes.
+        if (frame_only and frame_ms != null and !composition.isDirty()) return false;
         var frame = try composition.snapshotAndLower(.{
             .width = self.extent.width,
             .height = self.extent.height,
@@ -388,6 +404,7 @@ const RolePresenter = struct {
             @intCast(dmabuf.vk.VK_QUEUE_FAMILY_FOREIGN_EXT),
         );
         self.slots[slot_index].image.markReleasedToWayland();
+        return true;
     }
 
     fn beginRetire(self: *RolePresenter) void {
@@ -397,7 +414,7 @@ const RolePresenter = struct {
         self.retiring = true;
         if (!self.detached) {
             self.detached = true;
-            detach = true;
+            detach = !self.surface_inert;
         }
         abandoned = self.pending.take();
         if (self.worker_active and self.status == .waiting_for_buffer)
@@ -548,6 +565,8 @@ const RolePresenter = struct {
         const self = from(raw);
         self.lock();
         defer self.unlock();
+        // The retiring worker may already have observed the release.
+        if (self.status == .ready) return true;
         if (self.status != .submitted) return error.NotSubmitted;
         self.reapReleasedLocked();
         if (self.hasSubmitted()) return false;
@@ -737,6 +756,13 @@ pub const Runtime = struct {
         const product = self.created_product orelse return error.ProductNotCreated;
         self.created_product = null;
         self.roles.appendAssumeCapacity(.{ .role = role, .extent = extent, .product = product });
+    }
+
+    /// The compositor invalidated the role's surface (its window closed); no
+    /// further wl_surface requests may be made on it.
+    pub fn markRoleInert(self: *Runtime, role: SurfaceRole) void {
+        const record = self.findRole(role) orelse return;
+        record.product.surface_inert = true;
     }
 
     pub fn retireRole(self: *Runtime, role: SurfaceRole) !Registry.RetirementStatus {

@@ -377,6 +377,7 @@ pub const Context = struct {
             .{ .number = @floatFromInt(flow.content_width) },
             .{ .number = @floatFromInt(clipping.leading) },
             .{ .number = @floatFromInt(clipping.trailing) },
+            .{ .boolean = world.focusedOutput() == wm_output },
         };
         try self.graphics.update(.{ .shell = shell_id }, .{
             .service = "desktop",
@@ -407,45 +408,9 @@ pub const Context = struct {
 
     pub fn updateStatusServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
         const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-        var cpu_history: [status_app.cpu_history_len]script.program_loader.Value = undefined;
-        var cpu_cores: [status_app.max_cpu_count]script.program_loader.Value = undefined;
-        var rx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
-        var tx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
-        for (0..status_app.cpu_history_len) |index|
-            cpu_history[index] = .{ .number = self.status.cpu_history[index] };
-        const cpu_core_count: usize = self.status.cpu_core_count;
-        for (0..cpu_core_count) |index|
-            cpu_cores[index] = .{ .number = self.status.cpu_cores[index] };
-        for (0..status_app.network_history_len) |index| {
-            rx_history[index] = .{ .number = self.status.network_rx_history[index] };
-            tx_history[index] = .{ .number = self.status.network_tx_history[index] };
-        }
-        const values = [_]script.program_loader.Value{
-            .{ .string = &self.status.time },
-            .{ .string = &self.status.dow },
-            .{ .string = &self.status.date },
-            .{ .number = @floatFromInt(self.status.cpu_percent) },
-            .{ .array = &cpu_history },
-            .{ .number = @floatFromInt(self.status.memory_percent) },
-            .{ .number = @floatFromInt(self.status.disk_percent) },
-            .{ .number = self.status.network_rx },
-            .{ .number = self.status.network_tx },
-            .{ .array = &rx_history },
-            .{ .array = &tx_history },
-            .{ .number = @floatFromInt(self.status.audio_percent) },
-            .{ .boolean = self.status.audio_muted },
-            .{ .boolean = self.status.audio_visible },
-            .{ .boolean = self.status.battery_present },
-            .{ .number = @floatFromInt(self.status.battery_percent) },
-            .{ .boolean = self.status.battery_charging },
-            .{ .number = @floatFromInt(self.status.network_sample_sequence) },
-            .{ .number = @floatFromInt(self.status.cpu_core_count) },
-            .{ .number = self.status.cpu_core_equivalents },
-            .{ .array = cpu_cores[0..cpu_core_count] },
-            .{ .number = @floatFromInt(self.status.cpu_sample_sequence) },
-            .{ .number = self.status.network_capacity },
-        };
-        try self.graphics.update(.{ .shell = shell_id }, .{ .service = "status", .values = &values });
+        var status_values: status_app.StatusValues(script.program_loader.Value) = .{};
+        const values = status_values.build(&self.status);
+        try self.graphics.update(.{ .shell = shell_id }, .{ .service = "status", .values = values });
     }
 
     pub fn updateFrameServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
@@ -566,8 +531,9 @@ fn onDecorationCreated(raw: ?*anyopaque, window: host.types.WindowId, id: host.t
     try self.graphics.createRole(.{ .decoration = id }, surface, try self.decorationExtent(window));
 }
 
-fn onDecorationRetire(raw: ?*anyopaque, _: host.types.WindowId, id: host.types.DecorationId) !river_role_lifecycle.RetirementStatus {
+fn onDecorationRetire(raw: ?*anyopaque, _: host.types.WindowId, id: host.types.DecorationId, inert: bool) !river_role_lifecycle.RetirementStatus {
     const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
+    if (inert) self.graphics.markRoleInert(.{ .decoration = id });
     return retire(self, .{ .decoration = id });
 }
 

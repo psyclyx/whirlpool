@@ -23,6 +23,8 @@ pub const OutputShellRole = struct {
     shell_surface: *wayland.client.river.ShellSurfaceV1,
     node: *wayland.client.river.NodeV1,
     retirement_requested: bool = false,
+    /// The position last sent to River, so an unchanged one is not sent again.
+    last_position: ?ShellPosition = null,
 };
 
 /// A decoration role is one ownership unit.  The manager owns both the
@@ -33,6 +35,11 @@ pub const DecorationRole = struct {
     surface: *wayland.client.wl.Surface,
     decoration: *wayland.client.river.DecorationV1,
     retirement_requested: bool = false,
+    /// River made the decoration inert when its window closed; committing the
+    /// surface any more crashes river, so retirement must not touch it.
+    inert: bool = false,
+    /// The offset last sent to River, so an unchanged one is not sent again.
+    last_offset: ?DecorationPosition = null,
 };
 
 pub const Hooks = struct {
@@ -200,10 +207,16 @@ pub const Manager = struct {
         self: *Manager,
         context: ?*anyopaque,
         resolve: *const fn (?*anyopaque, *wayland.client.river.OutputV1) ?ShellPosition,
+        refresh: bool,
     ) void {
-        for (self.output_shell_roles.items) |role| {
+        for (self.output_shell_roles.items) |*role| {
             if (role.retirement_requested) continue;
-            if (resolve(context, role.output)) |position| role.node.setPosition(position.x, position.y);
+            if (resolve(context, role.output)) |position| {
+                if (refresh or !std.meta.eql(role.last_position, position)) {
+                    role.node.setPosition(position.x, position.y);
+                    role.last_position = position;
+                }
+            }
             role.node.placeTop();
         }
     }
@@ -212,9 +225,13 @@ pub const Manager = struct {
         self: *Manager,
         context: ?*anyopaque,
         resolve: *const fn (?*anyopaque, *wayland.client.river.WindowV1) ?DecorationPosition,
+        refresh: bool,
     ) void {
-        for (self.decoration_roles.items) |role| if (resolve(context, role.window)) |position|
+        for (self.decoration_roles.items) |*role| if (resolve(context, role.window)) |position| {
+            if (!refresh and role.last_offset != null and std.meta.eql(role.last_offset.?, position)) continue;
             role.decoration.setOffset(position.x, position.y);
+            role.last_offset = position;
+        };
     }
 
     /// Create a compositor-owned surface and assign it a River decoration
@@ -279,7 +296,10 @@ pub const Manager = struct {
 
     pub fn requestDecorationsForWindowRetirement(self: *Manager, window: *wayland.client.river.WindowV1) void {
         for (self.decoration_roles.items) |*role| {
-            if (role.window == window) role.retirement_requested = true;
+            if (role.window == window) {
+                role.retirement_requested = true;
+                role.inert = true;
+            }
         }
     }
 

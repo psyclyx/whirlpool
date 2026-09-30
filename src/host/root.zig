@@ -12,6 +12,7 @@ pub const phase = @import("phase.zig");
 pub const wm_bridge = @import("wm_bridge.zig");
 pub const composition = @import("composition.zig");
 pub const decoration_selection = @import("decoration_selection.zig");
+pub const render_delta = @import("render_delta.zig");
 pub const skia_scene = @import("skia_scene.zig");
 pub const lua_composition = @import("lua/composition.zig");
 pub const surface_composition = @import("surface_composition.zig");
@@ -25,6 +26,7 @@ test {
     _ = wm_bridge;
     _ = composition;
     _ = decoration_selection;
+    _ = render_delta;
     _ = skia_scene;
     _ = lua_composition;
     _ = surface_composition;

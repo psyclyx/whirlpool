@@ -18,7 +18,7 @@ pub const Hooks = struct {
     shell_created: ?*const fn (?*anyopaque, types.OutputId, *wayland.client.river.ShellSurfaceV1, *wayland.client.wl.Surface) anyerror!void = null,
     shell_retire: ?*const fn (?*anyopaque, types.OutputId, types.ShellSurfaceId) anyerror!RetirementStatus = null,
     decoration_created: ?*const fn (?*anyopaque, types.WindowId, types.DecorationId, *wayland.client.river.DecorationV1, *wayland.client.wl.Surface) anyerror!void = null,
-    decoration_retire: ?*const fn (?*anyopaque, types.WindowId, types.DecorationId) anyerror!RetirementStatus = null,
+    decoration_retire: ?*const fn (?*anyopaque, types.WindowId, types.DecorationId, bool) anyerror!RetirementStatus = null,
 };
 
 pub const RetirementStatus = enum { pending_release, release_safe };
@@ -362,13 +362,13 @@ pub const Runtime = struct {
 
     fn advanceDecorationRetirement(self: *Runtime, index: usize) !bool {
         const record = self.decorations.items[index];
+        const manager_index = self.managerDecorationIndex(record.decoration) orelse return error.RoleOwnershipLost;
         const status = if (self.hooks.decoration_retire) |hook|
-            try hook(self.hooks.context, record.window, record.id)
+            try hook(self.hooks.context, record.window, record.id, self.manager.decoration_roles.items[manager_index].inert)
         else
             RetirementStatus.release_safe;
         if (status == .pending_release) return false;
 
-        const manager_index = self.managerDecorationIndex(record.decoration) orelse return error.RoleOwnershipLost;
         try self.manager.finishDecorationRoleRetirement(manager_index);
         _ = self.decoration_lifetime.active.remove(record.window);
         _ = self.decorations.orderedRemove(index);
@@ -473,4 +473,54 @@ test "decoration extent follows width but not content height" {
         .{ .width = 800, .height = 600 },
         .{ .width = 1024, .height = 600 },
     ));
+}
+
+var retire_hook_inert: ?bool = null;
+
+fn recordInertRetire(_: ?*anyopaque, _: types.WindowId, _: types.DecorationId, inert: bool) anyerror!RetirementStatus {
+    retire_hook_inert = inert;
+    return .pending_release;
+}
+
+test "decorations of a closed window retire as inert" {
+    const window: *wayland.client.river.WindowV1 = @ptrFromInt(0x3000);
+    var manager: live.Manager = .{
+        .allocator = std.testing.allocator,
+        .client = undefined,
+        .proxy = undefined,
+    };
+    defer manager.decoration_roles.deinit(manager.allocator);
+    try manager.decoration_roles.append(manager.allocator, .{
+        .window = window,
+        .surface = @ptrFromInt(0x3010),
+        .decoration = @ptrFromInt(0x3020),
+    });
+    try std.testing.expect(!manager.decoration_roles.items[0].inert);
+
+    var adapter = world.Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+    var runtime = Runtime.init(std.testing.allocator, &manager, &adapter, undefined, .{
+        .decoration_retire = recordInertRetire,
+    });
+    defer runtime.abandon();
+    try runtime.decorations.append(std.testing.allocator, .{
+        .window = types.WindowId.init(7),
+        .extent = .{ .width = 800, .height = 600 },
+        .decoration = @ptrFromInt(0x3020),
+        .surface = @ptrFromInt(0x3010),
+        .id = types.DecorationId.init(9),
+    });
+
+    // Retirement for an ordinary reason (e.g. a resize) may still touch the surface.
+    retire_hook_inert = null;
+    try manager.requestDecorationRoleRetirement(0);
+    try runtime.advanceDecorationRetirements();
+    try std.testing.expectEqual(@as(?bool, false), retire_hook_inert);
+
+    // Once River sends `closed`, the surface is inert and must not be committed.
+    manager.requestDecorationsForWindowRetirement(window);
+    try std.testing.expect(manager.decoration_roles.items[0].inert);
+    retire_hook_inert = null;
+    try runtime.advanceDecorationRetirements();
+    try std.testing.expectEqual(@as(?bool, true), retire_hook_inert);
 }

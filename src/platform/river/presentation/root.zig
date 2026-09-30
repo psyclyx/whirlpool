@@ -342,10 +342,11 @@ pub fn Registry(comptime Api: type) type {
                 if (entry.presenter.stateOf() != .submitted) continue;
                 const did_release = try entry.presenter.pollRelease();
                 const state = entry.presenter.stateOf();
-                if (did_release) {
-                    if (state != .ready) return error.InvalidPresenterTransition;
+                // A retiring role's render worker can also observe the release and
+                // flip the presenter to ready between our poll and this read.
+                if (state == .ready) {
                     released += 1;
-                } else if (state != .submitted) {
+                } else if (did_release or state != .submitted) {
                     return error.InvalidPresenterTransition;
                 }
             }
@@ -477,6 +478,7 @@ const TestPresenter = struct {
     discard_calls: usize = 0,
     fail_arm: bool = false,
     release_ready: bool = false,
+    release_race: bool = false,
 
     fn stateOf(raw: *anyopaque) TestRegistry.PresenterState {
         return from(raw).state;
@@ -522,6 +524,11 @@ const TestPresenter = struct {
     fn pollRelease(raw: *anyopaque) !bool {
         const self = from(raw);
         if (self.state != .submitted) return error.NotSubmitted;
+        if (self.release_race) {
+            // A retiring role's render worker observed the release first.
+            self.state = .ready;
+            return false;
+        }
         if (!self.release_ready) return false;
         self.state = .ready;
         return true;
@@ -733,4 +740,27 @@ test "registry refuses deinit while roles remain retained" {
     try std.testing.expectError(error.PresentersStillRetained, registry.deinit());
     try registry.destroyRole(role);
     try registry.deinit();
+}
+
+test "release polling tolerates a retiring worker releasing concurrently" {
+    var factory = TestFactory{ .allocator = std.testing.allocator };
+    var registry = try TestRegistry.init(std.testing.allocator, .{
+        .factory = factory.interface(),
+        .max_roles = 1,
+    });
+    defer registry.deinit() catch unreachable;
+    var surface = TestSurface{ .id = 1 };
+    const role = TestRole{ .decoration = 31 };
+    try registry.createRole(.{ .role = role, .surface = &surface, .extent = .{ .width = 80, .height = 24 } });
+    const submitted = try registry.prepareDrawList(role, 1, .{ 0, 0, 0, 1 }, .{ .operation_count = 1 });
+    const hooks = registry.surfaceHooks();
+    try hooks.prepare(hooks.context, submitted);
+    hooks.commit(hooks.context, submitted);
+
+    // The presenter reports "not released" but is already ready by the time
+    // the registry re-reads its state.
+    factory.products[0].?.release_race = true;
+    try std.testing.expectEqual(@as(usize, 1), try registry.pollReleases());
+    try std.testing.expectEqual(TestRegistry.PresenterState.ready, try registry.stateOf(role));
+    try registry.destroyRole(role);
 }

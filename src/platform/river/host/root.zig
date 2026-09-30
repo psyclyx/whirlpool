@@ -112,6 +112,11 @@ pub const Stats = struct {
     shell_failures: u64 = 0,
     committed_surfaces: u64 = 0,
     discarded_surfaces: u64 = 0,
+    /// Rendering operations sent to River, skipped as already true, and how
+    /// many render sequences restated everything.
+    render_ops_sent: u64 = 0,
+    render_ops_skipped: u64 = 0,
+    render_full_refreshes: u64 = 0,
 };
 pub const WindowChrome = struct { decoration_height: i32, border_width: i32 };
 
@@ -148,6 +153,8 @@ pub const Runtime = struct {
     manage_request_pending: bool = false,
     render_expected: bool = false,
     stats: Stats = .{},
+    /// What River already holds, so unchanged rendering state is not resent.
+    render_delta: host.render_delta.RenderDelta,
 
     /// Initialize a compositor-free host runtime with default limits.
     pub fn init(allocator: std.mem.Allocator) Runtime {
@@ -164,6 +171,7 @@ pub const Runtime = struct {
             .options = options,
             .queued_intents = script.IntentBatch.init(allocator, options.max_intents),
             .surface_queue = .init(allocator, options.max_pending_commits),
+            .render_delta = host.render_delta.RenderDelta.init(allocator),
         };
         runtime.assertValid();
         return runtime;
@@ -306,6 +314,7 @@ pub const Runtime = struct {
     /// Release all queued and staged host state.
     pub fn deinit(self: *Runtime) void {
         self.assertValid();
+        self.render_delta.deinit();
         if (self.render) |*cycle| cycle.deinit();
         if (self.frames) |*frames| frames.deinit();
         if (self.options.surfaces) |surface_hooks|
@@ -458,10 +467,6 @@ pub const Runtime = struct {
         const frames = &(self.frames orelse return transport.finishRenderError(Runtime, self, error.MissingFrameSet));
         const render_cycle = self.adapter.beginRender(frames) catch |err| return transport.finishRenderError(Runtime, self, err);
         self.render = render_cycle;
-        if (self.manager) |manager| {
-            manager.placeOutputShellRoles(self, resolveShellPosition);
-            manager.placeDecorationRoles(self, resolveDecorationPosition);
-        }
         defer {
             self.render.?.deinit();
             self.render = null;
@@ -470,10 +475,33 @@ pub const Runtime = struct {
         var operations = std.ArrayList(types.RenderOperation).empty;
         defer operations.deinit(self.allocator);
         for (frames.frames()) |frame| try operations.appendSlice(self.allocator, frame.plans.river_render.operations.items);
+        // A window on a tag no output shows is in no output's plan, so nothing
+        // else would ever take it off screen. State it here; the delta below
+        // makes it a single request when the window first disappears.
+        try self.appendHiddenTagWindows(&operations);
+        // Send only what River does not already hold (see render_delta.zig).
+        var changed = std.ArrayList(types.RenderOperation).empty;
+        defer changed.deinit(self.allocator);
+        const topology = self.renderTopology();
+        const refresh = self.render_delta.refreshDue(topology);
+        const filtered = try self.render_delta.filter(operations.items, &changed, topology);
+        self.stats.render_ops_sent += filtered.sent;
+        self.stats.render_ops_skipped += filtered.skipped;
+        if (filtered.full) self.stats.render_full_refreshes += 1;
         var commits = std.ArrayList(coordinator.SubmittedCommit).empty;
         defer commits.deinit(self.allocator);
         try self.surface_queue.appendReady(self.allocator, &commits);
-        try coordinator.runRender(.{ .operations = operations.items }, commits.items, transport.renderEmitter(Runtime, self));
+        // Decoration and shell placements are requests made on the manager
+        // directly; they follow the same refresh.
+        if (self.manager) |manager| {
+            manager.placeOutputShellRoles(self, resolveShellPosition, refresh);
+            manager.placeDecorationRoles(self, resolveDecorationPosition, refresh);
+        }
+        coordinator.runRender(.{ .operations = changed.items }, commits.items, transport.renderEmitter(Runtime, self)) catch |err| {
+            // Part of the plan may not have reached River: trust nothing.
+            self.render_delta.invalidate();
+            return err;
+        };
         if (render_cycle.dimensions_changed or frames.needs_frame) self.manage_dirty_requested = true;
     }
 
@@ -538,6 +566,36 @@ pub const Runtime = struct {
         const wm_window = (self.adapter.objects.windows.get(live_window) orelse return null).wm_id orelse return null;
         const chrome = self.windowChrome(wm_window) orelse return null;
         return live.decorationPosition(chrome.decoration_height, chrome.border_width) catch null;
+    }
+
+    fn appendHiddenTagWindows(self: *const Runtime, operations: *std.ArrayList(types.RenderOperation)) !void {
+        const view = self.adapter.worldView();
+        var index: usize = 0;
+        while (view.windowAt(index)) |id| : (index += 1) {
+            const record = view.getWindow(id) orelse continue;
+            if (record.lifecycle != .managed or view.tagShownSomewhere(record.tag)) continue;
+            const host_window = self.adapter.objects.wm_to_window.get(id) orelse continue;
+            try operations.append(self.allocator, .{ .hide = host_window });
+        }
+    }
+
+    /// A digest of which windows and outputs exist and where the outputs are.
+    /// Any change means River's rendering state may no longer match the cache.
+    fn renderTopology(self: *const Runtime) u64 {
+        const view = self.adapter.worldView();
+        var hasher = std.hash.Wyhash.init(0);
+        var index: usize = 0;
+        while (view.windowAt(index)) |id| : (index += 1) hasher.update(std.mem.asBytes(&id.raw()));
+        index = 0;
+        while (view.outputAt(index)) |id| : (index += 1) {
+            hasher.update(std.mem.asBytes(&id.raw()));
+            if (view.getOutput(id)) |output| {
+                hasher.update(std.mem.asBytes(&output.bounds));
+                hasher.update(std.mem.asBytes(&output.usable));
+                hasher.update(std.mem.asBytes(&output.active_tag.raw()));
+            }
+        }
+        return hasher.final();
     }
 
     fn assertValid(self: *const Runtime) void {
@@ -708,7 +766,12 @@ test "compositor-free coordinator runs policy and retained commits only after bo
 
     try runtime.stageRenderBoundary();
     try runtime.afterDispatch();
-    try std.testing.expectEqualSlices(u8, "pmMascrrrrrRblkdrrrrrR", trace.events.items);
+    // The same five rendering operations are already true in River, so the second
+    // render sequence sends none of them (it still finishes).
+    try std.testing.expectEqualSlices(u8, "pmMascrrrrrRblkdR", trace.events.items);
+    try std.testing.expectEqual(@as(u64, 5), runtime.stats.render_ops_sent);
+    try std.testing.expectEqual(@as(u64, 5), runtime.stats.render_ops_skipped);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats.render_full_refreshes);
 }
 
 test "surface retirement discards queued work before presenter teardown" {
