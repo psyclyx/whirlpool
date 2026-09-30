@@ -34,10 +34,40 @@ pub fn run(self: anytype, facts: []const types.ManageFact) !void {
     try syncWindowSizing(self);
     try applyWindowPolicy(self);
     if (focus) |window| if (self.objects.windows.get(window)) |record| {
-        if (record.wm_id) |id| _ = try self.world.applyAtomically(&.{.{ .focus = .{ .window = id } }});
+        if (record.wm_id) |id| try focusIfFocusable(self, id);
     };
     removeRetiredSeats(self, facts);
     removeClosedRecords(self);
+}
+
+/// Compositor-originated focus (pointer interaction, new windows) can name a
+/// window the model considers invisible, e.g. on another tag or minimized.
+/// That is not a fault; the request is dropped and focus stays put.
+fn focusIfFocusable(self: anytype, id: anytype) !void {
+    _ = self.world.applyAtomically(&.{.{ .focus = .{ .window = id } }}) catch |err| switch (err) {
+        error.NotFocusable => return logUnfocusable(self, id),
+        else => return err,
+    };
+}
+
+fn logUnfocusable(self: anytype, id: anytype) void {
+    const window = self.world.getWindow(id) orelse {
+        std.log.warn("focus dropped: window {d} unknown", .{id.raw()});
+        return;
+    };
+    const output = if (window.output) |output_id| self.world.getOutput(output_id) else null;
+    std.log.warn(
+        "focus dropped: window={d} lifecycle={s} placement={s} tag={d} output={?d} output_active_tag={?d} focused={?d}",
+        .{
+            id.raw(),
+            @tagName(window.lifecycle),
+            @tagName(window.placement),
+            window.tag.raw(),
+            if (window.output) |o| o.raw() else null,
+            if (output) |o| o.active_tag.raw() else null,
+            if (self.world.focusedWindow()) |w| w.raw() else null,
+        },
+    );
 }
 
 fn destroyClosedWindows(self: anytype) !void {
@@ -158,7 +188,7 @@ fn materializeWindows(self: anytype) !void {
         } });
         const window_id = result.announced_window.?;
         _ = try wm.lifecycle.applyEvent(&self.world, .{ .window_managed = window_id });
-        _ = try self.world.applyAtomically(&.{.{ .focus = .{ .window = window_id } }});
+        try focusIfFocusable(self, window_id);
         entry.wm_id = window_id;
         entry.requested_placement = null;
         try self.objects.wm_to_window.put(window_id, window);

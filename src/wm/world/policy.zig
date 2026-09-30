@@ -7,7 +7,7 @@ const validation = @import("validation.zig");
 
 pub fn focusWindowInPlace(world: anytype, window_id: ids.WindowId) !void {
     const window = world.windows.getConst(window_id) orelse return error.UnknownWindow;
-    if (!validation.isVisible(world, window)) return error.NotFocusable;
+    if (!validation.isFocusable(world, window)) return error.NotFocusable;
     world.focused = window_id;
 }
 
@@ -204,7 +204,7 @@ fn clearInvalidFocus(world: anytype) void {
         world.focused = null;
         return;
     };
-    if (!validation.isVisible(world, window)) world.focused = null;
+    if (!validation.isFocusable(world, window)) world.focused = null;
 }
 
 test "placement restoration is independent of layout structure" {

@@ -26,15 +26,26 @@ pub fn validate(world: anytype) !void {
     }
     if (world.focused) |focused| {
         const window = world.windows.getConst(focused) orelse return error.InvalidInvariant;
-        if (!isVisible(world, window)) return error.InvalidInvariant;
+        if (!isFocusable(world, window)) return error.InvalidInvariant;
     }
 }
 
-pub fn isVisible(world: anytype, window: *const types.Window) bool {
+/// Whether a window may hold focus: managed, not in the scratchpad, and on a
+/// tag some output is showing. This is not on-screen visibility; strip
+/// camera, tab selection and fullscreen occlusion are layout state.
+pub fn isFocusable(world: anytype, window: *const types.Window) bool {
     if (window.lifecycle != .managed or window.placement == .scratchpad) return false;
-    const output_id = window.output orelse return false;
-    const output = world.outputs.getConst(output_id) orelse return false;
-    return output.active_tag == window.tag;
+    // A window pinned to an output counts only there. An unpinned one
+    // (e.g. after send-to-tag) follows its tag to whichever output shows it.
+    if (window.output) |output_id| {
+        const output = world.outputs.getConst(output_id) orelse return false;
+        return output.active_tag == window.tag;
+    }
+    for (world.outputs.slots.items) |slot| {
+        const output = slot.value orelse continue;
+        if (output.active_tag == window.tag) return true;
+    }
+    return false;
 }
 
 pub fn validateOptionalSize(value: ?types.Size) !void {
