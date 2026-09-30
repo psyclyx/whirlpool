@@ -103,6 +103,14 @@ pub const SceneDelta = struct {
         try self.set(node, .{ .font_size = value });
     }
 
+    pub fn setTextAlign(self: *SceneDelta, node: tree.NodeHandle, value: tree.TextAlign) !void {
+        try self.set(node, .{ .text_align = value });
+    }
+
+    pub fn setTextVAlign(self: *SceneDelta, node: tree.NodeHandle, value: tree.TextVAlign) !void {
+        try self.set(node, .{ .text_valign = value });
+    }
+
     pub fn setOpacity(self: *SceneDelta, node: tree.NodeHandle, value: f32) !void {
         try self.set(node, .{ .opacity = value });
     }
@@ -139,6 +147,11 @@ pub const SceneDelta = struct {
 
         for (self.mutations.items, 0..) |mutation, index| {
             const owns_bytes = ownedBytes(mutation.value) != null;
+            // A value equal to what the node already holds changes nothing, so it
+            // must not dirty the node either.
+            if (scene.node(mutation.node)) |current| {
+                if (properties.matches(current.properties, mutation.value)) continue;
+            }
             if (owns_bytes and prepared[index].bytes == null) continue;
             const owned_bytes = if (prepared[index].bytes) |bytes| blk: {
                 prepared[index].bytes = null;
@@ -307,4 +320,31 @@ fn deltaAllocationScenario(allocator: Allocator) !void {
     if (!std.mem.eql(u8, scene.node(label).?.properties.text, "a replacement that needs storage")) {
         return error.InvalidValue;
     }
+}
+
+test "setting a property to the value it already has does not dirty the scene" {
+    var scene = tree.Scene.init(std.testing.allocator);
+    defer scene.deinit();
+    var mount = try scene.mount();
+    defer mount.deinit();
+    const root = try mount.create(.row, null);
+    const label = try mount.text(root, "steady");
+    scene.clearDirty();
+    try std.testing.expect(!scene.hasDirtyNodes());
+
+    var delta = SceneDelta.init(std.testing.allocator);
+    defer delta.deinit();
+    try delta.setText(label, "steady");
+    try delta.setOpacity(label, 1);
+    try delta.setTextColor(label, tree.Color.white);
+    try delta.setFontSize(label, 16);
+    try delta.apply(&scene);
+    try std.testing.expect(!scene.hasDirtyNodes());
+
+    // A genuine change still dirties exactly that node.
+    try delta.setOpacity(label, 0.5);
+    try delta.apply(&scene);
+    try std.testing.expect(scene.hasDirtyNodes());
+    try std.testing.expectEqual(@as(tree.DirtyFlags, .{ .paint = true }), scene.node(label).?.dirty);
+    try std.testing.expectEqual(@as(tree.DirtyFlags, .{}), scene.node(root).?.dirty);
 }

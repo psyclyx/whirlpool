@@ -13,6 +13,8 @@ pub const Edges = properties.Edges;
 pub const Color = properties.Color;
 pub const Point = properties.Point;
 pub const Polygon = properties.Polygon;
+pub const TextAlign = properties.TextAlign;
+pub const TextVAlign = properties.TextVAlign;
 pub const DirtyFlags = properties.DirtyFlags;
 pub const NodeProperties = properties.Snapshot;
 
@@ -134,7 +136,6 @@ pub const Scene = struct {
     /// Copy the direct children in retained order. Passing null returns the
     /// scene roots. The returned handle array belongs to the caller.
     pub fn childrenAlloc(self: *const Scene, allocator: Allocator, parent: ?NodeHandle) (NodeError || Allocator.Error)![]NodeHandle {
-        self.assertValid();
         if (parent) |parent_handle| _ = self.lookupNode(parent_handle) orelse return error.StaleNode;
 
         const first = if (parent) |parent_handle|
@@ -166,12 +167,18 @@ pub const Scene = struct {
     }
 
     /// Clear dirty flags on every live node.
+    /// Whether any node has changed since the last `clearDirty`.
+    pub fn hasDirtyNodes(self: *const Scene) bool {
+        for (self.nodes.slots.items) |slot| {
+            if (slot.state == .alive and isDirty(slot.value.dirty)) return true;
+        }
+        return false;
+    }
+
     pub fn clearDirty(self: *Scene) void {
-        self.assertValid();
         for (self.nodes.slots.items) |*slot| {
             if (slot.state == .alive) slot.value.dirty = .{};
         }
-        self.assertValid();
     }
 
     /// Return stable, caller-owned snapshots for the currently dirty nodes.
@@ -236,14 +243,14 @@ pub const Scene = struct {
             else => {},
         }
         self.commitProperty(handle, value, owned_bytes);
-        self.assertValid();
     }
 
     /// Commit a property after the caller has validated the node and prepared
     /// all fallible allocations. Keeping this phase infallible is what makes a
     /// SceneDelta's mutation phase atomic.
     pub fn commitProperty(self: *Scene, handle: NodeHandle, value: PropertyValue, owned_bytes: ?[]u8) void {
-        self.assertValid();
+        // Properties never change structure, so the O(nodes) invariant walk is
+        // reserved for the structural operations that can break it.
         const stored = self.lookupNodeMut(handle) orelse unreachable;
         stored.properties.commit(self.allocator, value, owned_bytes);
 
@@ -251,7 +258,6 @@ pub const Scene = struct {
         stored.dirty.layout = stored.dirty.layout or dirty.layout;
         stored.dirty.paint = stored.dirty.paint or dirty.paint;
         if (dirty.layout) self.markLayoutAncestors(stored.parent);
-        self.assertValid();
     }
 
     fn markLayoutAncestors(self: *Scene, start: ?NodeHandle) void {
@@ -467,6 +473,12 @@ pub const Scene = struct {
 
     fn assertValid(self: *const Scene) void {
         if (!std.debug.runtime_safety) return;
+        // The walk below is quadratic in the node count. Small scenes (all the unit
+        // tests of the tree itself) are checked after every mutation; a large one is
+        // checked when it doubles, which still catches a broken invariant soon
+        // after it appears while keeping construction of a big program cheap.
+        const live = self.nodes.liveCount();
+        if (live > 64 and !std.math.isPowerOfTwo(live)) return;
         std.debug.assert((self.first_root == null) == (self.last_root == null));
 
         for (self.mounts.slots.items, 0..) |slot, index| {

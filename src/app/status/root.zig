@@ -5,13 +5,55 @@
 //! in a Wayland callback or a Lua surface controller.
 
 const std = @import("std");
+const rate_mod = @import("rate.zig");
+const storage = @import("storage.zig");
+const io_mod = @import("io.zig");
 
+pub const WindowedRate = rate_mod.WindowedRate;
 pub const cpu_history_len = 24;
 pub const network_history_len = 24;
 pub const max_cpu_count = 256;
 pub const cpu_sample_period_ms = 500;
 pub const network_sample_period_ms = 500;
-const network_ewma_seconds = 2.0;
+/// Throughput is bytes over this trailing window, so displayed numbers change
+/// smoothly instead of tracking every sample.
+const throughput_window_ns: i128 = 2 * std.time.ns_per_s;
+/// The numeric readout averages over a longer window than the plot so it moves
+/// slowly enough to read.
+const readout_window_ns: i128 = 4 * std.time.ns_per_s;
+pub const max_disks = storage.max_groups;
+
+pub const Memory = struct {
+    total: u64 = 0,
+    /// Memory held by programs and the kernel (excluding everything below).
+    used: u64 = 0,
+    /// Page cache and buffers: reclaimable, but not free.
+    cache: u64 = 0,
+    /// ZFS ARC, evictable like cache but accounted separately by the kernel.
+    arc: u64 = 0,
+    free: u64 = 0,
+    swap_total: u64 = 0,
+    swap_used: u64 = 0,
+    /// Pages held compressed in zswap (their original size), and the memory
+    /// their compressed copies occupy. Both zero when zswap is off.
+    zswap_stored: u64 = 0,
+    zswap_compressed: u64 = 0,
+};
+
+pub const Disk = struct {
+    label: [24]u8 = undefined,
+    label_len: u8 = 0,
+    total: u64 = 0,
+    used: u64 = 0,
+    avail: u64 = 0,
+    /// Bytes per second the pool or device is reading and writing.
+    read_rate: f64 = 0,
+    write_rate: f64 = 0,
+
+    pub fn labelSlice(self: *const Disk) []const u8 {
+        return self.label[0..self.label_len];
+    }
+};
 
 pub const Snapshot = struct {
     time: [5]u8 = "--:--".*,
@@ -23,14 +65,14 @@ pub const Snapshot = struct {
     cpu_core_equivalents: f64 = 0,
     cpu_cores: [max_cpu_count]f64 = [_]f64{0} ** max_cpu_count,
     cpu_sample_sequence: u64 = 0,
-    memory_percent: u8 = 0,
-    disk_percent: u8 = 0,
+    memory: Memory = .{},
+    disks: [max_disks]Disk = [_]Disk{.{}} ** max_disks,
+    disk_count: u8 = 0,
     network_rx: f64 = 0,
     network_tx: f64 = 0,
     network_rx_history: [network_history_len]f64 = [_]f64{0} ** network_history_len,
     network_tx_history: [network_history_len]f64 = [_]f64{0} ** network_history_len,
     network_sample_sequence: u64 = 0,
-    network_capacity: f64 = 0,
     audio_percent: u8 = 0,
     audio_muted: bool = false,
     audio_visible: bool = false,
@@ -57,6 +99,10 @@ pub const Service = struct {
     snapshot: Snapshot = .{},
     revision: u64 = 0,
     wake: ?Wake = null,
+    /// What each reported filesystem lives on, so I/O can be attributed to it.
+    /// Rewritten whenever the set of filesystems is rediscovered.
+    disk_targets: [max_disks]IoTarget = [_]IoTarget{.{}} ** max_disks,
+    disk_generation: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !*Service {
         const self = try allocator.create(Service);
@@ -67,6 +113,7 @@ pub const Service = struct {
         try self.group.concurrent(io, cpuLoop, .{self});
         try self.group.concurrent(io, memoryLoop, .{self});
         try self.group.concurrent(io, diskLoop, .{self});
+        try self.group.concurrent(io, diskIoLoop, .{self});
         try self.group.concurrent(io, networkLoop, .{self});
         try self.group.concurrent(io, audioLoop, .{self});
         try self.group.concurrent(io, batteryLoop, .{self});
@@ -159,51 +206,131 @@ pub const Service = struct {
 
     fn memoryLoop(self: *Service) std.Io.Cancelable!void {
         while (true) {
-            const percent = readMemory(self.io) catch |err| {
+            const memory = readMemory(self.io) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 try std.Io.sleep(self.io, .fromSeconds(5), .awake);
                 continue;
             };
             self.lock();
-            self.snapshot.memory_percent = percent;
+            self.snapshot.memory = memory;
             self.publish();
-            try std.Io.sleep(self.io, .fromSeconds(5), .awake);
+            try std.Io.sleep(self.io, .fromSeconds(2), .awake);
         }
     }
 
     fn diskLoop(self: *Service) std.Io.Cancelable!void {
         while (true) {
-            const percent = self.pollDisk() catch |err| {
+            var groups: [storage.max_groups]storage.Group = undefined;
+            const count = self.pollDisks(&groups) catch |err| blk: {
                 if (err == error.Canceled) return error.Canceled;
-                try std.Io.sleep(self.io, .fromSeconds(30), .awake);
-                continue;
+                break :blk 0;
             };
+            var targets = [_]IoTarget{.{}} ** max_disks;
+            for (groups[0..count], 0..) |group, index| targets[index] = self.ioTarget(group);
             self.lock();
-            self.snapshot.disk_percent = percent;
+            for (groups[0..count], 0..) |group, index| {
+                var disk = Disk{ .label_len = group.label_len, .total = group.total, .used = group.used, .avail = group.avail };
+                @memcpy(disk.label[0..group.label_len], group.labelSlice());
+                self.snapshot.disks[index] = disk;
+            }
+            self.snapshot.disk_count = @intCast(count);
+            self.disk_targets = targets;
+            self.disk_generation +%= 1;
             self.publish();
             try std.Io.sleep(self.io, .fromSeconds(30), .awake);
         }
     }
 
+    /// Work out which counters describe a filesystem's traffic.
+    fn ioTarget(self: *Service, group: storage.Group) IoTarget {
+        var target = IoTarget{};
+        switch (group.kind) {
+            .zfs => {
+                target.kind = .zfs_pool;
+                target.len = copyName(&target.name, group.keySlice());
+            },
+            .block => {
+                var name = group.keySlice();
+                var resolved: [128]u8 = undefined;
+                if (std.mem.startsWith(u8, name, "/dev/mapper/") or std.mem.startsWith(u8, name, "/dev/disk/")) {
+                    // Names like /dev/mapper/root are symlinks to /dev/dm-N.
+                    if (std.Io.Dir.cwd().readLink(self.io, name, &resolved)) |length| {
+                        name = resolved[0..length];
+                    } else |_| return target;
+                }
+                const slash = std.mem.lastIndexOfScalar(u8, name, '/') orelse return target;
+                target.kind = .block_device;
+                target.len = copyName(&target.name, name[slash + 1 ..]);
+            },
+        }
+        return target;
+    }
+
+    fn diskIoLoop(self: *Service) std.Io.Cancelable!void {
+        var rings: [max_disks]DiskRing = [_]DiskRing{.{}} ** max_disks;
+        var seen_generation: u64 = std.math.maxInt(u64);
+        while (true) {
+            self.lock();
+            const generation = self.disk_generation;
+            const targets = self.disk_targets;
+            const count: usize = self.snapshot.disk_count;
+            self.unlock();
+            if (generation != seen_generation) {
+                // New set of filesystems: counters of the old ones mean nothing.
+                rings = [_]DiskRing{.{}} ** max_disks;
+                seen_generation = generation;
+            }
+            const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+            var read_rates = [_]f64{0} ** max_disks;
+            var write_rates = [_]f64{0} ** max_disks;
+            for (targets[0..count], 0..) |target, index| {
+                const counters = self.readIo(target) orelse continue;
+                rings[index].reads.push(now, counters.read);
+                rings[index].writes.push(now, counters.written);
+                read_rates[index] = rings[index].reads.rate(readout_window_ns);
+                write_rates[index] = rings[index].writes.rate(readout_window_ns);
+            }
+            self.lock();
+            if (self.disk_generation == generation) {
+                for (0..count) |index| {
+                    self.snapshot.disks[index].read_rate = read_rates[index];
+                    self.snapshot.disks[index].write_rate = write_rates[index];
+                }
+                self.publish();
+            } else self.unlock();
+            try std.Io.sleep(self.io, .fromMilliseconds(500), .awake);
+        }
+    }
+
+    fn readIo(self: *Service, target: IoTarget) ?io_mod.Counters {
+        switch (target.kind) {
+            .none => return null,
+            .zfs_pool => {
+                var path: [128]u8 = undefined;
+                const location = std.fmt.bufPrint(&path, "/proc/spl/kstat/zfs/{s}/io", .{target.nameSlice()}) catch return null;
+                var buffer: [4096]u8 = undefined;
+                const data = std.Io.Dir.cwd().readFile(self.io, location, &buffer) catch return null;
+                return io_mod.parseZfsPoolIo(data);
+            },
+            .block_device => {
+                var buffer: [64 * 1024]u8 = undefined;
+                const data = std.Io.Dir.cwd().readFile(self.io, "/proc/diskstats", &buffer) catch return null;
+                return io_mod.parseDiskstats(data, target.nameSlice());
+            },
+        }
+    }
+
     fn networkLoop(self: *Service) std.Io.Cancelable!void {
-        var previous: ?NetworkSample = null;
-        var previous_at: ?std.Io.Timestamp = null;
+        var received = WindowedRate{};
+        var sent = WindowedRate{};
         var interface_buffer: [64]u8 = undefined;
         var interface: ?[]const u8 = null;
-        var rx_ewma: f64 = 0;
-        var tx_ewma: f64 = 0;
         while (true) {
             if (interface == null) {
                 interface = readDefaultInterface(self.io, &interface_buffer) catch |err| blk: {
                     if (err == error.Canceled) return error.Canceled;
                     break :blk null;
                 };
-                if (interface) |name| {
-                    const capacity = readNetworkCapacity(self.io, name) catch 0;
-                    self.lock();
-                    self.snapshot.network_capacity = capacity;
-                    self.publish();
-                }
             }
             const current = if (interface) |name| readNetwork(self.io, name) catch |err| blk: {
                 if (err == error.Canceled) return error.Canceled;
@@ -213,25 +340,16 @@ pub const Service = struct {
                 try std.Io.sleep(self.io, .fromMilliseconds(network_sample_period_ms), .awake);
                 continue;
             };
-            var rx: f64 = 0;
-            var tx: f64 = 0;
-            const now = std.Io.Clock.awake.now(self.io);
-            if (previous) |old| {
-                const elapsed_ns = (previous_at orelse now).durationTo(now).nanoseconds;
-                const elapsed_seconds = @as(f64, @floatFromInt(@max(elapsed_ns, 1))) / std.time.ns_per_s;
-                rx = @as(f64, @floatFromInt(sample.rx -| old.rx)) / elapsed_seconds;
-                tx = @as(f64, @floatFromInt(sample.tx -| old.tx)) / elapsed_seconds;
-                const alpha = 1.0 - @exp(-elapsed_seconds / network_ewma_seconds);
-                rx_ewma += (rx - rx_ewma) * alpha;
-                tx_ewma += (tx - tx_ewma) * alpha;
-            }
-            previous = sample;
-            previous_at = now;
+            const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+            received.push(now, sample.rx);
+            sent.push(now, sample.tx);
+            const rx = received.rate(throughput_window_ns);
+            const tx = sent.rate(throughput_window_ns);
             self.lock();
-            self.snapshot.network_rx = rx_ewma;
-            self.snapshot.network_tx = tx_ewma;
-            pushHistory(network_history_len, &self.snapshot.network_rx_history, rx_ewma);
-            pushHistory(network_history_len, &self.snapshot.network_tx_history, tx_ewma);
+            self.snapshot.network_rx = received.rate(readout_window_ns);
+            self.snapshot.network_tx = sent.rate(readout_window_ns);
+            pushHistory(network_history_len, &self.snapshot.network_rx_history, rx);
+            pushHistory(network_history_len, &self.snapshot.network_tx_history, tx);
             self.snapshot.network_sample_sequence +|= 1;
             if (self.snapshot.network_sample_sequence == 0) self.snapshot.network_sample_sequence = 1;
             self.publish();
@@ -298,19 +416,29 @@ pub const Service = struct {
         self.publish();
     }
 
-    fn pollDisk(self: *Service) !u8 {
-        const output = try self.command(&.{ "df", "-P", "/" });
-        defer self.allocator.free(output);
-        var lines = std.mem.splitScalar(u8, output, '\n');
-        _ = lines.next();
-        const line = lines.next() orelse return error.InvalidDiskUsage;
-        var fields = std.mem.tokenizeAny(u8, line, " \t");
-        var use: ?[]const u8 = null;
-        while (fields.next()) |field| {
-            if (std.mem.endsWith(u8, field, "%")) use = field;
+    /// Discover the filesystems worth reporting and size each from the thing
+    /// that owns its space. Returns how many groups were filled in.
+    fn pollDisks(self: *Service, groups: *[storage.max_groups]storage.Group) !usize {
+        var buffer: [64 * 1024]u8 = undefined;
+        const mountinfo = try std.Io.Dir.cwd().readFile(self.io, "/proc/self/mountinfo", &buffer);
+        const count = storage.selectGroups(mountinfo, groups);
+        for (groups[0..count]) |*group| {
+            const output = self.command(&.{ "df", "-PB1", "--", group.mountSlice() }) catch |err| switch (err) {
+                error.CommandFailed, error.FileNotFound => continue,
+                else => return err,
+            };
+            defer self.allocator.free(output);
+            storage.parseDf(output, group) catch continue;
         }
-        const value = use orelse return error.InvalidDiskUsage;
-        return @intCast(@min(100, try std.fmt.parseUnsigned(u16, value[0 .. value.len - 1], 10)));
+        // Pools are sized by ZFS itself: `used` counts snapshots and child
+        // datasets that are not mounted, and `avail` is usable space. Asked
+        // unconditionally: a pool with nothing mounted has no mount to find it by.
+        var total = count;
+        if (self.command(&.{ "zfs", "list", "-Hp", "-d0", "-o", "name,used,avail" })) |output| {
+            defer self.allocator.free(output);
+            total = storage.applyZfsList(output, groups, count);
+        } else |_| {}
+        return storage.finalize(groups[0..total]);
     }
 
     fn pollAudio(self: *Service) !?AudioSample {
@@ -348,7 +476,7 @@ pub const Service = struct {
     fn command(self: *Service, argv: []const []const u8) ![]u8 {
         const result = try std.process.run(self.allocator, self.io, .{
             .argv = argv,
-            .stdout_limit = .limited(4096),
+            .stdout_limit = .limited(16 * 1024),
             .stderr_limit = .limited(4096),
             .timeout = .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } },
         });
@@ -425,22 +553,92 @@ fn utilization(previous: CpuSample, current: CpuSample) f64 {
     return @min(1.0, @as(f64, @floatFromInt(total -| idle)) / @as(f64, @floatFromInt(total)));
 }
 
-fn readMemory(io: std.Io) !u8 {
-    var buffer: [4096]u8 = undefined;
+fn readMemory(io: std.Io) !Memory {
+    var buffer: [8192]u8 = undefined;
     const data = try std.Io.Dir.cwd().readFile(io, "/proc/meminfo", &buffer);
+    var arc: u64 = 0;
+    var arc_buffer: [16 * 1024]u8 = undefined;
+    if (std.Io.Dir.cwd().readFile(io, "/proc/spl/kstat/zfs/arcstats", &arc_buffer)) |stats| {
+        arc = parseArcSize(stats);
+    } else |_| {}
+    return parseMemory(data, arc);
+}
+
+fn parseArcSize(stats: []const u8) u64 {
+    var lines = std.mem.splitScalar(u8, stats, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const name = fields.next() orelse continue;
+        if (!std.mem.eql(u8, name, "size")) continue;
+        _ = fields.next() orelse continue; // kstat type
+        return std.fmt.parseUnsigned(u64, fields.next() orelse continue, 10) catch 0;
+    }
+    return 0;
+}
+
+fn parseMemory(meminfo: []const u8, arc: u64) !Memory {
     var total: ?u64 = null;
-    var available: ?u64 = null;
-    var lines = std.mem.splitScalar(u8, data, '\n');
+    var free: u64 = 0;
+    var buffers: u64 = 0;
+    var cached: u64 = 0;
+    var reclaimable: u64 = 0;
+    var shared: u64 = 0;
+    var swap_total: u64 = 0;
+    var swap_free: u64 = 0;
+    var zswap: u64 = 0;
+    var zswapped: u64 = 0;
+    var lines = std.mem.splitScalar(u8, meminfo, '\n');
     while (lines.next()) |line| {
         var fields = std.mem.tokenizeAny(u8, line, " :\t");
         const name = fields.next() orelse continue;
-        if (std.mem.eql(u8, name, "MemTotal")) total = try std.fmt.parseUnsigned(u64, fields.next() orelse continue, 10);
-        if (std.mem.eql(u8, name, "MemAvailable")) available = try std.fmt.parseUnsigned(u64, fields.next() orelse continue, 10);
+        const kib = std.fmt.parseUnsigned(u64, fields.next() orelse continue, 10) catch continue;
+        const bytes = kib * 1024;
+        if (std.mem.eql(u8, name, "MemTotal")) total = bytes;
+        if (std.mem.eql(u8, name, "MemFree")) free = bytes;
+        if (std.mem.eql(u8, name, "Buffers")) buffers = bytes;
+        if (std.mem.eql(u8, name, "Cached")) cached = bytes;
+        if (std.mem.eql(u8, name, "SReclaimable")) reclaimable = bytes;
+        if (std.mem.eql(u8, name, "Shmem")) shared = bytes;
+        if (std.mem.eql(u8, name, "SwapTotal")) swap_total = bytes;
+        if (std.mem.eql(u8, name, "SwapFree")) swap_free = bytes;
+        if (std.mem.eql(u8, name, "Zswap")) zswap = bytes;
+        if (std.mem.eql(u8, name, "Zswapped")) zswapped = bytes;
     }
     const capacity = total orelse return error.InvalidMemoryInfo;
-    const free = available orelse return error.InvalidMemoryInfo;
     if (capacity == 0) return error.InvalidMemoryInfo;
-    return @intCast(@min(100, ((capacity -| free) * 100 + capacity / 2) / capacity));
+    // Shared memory is counted in Cached but cannot be dropped like cache.
+    const cache = (buffers +| cached +| reclaimable) -| shared;
+    const arc_held = @min(arc, capacity);
+    return .{
+        .total = capacity,
+        .used = capacity -| free -| cache -| arc_held,
+        .cache = cache,
+        .arc = arc_held,
+        .free = free,
+        .swap_total = swap_total,
+        .swap_used = swap_total -| swap_free,
+        .zswap_stored = zswapped,
+        .zswap_compressed = zswap,
+    };
+}
+
+/// Where a filesystem's I/O counters live.
+const IoTarget = struct {
+    kind: enum { none, zfs_pool, block_device } = .none,
+    name: [64]u8 = undefined,
+    len: u8 = 0,
+
+    fn nameSlice(self: *const IoTarget) []const u8 {
+        return self.name[0..self.len];
+    }
+};
+
+const DiskRing = struct { reads: WindowedRate = .{}, writes: WindowedRate = .{} };
+
+fn copyName(target: *[64]u8, source: []const u8) u8 {
+    const count = @min(target.len, source.len);
+    @memcpy(target[0..count], source[0..count]);
+    return @intCast(count);
 }
 
 fn readDefaultInterface(io: std.Io, buffer: []u8) ![]const u8 {
@@ -476,16 +674,6 @@ fn readNetwork(io: std.Io, interface: []const u8) !?NetworkSample {
     return null;
 }
 
-fn readNetworkCapacity(io: std.Io, interface: []const u8) !f64 {
-    var path_buffer: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "/sys/class/net/{s}/speed", .{interface});
-    var speed_buffer: [64]u8 = undefined;
-    const data = try std.Io.Dir.cwd().readFile(io, path, &speed_buffer);
-    const megabits = try std.fmt.parseUnsigned(u64, std.mem.trim(u8, data, " \t\r\n"), 10);
-    if (megabits == 0) return error.InvalidLinkSpeed;
-    return @as(f64, @floatFromInt(megabits)) * 1_000_000.0 / 8.0;
-}
-
 fn pushHistory(comptime len: usize, history: *[len]f64, value: f64) void {
     std.mem.copyForwards(f64, history[0 .. len - 1], history[1..]);
     history[len - 1] = if (std.math.isFinite(value)) @max(0, value) else 0;
@@ -513,4 +701,185 @@ test "cpu parser excludes guest time and retains logical cores" {
         .{ .total = 100, .idle = 50 },
         .{ .total = 120, .idle = 60 },
     ), 0.0001);
+}
+
+/// Shape a snapshot into the grouped positional values the shell program
+/// receives (see the header of `lua/whirlpool/shell.lua`). Generic over the
+/// script value type so this module needs no dependency on the script layer;
+/// the caller owns the storage the returned slice points into.
+pub fn StatusValues(comptime Value: type) type {
+    return struct {
+        cpu_history: [cpu_history_len]Value = undefined,
+        cpu_cores: [max_cpu_count]Value = undefined,
+        rx_history: [network_history_len]Value = undefined,
+        tx_history: [network_history_len]Value = undefined,
+        cpu: [6]Value = undefined,
+        network: [5]Value = undefined,
+        audio: [3]Value = undefined,
+        memory: [9]Value = undefined,
+        disk_fields: [max_disks][6]Value = undefined,
+        disks: [max_disks]Value = undefined,
+        battery: [3]Value = undefined,
+        top: [10]Value = undefined,
+
+        pub fn build(self: *@This(), snapshot: *const Snapshot) []const Value {
+            for (0..cpu_history_len) |index| self.cpu_history[index] = .{ .number = snapshot.cpu_history[index] };
+            const core_count: usize = snapshot.cpu_core_count;
+            for (0..core_count) |index| self.cpu_cores[index] = .{ .number = snapshot.cpu_cores[index] };
+            for (0..network_history_len) |index| {
+                self.rx_history[index] = .{ .number = snapshot.network_rx_history[index] };
+                self.tx_history[index] = .{ .number = snapshot.network_tx_history[index] };
+            }
+            self.cpu = .{
+                .{ .number = @floatFromInt(snapshot.cpu_percent) },
+                .{ .number = snapshot.cpu_core_equivalents },
+                .{ .number = @floatFromInt(snapshot.cpu_core_count) },
+                .{ .array = self.cpu_cores[0..core_count] },
+                .{ .array = &self.cpu_history },
+                .{ .number = @floatFromInt(snapshot.cpu_sample_sequence) },
+            };
+            self.network = .{
+                .{ .number = snapshot.network_rx },
+                .{ .number = snapshot.network_tx },
+                .{ .array = &self.rx_history },
+                .{ .array = &self.tx_history },
+                .{ .number = @floatFromInt(snapshot.network_sample_sequence) },
+            };
+            self.audio = .{
+                .{ .number = @floatFromInt(snapshot.audio_percent) },
+                .{ .boolean = snapshot.audio_muted },
+                .{ .boolean = snapshot.audio_visible },
+            };
+            const memory = snapshot.memory;
+            self.memory = .{
+                .{ .number = @floatFromInt(memory.total) },
+                .{ .number = @floatFromInt(memory.used) },
+                .{ .number = @floatFromInt(memory.cache) },
+                .{ .number = @floatFromInt(memory.arc) },
+                .{ .number = @floatFromInt(memory.free) },
+                .{ .number = @floatFromInt(memory.swap_total) },
+                .{ .number = @floatFromInt(memory.swap_used) },
+                .{ .number = @floatFromInt(memory.zswap_stored) },
+                .{ .number = @floatFromInt(memory.zswap_compressed) },
+            };
+            const disk_count: usize = snapshot.disk_count;
+            for (0..disk_count) |index| {
+                const disk = &snapshot.disks[index];
+                self.disk_fields[index] = .{
+                    .{ .string = disk.labelSlice() },
+                    .{ .number = @floatFromInt(disk.total) },
+                    .{ .number = @floatFromInt(disk.used) },
+                    .{ .number = @floatFromInt(disk.avail) },
+                    .{ .number = disk.read_rate },
+                    .{ .number = disk.write_rate },
+                };
+                self.disks[index] = .{ .array = &self.disk_fields[index] };
+            }
+            self.battery = .{
+                .{ .boolean = snapshot.battery_present },
+                .{ .number = @floatFromInt(snapshot.battery_percent) },
+                .{ .boolean = snapshot.battery_charging },
+            };
+            self.top = .{
+                .{ .string = &snapshot.time },
+                .{ .string = &snapshot.dow },
+                .{ .string = &snapshot.date },
+                .{ .array = &self.cpu },
+                .{ .array = &self.network },
+                .{ .array = &self.audio },
+                .{ .array = &self.memory },
+                .{ .array = self.disks[0..disk_count] },
+                .{ .array = &self.battery },
+                .{ .boolean = snapshot.audio_visible },
+            };
+            return &self.top;
+        }
+    };
+}
+
+test "memory parsing separates programs, cache, ZFS ARC, free and swap" {
+    const kib = 1024;
+    const memory = try parseMemory(
+        \\MemTotal:       65536000 kB
+        \\MemFree:        20480000 kB
+        \\MemAvailable:   40000000 kB
+        \\Buffers:          512000 kB
+        \\Cached:         14000000 kB
+        \\SReclaimable:     488000 kB
+        \\Shmem:           1000000 kB
+        \\SwapTotal:       8388608 kB
+        \\SwapFree:        7000000 kB
+        \\Zswap:             300000 kB
+        \\Zswapped:          900000 kB
+        \\
+    , 6 * 1024 * 1024 * kib);
+    try std.testing.expectEqual(@as(u64, 65536000 * kib), memory.total);
+    try std.testing.expectEqual(@as(u64, 20480000 * kib), memory.free);
+    // Buffers + Cached + SReclaimable - Shmem
+    try std.testing.expectEqual(@as(u64, (512000 + 14000000 + 488000 - 1000000) * kib), memory.cache);
+    try std.testing.expectEqual(@as(u64, 6 * 1024 * 1024 * kib), memory.arc);
+    // The four parts account for the whole of RAM.
+    try std.testing.expectEqual(memory.total, memory.used + memory.cache + memory.arc + memory.free);
+    try std.testing.expectEqual(@as(u64, (8388608 - 7000000) * kib), memory.swap_used);
+    try std.testing.expectEqual(@as(u64, 900000 * kib), memory.zswap_stored);
+    try std.testing.expectEqual(@as(u64, 300000 * kib), memory.zswap_compressed);
+}
+
+test "arc size comes from the kstat table" {
+    try std.testing.expectEqual(@as(u64, 6442450944), parseArcSize(
+        \\13 1 0x01 147 39984 1234 5678
+        \\name                            type data
+        \\hits                            4    111
+        \\size                            4    6442450944
+        \\c_max                           4    9999
+        \\
+    ));
+    try std.testing.expectEqual(@as(u64, 0), parseArcSize("nothing here\n"));
+}
+
+test "status values group every subsystem for the shell program" {
+    const TestValue = union(enum) { number: f64, string: []const u8, boolean: bool, array: []const @This() };
+    var snapshot = Snapshot{};
+    snapshot.cpu_core_count = 2;
+    snapshot.cpu_cores[0] = 90;
+    snapshot.cpu_core_equivalents = 1.5;
+    snapshot.memory = .{ .total = 100, .used = 40, .cache = 30, .arc = 10, .free = 20 };
+    snapshot.disk_count = 1;
+    var disk = Disk{ .label_len = 4, .total = 1000, .used = 400, .avail = 600 };
+    @memcpy(disk.label[0..4], "tank");
+    snapshot.disks[0] = disk;
+    var storage_values: StatusValues(TestValue) = .{};
+    const values = storage_values.build(&snapshot);
+    try std.testing.expectEqual(@as(usize, 10), values.len);
+    try std.testing.expectEqual(@as(usize, 2), values[3].array[3].array.len);
+    try std.testing.expectEqual(@as(f64, 40), values[6].array[1].number);
+    try std.testing.expectEqual(@as(usize, 1), values[7].array.len);
+    try std.testing.expectEqualStrings("tank", values[7].array[0].array[0].string);
+    try std.testing.expectEqual(@as(f64, 600), values[7].array[0].array[3].number);
+}
+
+test {
+    _ = rate_mod;
+    _ = storage;
+    _ = io_mod;
+}
+
+test "live host: memory accounts for all of RAM and disks are grouped" {
+    const memory = readMemory(std.testing.io) catch return error.SkipZigTest;
+    try std.testing.expect(memory.total > 0);
+    try std.testing.expectEqual(memory.total, memory.used + memory.cache + memory.arc + memory.free);
+
+    var buffer: [64 * 1024]u8 = undefined;
+    const mountinfo = std.Io.Dir.cwd().readFile(std.testing.io, "/proc/self/mountinfo", &buffer) catch return error.SkipZigTest;
+    var groups: [storage.max_groups]storage.Group = undefined;
+    const count = storage.selectGroups(mountinfo, &groups);
+    for (groups[0..count], 0..) |group, index| {
+        std.debug.print("live disk group {d}: {s} at {s} ({s})\n", .{ index, group.labelSlice(), group.mountSlice(), @tagName(group.kind) });
+        for (groups[index + 1 .. count]) |other| {
+            try std.testing.expect(!(group.kind == other.kind and std.mem.eql(u8, group.keySlice(), other.keySlice())));
+        }
+    }
+    std.debug.print("live memory: total {d} used {d} cache {d} arc {d} free {d} swap {d}/{d}\n", .{
+        memory.total, memory.used, memory.cache, memory.arc, memory.free, memory.swap_used, memory.swap_total,
+    });
 }

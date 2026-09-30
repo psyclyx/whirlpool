@@ -22,8 +22,9 @@ void whirlpool_skia_draw_rect(WhirlpoolSkia *renderer, float x, float y, float w
 void whirlpool_skia_draw_polygon(WhirlpoolSkia *renderer, const float *points,
                                  size_t point_count, float r, float g, float b, float a);
 void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *text, size_t length,
-                              float x, float baseline, float size,
-                              float r, float g, float b, float a);
+                              float x, float y, float size,
+                              float r, float g, float b, float a,
+                              int anchor, int middle);
 void whirlpool_skia_draw_icon(WhirlpoolSkia *renderer, const char *source, size_t length,
                               float x, float y, float width, float height, float opacity);
 const uint8_t *whirlpool_skia_end(WhirlpoolSkia *renderer, size_t *row_bytes);

@@ -134,6 +134,11 @@ pub const Composition = struct {
     /// Snapshot all retained nodes in tree order and lower them to a complete
     /// renderer-neutral draw list. Dirty bits are cleared only after lowering
     /// succeeds; a rejected frame can therefore be retried.
+    /// Whether anything has changed since the last frame was lowered.
+    pub fn isDirty(self: *const Composition) bool {
+        return self.scene.hasDirtyNodes();
+    }
+
     pub fn snapshotAndLower(self: *Composition, viewport: skia_scene.Viewport) !Frame {
         var snapshots = std.ArrayList(ui.NodeSnapshot).empty;
         defer {

@@ -15,7 +15,7 @@ extern fn whirlpool_skia_begin(renderer: *Native, width: u32, height: u32) c_int
 extern fn whirlpool_skia_clear(renderer: *Native, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_rect(renderer: *Native, x: f32, y: f32, width: f32, height: f32, radius: f32, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_polygon(renderer: *Native, points: [*]const f32, point_count: usize, r: f32, g: f32, b: f32, a: f32) void;
-extern fn whirlpool_skia_draw_text(renderer: *Native, text: [*]const u8, length: usize, x: f32, baseline: f32, size: f32, r: f32, g: f32, b: f32, a: f32) void;
+extern fn whirlpool_skia_draw_text(renderer: *Native, text: [*]const u8, length: usize, x: f32, y: f32, size: f32, r: f32, g: f32, b: f32, a: f32, anchor: c_int, middle: c_int) void;
 extern fn whirlpool_skia_draw_icon(renderer: *Native, source: [*]const u8, length: usize, x: f32, y: f32, width: f32, height: f32, opacity: f32) void;
 extern fn whirlpool_skia_push_clip(renderer: *Native, x: f32, y: f32, width: f32, height: f32) void;
 extern fn whirlpool_skia_pop_clip(renderer: *Native) void;
@@ -62,7 +62,11 @@ pub const Renderer = struct {
     }
 
     pub fn drawText(self: *Renderer, text: []const u8, x: f32, baseline: f32, size: f32, color: Color) void {
-        whirlpool_skia_draw_text(self.native, text.ptr, text.len, x, baseline, size, color.r, color.g, color.b, color.a);
+        whirlpool_skia_draw_text(self.native, text.ptr, text.len, x, baseline, size, color.r, color.g, color.b, color.a, 0, 0);
+    }
+
+    pub fn drawTextItem(self: *Renderer, item: anytype) void {
+        drawTextNative(self.native, item);
     }
 
     pub fn drawIcon(self: *Renderer, source: []const u8, rect: Rect, opacity: f32) void {
@@ -76,7 +80,7 @@ pub const Renderer = struct {
         for (list.ops) |op| switch (op) {
             .rect => |rect| self.drawRect(rect.rect, rect.radius, rect.color),
             .polygon => |item| self.drawPolygon(item.points, item.color),
-            .text => |item| self.drawText(item.text, item.x, item.baseline, item.size, item.color),
+            .text => |item| self.drawTextItem(item),
             .icon => |item| self.drawIcon(item.source, item.rect, item.opacity),
             .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
             .pop_clip => whirlpool_skia_pop_clip(self.native),
@@ -139,7 +143,7 @@ pub const GpuRenderer = struct {
         for (list.ops) |op| switch (op) {
             .rect => |rect| whirlpool_skia_draw_rect(self.native, rect.rect.x, rect.rect.y, rect.rect.width, rect.rect.height, rect.radius, rect.color.r, rect.color.g, rect.color.b, rect.color.a),
             .polygon => |item| drawPolygonNative(self.native, item.points, item.color),
-            .text => |item| whirlpool_skia_draw_text(self.native, item.text.ptr, item.text.len, item.x, item.baseline, item.size, item.color.r, item.color.g, item.color.b, item.color.a),
+            .text => |item| drawTextNative(self.native, item),
             .icon => |item| whirlpool_skia_draw_icon(self.native, item.source.ptr, item.source.len, item.rect.x, item.rect.y, item.rect.width, item.rect.height, item.opacity),
             .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
             .pop_clip => whirlpool_skia_pop_clip(self.native),
@@ -209,6 +213,8 @@ pub const DrawOp = union(enum) {
         baseline: f32,
         size: f32,
         color: Color,
+        anchor: TextAnchor = .start,
+        vertical: TextVertical = .baseline,
     },
     icon: struct {
         source: []const u8,
@@ -271,4 +277,27 @@ test "CPU renderer decodes and rasterizes an SVG icon" {
         break;
     };
     try std.testing.expect(painted);
+}
+
+/// Which point of a text run `x` names: its start, centre, or end.
+pub const TextAnchor = enum(u8) { start, center, end };
+/// What `y` names: the alphabetic baseline, or the vertical middle of capital
+/// letters (so text centres in a box without the caller knowing font metrics).
+pub const TextVertical = enum(u8) { baseline, middle };
+
+fn drawTextNative(native: *Native, item: anytype) void {
+    whirlpool_skia_draw_text(
+        native,
+        item.text.ptr,
+        item.text.len,
+        item.x,
+        item.baseline,
+        item.size,
+        item.color.r,
+        item.color.g,
+        item.color.b,
+        item.color.a,
+        @intFromEnum(item.anchor),
+        @intFromEnum(item.vertical),
+    );
 }

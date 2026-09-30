@@ -81,45 +81,9 @@ const AfterDispatch = struct {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         if (self.status.latestAfter(self.status_revision)) |latest| {
             self.status_revision = latest.revision;
-            var cpu_history: [status_app.cpu_history_len]script.program_loader.Value = undefined;
-            var cpu_cores: [status_app.max_cpu_count]script.program_loader.Value = undefined;
-            var rx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
-            var tx_history: [status_app.network_history_len]script.program_loader.Value = undefined;
-            for (0..status_app.cpu_history_len) |index|
-                cpu_history[index] = .{ .number = latest.value.cpu_history[index] };
-            const cpu_core_count: usize = latest.value.cpu_core_count;
-            for (0..cpu_core_count) |index|
-                cpu_cores[index] = .{ .number = latest.value.cpu_cores[index] };
-            for (0..status_app.network_history_len) |index| {
-                rx_history[index] = .{ .number = latest.value.network_rx_history[index] };
-                tx_history[index] = .{ .number = latest.value.network_tx_history[index] };
-            }
-            const values = [_]script.program_loader.Value{
-                .{ .string = &latest.value.time },
-                .{ .string = &latest.value.dow },
-                .{ .string = &latest.value.date },
-                .{ .number = @floatFromInt(latest.value.cpu_percent) },
-                .{ .array = &cpu_history },
-                .{ .number = @floatFromInt(latest.value.memory_percent) },
-                .{ .number = @floatFromInt(latest.value.disk_percent) },
-                .{ .number = latest.value.network_rx },
-                .{ .number = latest.value.network_tx },
-                .{ .array = &rx_history },
-                .{ .array = &tx_history },
-                .{ .number = @floatFromInt(latest.value.audio_percent) },
-                .{ .boolean = latest.value.audio_muted },
-                .{ .boolean = latest.value.audio_visible },
-                .{ .boolean = latest.value.battery_present },
-                .{ .number = @floatFromInt(latest.value.battery_percent) },
-                .{ .boolean = latest.value.battery_charging },
-                .{ .number = @floatFromInt(latest.value.network_sample_sequence) },
-                .{ .number = @floatFromInt(latest.value.cpu_core_count) },
-                .{ .number = latest.value.cpu_core_equivalents },
-                .{ .array = cpu_cores[0..cpu_core_count] },
-                .{ .number = @floatFromInt(latest.value.cpu_sample_sequence) },
-                .{ .number = latest.value.network_capacity },
-            };
-            try self.runtime.update(.{ .service = "status", .values = &values });
+            var status_values: status_app.StatusValues(script.program_loader.Value) = .{};
+            const values = status_values.build(&latest.value);
+            try self.runtime.update(.{ .service = "status", .values = values });
         }
         const elapsed = self.clock_origin.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
         const now_ms = @as(f64, @floatFromInt(@max(elapsed, 0))) / 1_000_000.0;

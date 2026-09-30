@@ -39,6 +39,7 @@ pub fn Arena(comptime Value: type, comptime Identity: type) type {
         allocator: std.mem.Allocator,
         slots: std.ArrayList(Slot) = .empty,
         first_free: ?u32 = null,
+        live: usize = 0,
 
         /// Initialize an empty generation-checked arena.
         pub fn init(allocator: std.mem.Allocator) Self {
@@ -62,6 +63,7 @@ pub fn Arena(comptime Value: type, comptime Identity: type) type {
                 slot.next_free = null;
                 slot.state = .alive;
                 slot.value = value;
+                self.live += 1;
                 const id = Identity{ .slot = index, .generation = slot.generation };
                 self.assertValid();
                 std.debug.assert(self.getConst(id) != null);
@@ -70,6 +72,7 @@ pub fn Arena(comptime Value: type, comptime Identity: type) type {
 
             const index = std.math.cast(u32, self.slots.items.len) orelse return error.GenerationExhausted;
             try self.slots.append(self.allocator, .{ .state = .alive, .value = value });
+            self.live += 1;
             const id = Identity{ .slot = index, .generation = 1 };
             self.assertValid();
             std.debug.assert(self.getConst(id) != null);
@@ -84,6 +87,7 @@ pub fn Arena(comptime Value: type, comptime Identity: type) type {
             const slot = &self.slots.items[id.slot];
             std.debug.assert(slot.state == .alive and slot.generation == id.generation);
             slot.value = undefined;
+            self.live -= 1;
             if (slot.generation == std.math.maxInt(u32)) {
                 slot.state = .retired;
                 slot.next_free = null;
@@ -119,11 +123,7 @@ pub fn Arena(comptime Value: type, comptime Identity: type) type {
         /// Return the number of live arena slots.
         pub fn liveCount(self: *const Self) usize {
             self.assertMetadata();
-            var count: usize = 0;
-            for (self.slots.items) |slot| if (slot.state == .alive) {
-                count += 1;
-            };
-            return count;
+            return self.live;
         }
 
         fn assertMetadata(self: *const Self) void {

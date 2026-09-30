@@ -88,7 +88,7 @@ test "frame composition translates one WM epoch into both River plans" {
         .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
         .usable = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
     });
-    const window = try world.createWindow(.{ .tag = tag, .output = output });
+    const window = try world.createWindow(.{ .tag = tag });
     try world.manageWindow(window);
 
     const resolver = bridge.Resolver{

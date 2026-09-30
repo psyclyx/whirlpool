@@ -55,6 +55,17 @@ const Lowerer = struct {
     snapshots: []const ui.NodeSnapshot,
     arena: *std.heap.ArenaAllocator,
     ops: *std.ArrayList(DrawOp),
+    /// Children of every node, in snapshot order, as one flat array indexed by
+    /// `child_start`. Scanning every snapshot to find a node's children made
+    /// layout quadratic (and worse with nesting), which dominated frame time.
+    child_start: []usize,
+    child_items: []usize,
+    /// Preferred size of each node per axis, computed once (NaN = not yet).
+    intrinsic_cache: [][2]f32,
+
+    fn children(self: *const Lowerer, index: usize) []const usize {
+        return self.child_items[self.child_start[index]..self.child_start[index + 1]];
+    }
 
     fn layoutNode(self: *Lowerer, index: usize, offered: Box, inherited_opacity: f32) (LowerError || Allocator.Error)!void {
         const snapshot = self.snapshots[index];
@@ -93,12 +104,33 @@ const Lowerer = struct {
             .text => if (properties.text.len != 0) {
                 const size = try fontSize(properties.font_size);
                 const text = try self.arena.allocator().dupe(u8, properties.text);
+                const content = inset(box, properties.padding);
+                // Alignment is relative to the padded content box; the renderer
+                // measures the text, so no font metrics are needed here.
+                const x = switch (properties.text_align) {
+                    .start => content.x,
+                    .center => content.x + content.width / 2,
+                    .end => content.x + content.width,
+                };
+                const y = switch (properties.text_valign) {
+                    .top => content.y + size,
+                    .middle => content.y + content.height / 2,
+                };
                 try self.ops.append(self.allocator, .{ .text = .{
                     .text = text,
-                    .x = box.x + @as(f32, @floatFromInt(properties.padding.left)),
-                    .baseline = box.y + @as(f32, @floatFromInt(properties.padding.top)) + size,
+                    .x = x,
+                    .baseline = y,
                     .size = size,
                     .color = colorWithOpacity(properties.text_color, opacity),
+                    .anchor = switch (properties.text_align) {
+                        .start => .start,
+                        .center => .center,
+                        .end => .end,
+                    },
+                    .vertical = switch (properties.text_valign) {
+                        .top => .baseline,
+                        .middle => .middle,
+                    },
                 } });
             },
             .icon => if (properties.icon_source.len != 0 and box.width > 0 and box.height > 0) {
@@ -120,7 +152,7 @@ const Lowerer = struct {
     fn layoutFlow(self: *Lowerer, parent_index: usize, box: Box, axis: Axis, opacity: f32) (LowerError || Allocator.Error)!void {
         const properties = self.snapshots[parent_index].properties;
         const content = inset(box, properties.padding);
-        const child_count = self.childCount(parent_index);
+        const child_count = self.children(parent_index).len;
         if (child_count == 0) return;
 
         const gap: f32 = @floatFromInt(properties.gap);
@@ -130,8 +162,8 @@ const Lowerer = struct {
         var flex_total: u64 = 0;
         var auto_count: usize = 0;
 
-        for (self.snapshots, 0..) |child, child_index| {
-            if (!isChild(child, self.snapshots[parent_index])) continue;
+        for (self.children(parent_index)) |child_index| {
+            const child = self.snapshots[child_index];
             const preferred = try self.intrinsic(child_index, axis);
             if (child.properties.flex != 0) {
                 flex_total += child.properties.flex;
@@ -149,8 +181,8 @@ const Lowerer = struct {
             0;
         var cursor = if (axis == .horizontal) content.x else content.y;
 
-        for (self.snapshots, 0..) |child, child_index| {
-            if (!isChild(child, self.snapshots[parent_index])) continue;
+        for (self.children(parent_index)) |child_index| {
+            const child = self.snapshots[child_index];
             const preferred_main = try self.intrinsic(child_index, axis);
             const explicit_main = if (axis == .horizontal) child.properties.width else child.properties.height;
             const child_main = if (child_count == 1 and explicit_main == null)
@@ -178,8 +210,8 @@ const Lowerer = struct {
 
     fn layoutStack(self: *Lowerer, parent_index: usize, box: Box, opacity: f32) (LowerError || Allocator.Error)!void {
         const content = inset(box, self.snapshots[parent_index].properties.padding);
-        for (self.snapshots, 0..) |child, child_index| {
-            if (!isChild(child, self.snapshots[parent_index])) continue;
+        for (self.children(parent_index)) |child_index| {
+            const child = self.snapshots[child_index];
             var child_box = content;
             if (child.properties.width) |width| child_box.width = try dimension(width);
             if (child.properties.height) |height| child_box.height = try dimension(height);
@@ -188,6 +220,14 @@ const Lowerer = struct {
     }
 
     fn intrinsic(self: *Lowerer, index: usize, axis: Axis) LowerError!f32 {
+        const cached = self.intrinsic_cache[index][@intFromEnum(axis)];
+        if (!std.math.isNan(cached)) return cached;
+        const value = try self.computeIntrinsic(index, axis);
+        self.intrinsic_cache[index][@intFromEnum(axis)] = value;
+        return value;
+    }
+
+    fn computeIntrinsic(self: *Lowerer, index: usize, axis: Axis) LowerError!f32 {
         const snapshot = self.snapshots[index];
         const properties = snapshot.properties;
         const explicit = if (axis == .horizontal) properties.width else properties.height;
@@ -204,13 +244,12 @@ const Lowerer = struct {
             .row, .column, .stack => blk: {
                 var total: f32 = 0;
                 var maximum: f32 = 0;
-                var count: usize = 0;
-                for (self.snapshots, 0..) |child, child_index| {
-                    if (!isChild(child, snapshot)) continue;
+                const child_indices = self.children(index);
+                const count = child_indices.len;
+                for (child_indices) |child_index| {
                     const value = try self.intrinsic(child_index, axis);
                     total += value;
                     maximum = @max(maximum, value);
-                    count += 1;
                 }
                 const flows_on_axis = (snapshot.kind == .row and axis == .horizontal) or
                     (snapshot.kind == .column and axis == .vertical);
@@ -220,14 +259,6 @@ const Lowerer = struct {
             },
         };
     }
-
-    fn childCount(self: *const Lowerer, parent_index: usize) usize {
-        var count: usize = 0;
-        for (self.snapshots) |candidate| if (isChild(candidate, self.snapshots[parent_index])) {
-            count += 1;
-        };
-        return count;
-    }
 };
 
 pub fn lower(allocator: Allocator, snapshots: []const ui.NodeSnapshot, viewport: Viewport) (LowerError || Allocator.Error)!OwnedDrawList {
@@ -236,7 +267,23 @@ pub fn lower(allocator: Allocator, snapshots: []const ui.NodeSnapshot, viewport:
     errdefer arena.deinit();
     var ops = std.ArrayList(DrawOp).empty;
     errdefer ops.deinit(allocator);
-    var lowerer = Lowerer{ .allocator = allocator, .snapshots = snapshots, .arena = &arena, .ops = &ops };
+    const child_start = try allocator.alloc(usize, snapshots.len + 1);
+    defer allocator.free(child_start);
+    const child_items = try allocator.alloc(usize, snapshots.len);
+    defer allocator.free(child_items);
+    const intrinsic_cache = try allocator.alloc([2]f32, snapshots.len);
+    defer allocator.free(intrinsic_cache);
+    @memset(intrinsic_cache, .{ std.math.nan(f32), std.math.nan(f32) });
+    try indexChildren(allocator, snapshots, child_start, child_items);
+    var lowerer = Lowerer{
+        .allocator = allocator,
+        .snapshots = snapshots,
+        .arena = &arena,
+        .ops = &ops,
+        .child_start = child_start,
+        .child_items = child_items,
+        .intrinsic_cache = intrinsic_cache,
+    };
     const root_box = Box{ .x = 0, .y = 0, .width = @floatFromInt(viewport.width), .height = @floatFromInt(viewport.height) };
     for (snapshots, 0..) |snapshot, index| if (snapshot.parent == null) {
         try lowerer.layoutNode(index, root_box, 1);
@@ -246,6 +293,41 @@ pub fn lower(allocator: Allocator, snapshots: []const ui.NodeSnapshot, viewport:
 
 fn isChild(candidate: ui.NodeSnapshot, parent: ui.NodeSnapshot) bool {
     return candidate.parent != null and candidate.parent.?.eql(parent.handle);
+}
+
+/// Build the flat children index: for node `i`, its children (in snapshot
+/// order) are `child_items[child_start[i]..child_start[i + 1]]`.
+fn indexChildren(allocator: Allocator, snapshots: []const ui.NodeSnapshot, child_start: []usize, child_items: []usize) Allocator.Error!void {
+    // Handles name arena slots, so a slot -> snapshot-index table resolves
+    // parents in constant time.
+    var max_slot: usize = 0;
+    for (snapshots) |snapshot| max_slot = @max(max_slot, snapshot.handle.slot);
+    const by_slot = try allocator.alloc(usize, max_slot + 1);
+    defer allocator.free(by_slot);
+    @memset(by_slot, std.math.maxInt(usize));
+    for (snapshots, 0..) |snapshot, index| by_slot[snapshot.handle.slot] = index;
+
+    const parents = try allocator.alloc(usize, snapshots.len);
+    defer allocator.free(parents);
+    @memset(child_start, 0);
+    for (snapshots, 0..) |snapshot, index| {
+        parents[index] = std.math.maxInt(usize);
+        const parent = snapshot.parent orelse continue;
+        if (parent.slot > max_slot) continue;
+        const parent_index = by_slot[parent.slot];
+        if (parent_index == std.math.maxInt(usize) or !snapshots[parent_index].handle.eql(parent)) continue;
+        parents[index] = parent_index;
+        child_start[parent_index + 1] += 1;
+    }
+    for (1..child_start.len) |index| child_start[index] += child_start[index - 1];
+    const cursor = try allocator.alloc(usize, snapshots.len);
+    defer allocator.free(cursor);
+    @memcpy(cursor, child_start[0..snapshots.len]);
+    for (parents, 0..) |parent_index, index| {
+        if (parent_index == std.math.maxInt(usize)) continue;
+        child_items[cursor[parent_index]] = index;
+        cursor[parent_index] += 1;
+    }
 }
 
 fn inset(box: Box, edges: ui.Edges) Box {
@@ -411,4 +493,27 @@ test "clip and horizontal offset bound translated descendants" {
     try std.testing.expectEqual(@as(f32, 40), result.ops[0].push_clip.width);
     try std.testing.expectEqual(@as(f32, -12.5), result.ops[1].rect.rect.x);
     try std.testing.expect(result.ops[2] == .pop_clip);
+}
+
+test "aligned text is anchored to its padded box so the renderer can centre it" {
+    const root = ui.NodeHandle{ .slot = 0, .generation = 1 };
+    const snapshots = [_]ui.NodeSnapshot{
+        fixture(.stack, 0, null, .{ .width = 100, .height = 20, .offset_x = 10, .padding = .{ .left = 4, .right = 6 } }),
+        fixture(.text, 1, root, .{ .text = "7", .font_size = 12, .text_align = .center, .text_valign = .middle }),
+        fixture(.text, 2, root, .{ .text = "end", .font_size = 12, .text_align = .end }),
+        fixture(.text, 3, root, .{ .text = "start", .font_size = 12 }),
+    };
+    var result = try lower(std.testing.allocator, &snapshots, .{ .width = 200, .height = 40 });
+    defer result.deinit();
+    // The stack's content box is x 14..104 (offset 10, padding 4 and 6).
+    try std.testing.expectEqual(graphics.skia.TextAnchor.center, result.ops[0].text.anchor);
+    try std.testing.expectEqual(graphics.skia.TextVertical.middle, result.ops[0].text.vertical);
+    try std.testing.expectEqual(@as(f32, 59), result.ops[0].text.x);
+    try std.testing.expectEqual(@as(f32, 10), result.ops[0].text.baseline);
+    try std.testing.expectEqual(graphics.skia.TextAnchor.end, result.ops[1].text.anchor);
+    try std.testing.expectEqual(@as(f32, 104), result.ops[1].text.x);
+    // Unaligned text is unchanged: start of the box, baseline one font size down.
+    try std.testing.expectEqual(graphics.skia.TextAnchor.start, result.ops[2].text.anchor);
+    try std.testing.expectEqual(@as(f32, 14), result.ops[2].text.x);
+    try std.testing.expectEqual(@as(f32, 12), result.ops[2].text.baseline);
 }

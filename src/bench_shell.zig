@@ -2,6 +2,7 @@ const std = @import("std");
 const graphics = @import("whirlpool-graphics");
 const host = @import("whirlpool-host");
 const script = @import("whirlpool-script");
+const status = @import("whirlpool-app-status");
 
 const warmup_iterations = 20;
 const measured_iterations = 200;
@@ -99,7 +100,7 @@ fn measureDraw(io: std.Io, renderer: *graphics.skia.Renderer, list: graphics.ski
         } else for (list.ops) |operation| switch (operation) {
             .rect => |rect| if (mode == .geometry) renderer.drawRect(rect.rect, rect.radius, rect.color),
             .polygon => |polygon| if (mode == .geometry) renderer.drawPolygon(polygon.points, polygon.color),
-            .text => |item| if (mode == .text) renderer.drawText(item.text, item.x, item.baseline, item.size, item.color),
+            .text => |item| if (mode == .text) renderer.drawTextItem(item),
             .icon => |item| if (mode == .icon) renderer.drawIcon(item.source, item.rect, item.opacity),
             .push_clip, .pop_clip => {},
         };
@@ -136,23 +137,16 @@ fn populate(shell: *host.surface_composition.Composition) !void {
         },
     });
 
-    var cpu_history = [_]script.program_loader.Value{.{ .number = 1.25 }} ** 24;
-    var cpu_cores = [_]script.program_loader.Value{.{ .number = 0 }} ** 32;
-    cpu_cores[0] = .{ .number = 100 };
-    cpu_cores[1] = .{ .number = 25 };
-    var rx_history = [_]script.program_loader.Value{.{ .number = 256 * 1024 }} ** 24;
-    var tx_history = [_]script.program_loader.Value{.{ .number = 128 * 1024 }} ** 24;
-    try shell.update(.{
-        .service = "status",
-        .values = &.{
-            .{ .string = "12:34" },    .{ .string = "Mon" },       .{ .string = "2026-09-01" },
-            .{ .number = 40 },         .{ .array = &cpu_history }, .{ .number = 50 },
-            .{ .number = 60 },         .{ .number = 256 * 1024 },  .{ .number = 128 * 1024 },
-            .{ .array = &rx_history }, .{ .array = &tx_history },  .{ .number = 40 },
-            .{ .boolean = false },     .{ .boolean = false },      .{ .boolean = false },
-            .{ .number = 0 },          .{ .boolean = false },      .{ .number = 1 },
-            .{ .number = 32 },         .{ .number = 1.25 },        .{ .array = &cpu_cores },
-            .{ .number = 1 },          .{ .number = 2.5e9 },
-        },
-    });
+    var snapshot = status.Snapshot{};
+    snapshot.cpu_core_count = 32;
+    snapshot.cpu_core_equivalents = 1.25;
+    snapshot.cpu_cores[0] = 100;
+    snapshot.cpu_cores[1] = 25;
+    snapshot.cpu_sample_sequence = 1;
+    snapshot.network_sample_sequence = 1;
+    for (&snapshot.cpu_history) |*sample| sample.* = 1.25;
+    for (&snapshot.network_rx_history) |*sample| sample.* = 256 * 1024;
+    for (&snapshot.network_tx_history) |*sample| sample.* = 128 * 1024;
+    var storage: status.StatusValues(script.program_loader.Value) = .{};
+    try shell.update(.{ .service = "status", .values = storage.build(&snapshot) });
 }

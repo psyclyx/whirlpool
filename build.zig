@@ -412,11 +412,30 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "whirlpool-host", .module = host },
                 .{ .name = "whirlpool-script", .module = script },
                 .{ .name = "whirlpool-graphics", .module = graphics },
+                .{ .name = "whirlpool-app-status", .module = app_status },
             },
         }),
     });
     const run_shell_bench = b.addRunArtifact(shell_bench);
     b.step("bench-shell", "Benchmark example shell frame phases").dependOn(&run_shell_bench.step);
+
+    const shell_preview = b.addExecutable(.{
+        .name = "whirlpool-shell-preview",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shell_preview.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "whirlpool-host", .module = host },
+                .{ .name = "whirlpool-script", .module = script },
+                .{ .name = "whirlpool-graphics", .module = graphics },
+                .{ .name = "whirlpool-app-status", .module = app_status },
+            },
+        }),
+    });
+    const run_shell_preview = b.addRunArtifact(shell_preview);
+    if (b.args) |args| run_shell_preview.addArgs(args);
+    b.step("shell-preview", "Render the example shell to PPM images").dependOn(&run_shell_preview.step);
 
     const test_step = b.step("test", "Run all unit tests");
     const graphics_test_step = b.step("graphics-test", "Run graphics and DMA-BUF tests");

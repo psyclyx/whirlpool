@@ -35,6 +35,9 @@ pub const Polygon = struct {
     }
 };
 
+pub const TextAlign = enum { start, center, end };
+pub const TextVAlign = enum { top, middle };
+
 pub const Edges = struct {
     top: u32 = 0,
     right: u32 = 0,
@@ -77,6 +80,8 @@ pub const Snapshot = struct {
     opacity: f32 = 1,
     clip: bool = false,
     offset_x: f32 = 0,
+    text_align: TextAlign = .start,
+    text_valign: TextVAlign = .top,
 };
 
 pub const Value = union(enum) {
@@ -95,6 +100,8 @@ pub const Value = union(enum) {
     opacity: f32,
     clip: bool,
     offset_x: f32,
+    text_align: TextAlign,
+    text_valign: TextVAlign,
 };
 
 pub const Error = error{
@@ -122,7 +129,7 @@ pub fn metadata(value: Value) Metadata {
         .points => .{ .supported_by = .polygon, .dirty = paint },
         .text => .{ .supported_by = .text, .dirty = layout_and_paint, .owns_bytes = true },
         .icon_source => .{ .supported_by = .icon, .dirty = paint, .owns_bytes = true },
-        .text_color, .font_size => .{ .supported_by = .text, .dirty = paint },
+        .text_color, .font_size, .text_align, .text_valign => .{ .supported_by = .text, .dirty = paint },
         .opacity, .clip => .{ .supported_by = .every_node, .dirty = paint },
     };
 }
@@ -195,6 +202,8 @@ pub const Owned = struct {
     opacity: f32 = 1,
     clip: bool = false,
     offset_x: f32 = 0,
+    text_align: TextAlign = .start,
+    text_valign: TextVAlign = .top,
 
     pub fn snapshot(self: Owned) Snapshot {
         return .{
@@ -213,6 +222,8 @@ pub const Owned = struct {
             .opacity = self.opacity,
             .clip = self.clip,
             .offset_x = self.offset_x,
+            .text_align = self.text_align,
+            .text_valign = self.text_valign,
         };
     }
 
@@ -247,6 +258,8 @@ pub const Owned = struct {
             .opacity => |item| self.opacity = item,
             .clip => |item| self.clip = item,
             .offset_x => |item| self.offset_x = item,
+            .text_align => |item| self.text_align = item,
+            .text_valign => |item| self.text_valign = item,
         }
     }
 };
@@ -271,4 +284,56 @@ test "polygon points are finite, bounded in count, and owned inline" {
     try std.testing.expectError(error.InvalidValue, validate(.polygon, .{ .points = polygon }));
     polygon.points[1].x = max_polygon_coordinate + 1;
     try std.testing.expectError(error.InvalidValue, validate(.polygon, .{ .points = polygon }));
+}
+
+fn sameColor(a: Color, b: Color) bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
+}
+
+fn samePoints(a: Polygon, b: Polygon) bool {
+    if (a.len != b.len) return false;
+    for (a.slice(), b.slice()) |left, right| {
+        if (left.x != right.x or left.y != right.y) return false;
+    }
+    return true;
+}
+
+/// Whether setting `value` would leave the node exactly as it is. Programs set
+/// properties freely (a value recomputed each update is usually the same), so
+/// scenes skip these instead of marking the node dirty and re-rendering.
+pub fn matches(current: Snapshot, value: Value) bool {
+    return switch (value) {
+        .width => |item| current.width == item,
+        .height => |item| current.height == item,
+        .gap => |item| current.gap == item,
+        .padding => |item| std.meta.eql(current.padding, item),
+        .flex => |item| current.flex == item,
+        .fill => |item| sameColor(current.fill, item),
+        .radius => |item| current.radius == item,
+        .points => |item| samePoints(current.points, item),
+        .text => |item| std.mem.eql(u8, current.text, item),
+        .icon_source => |item| std.mem.eql(u8, current.icon_source, item),
+        .text_color => |item| sameColor(current.text_color, item),
+        .font_size => |item| current.font_size == item,
+        .opacity => |item| current.opacity == item,
+        .clip => |item| current.clip == item,
+        .offset_x => |item| current.offset_x == item,
+        .text_align => |item| current.text_align == item,
+        .text_valign => |item| current.text_valign == item,
+    };
+}
+
+test "setting a property to its current value is recognised as a no-op" {
+    var snapshot = Snapshot{};
+    try std.testing.expect(matches(snapshot, .{ .opacity = 1 }));
+    try std.testing.expect(!matches(snapshot, .{ .opacity = 0.5 }));
+    try std.testing.expect(matches(snapshot, .{ .fill = Color.transparent }));
+    try std.testing.expect(!matches(snapshot, .{ .fill = Color.white }));
+    try std.testing.expect(matches(snapshot, .{ .width = null }));
+    try std.testing.expect(!matches(snapshot, .{ .width = 10 }));
+    snapshot.points = .{ .len = 3 };
+    try std.testing.expect(matches(snapshot, .{ .points = .{ .len = 3 } }));
+    try std.testing.expect(!matches(snapshot, .{ .points = .{ .len = 4 } }));
+    try std.testing.expect(matches(snapshot, .{ .text = "" }));
+    try std.testing.expect(!matches(snapshot, .{ .text = "x" }));
 }

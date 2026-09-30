@@ -17,6 +17,7 @@
 #include "core/SkColor.h"
 #include "core/SkColorSpace.h"
 #include "core/SkFont.h"
+#include "core/SkFontMetrics.h"
 #include "core/SkFontMgr.h"
 #include "core/SkFontScanner.h"
 #include "core/SkData.h"
@@ -26,6 +27,7 @@
 #include "core/SkPath.h"
 #include "core/SkSamplingOptions.h"
 #include "core/SkSurface.h"
+#include "core/SkTextBlob.h"
 #include "gpu/ganesh/GrBackendSurface.h"
 #include "gpu/ganesh/GrDirectContext.h"
 #include "gpu/ganesh/GrTypes.h"
@@ -207,6 +209,17 @@ private:
     uint64_t total_ = 0;
 };
 
+struct CachedRun {
+    sk_sp<SkTextBlob> blob;
+    float offset;
+};
+struct CachedText {
+    std::vector<CachedRun> runs;
+    float width = 0;
+    float cap_height = 0;
+};
+
+// Shaped text, cached per (text, size); see `cached_text`.
 struct WhirlpoolSkia {
     SkColorType color_type = kBGRA_8888_SkColorType;
     uint32_t width = 0;
@@ -218,6 +231,7 @@ struct WhirlpoolSkia {
     sk_sp<SkTypeface> default_typeface;
     sk_sp<GrDirectContext> gpu_context;
     std::unordered_map<std::string, sk_sp<SkImage>> icon_cache;
+    std::unordered_map<std::string, CachedText> text_cache;
 };
 
 static SkImageInfo frame_info(const WhirlpoolSkia *renderer) {
@@ -456,15 +470,18 @@ extern "C" void whirlpool_skia_draw_polygon(WhirlpoolSkia *renderer,
     renderer->canvas->drawPath(path, paint);
 }
 
-extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *text,
-                                          size_t length, float x, float baseline, float size,
-                                          float r, float g, float b, float a) {
-    if (!renderer || !renderer->canvas || !text || length == 0 || size <= 0) return;
-    SkPaint paint;
-    paint.setAntiAlias(true);
-    paint.setColor4f(SkColor4f{r, g, b, a}, nullptr);
-    const auto& typeface = renderer->default_typeface;
-    if (!typeface) return;
+struct TextRun {
+    const char *start;
+    size_t length;
+    sk_sp<SkTypeface> typeface;
+};
+
+// Split text into runs that each resolve to a single typeface, so glyphs the
+// primary font lacks fall back per character.
+static std::vector<TextRun> split_text_runs(WhirlpoolSkia *renderer,
+                                            const sk_sp<SkTypeface>& typeface,
+                                            const char *text, size_t length) {
+    std::vector<TextRun> runs;
     const char *end = text + length;
     const char *cursor = text;
     const char *run_start = text;
@@ -476,15 +493,64 @@ extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *te
         if (!run_typeface) {
             run_typeface = std::move(character_typeface);
         } else if (character_typeface && character_typeface->uniqueID() != run_typeface->uniqueID()) {
-            x = draw_text_run(renderer, run_start,
-                              static_cast<size_t>(character_start - run_start),
-                              x, baseline, size, paint, run_typeface);
+            runs.push_back({run_start, static_cast<size_t>(character_start - run_start), run_typeface});
             run_start = character_start;
             run_typeface = std::move(character_typeface);
         }
     }
-    draw_text_run(renderer, run_start, static_cast<size_t>(end - run_start),
-                  x, baseline, size, paint, run_typeface);
+    runs.push_back({run_start, static_cast<size_t>(end - run_start), run_typeface});
+    return runs;
+}
+
+// Shaped text is expensive relative to a bar that repeats the same few strings
+// every frame, so the runs (glyph selection and font fallback included), the
+// advance width and the cap height are computed once per (text, size) and the
+// resulting blobs are redrawn from the cache.
+static const CachedText *cached_text(WhirlpoolSkia *renderer, const char *text,
+                                     size_t length, float size) {
+    std::string key(reinterpret_cast<const char *>(&size), sizeof(size));
+    key.append(text, length);
+    auto found = renderer->text_cache.find(key);
+    if (found != renderer->text_cache.end()) return &found->second;
+    // A bar with unbounded distinct strings (window titles) must not grow
+    // without limit.
+    if (renderer->text_cache.size() > 1024) renderer->text_cache.clear();
+
+    const auto& typeface = renderer->default_typeface;
+    CachedText entry;
+    float cursor = 0;
+    for (const auto& run : split_text_runs(renderer, typeface, text, length)) {
+        if (!run.typeface || run.length == 0) continue;
+        SkFont font(run.typeface, size);
+        entry.runs.push_back({SkTextBlob::MakeFromText(run.start, run.length, font,
+                                                       SkTextEncoding::kUTF8),
+                              cursor});
+        cursor += font.measureText(run.start, run.length, SkTextEncoding::kUTF8);
+    }
+    entry.width = cursor;
+    SkFontMetrics metrics;
+    SkFont(typeface, size).getMetrics(&metrics);
+    entry.cap_height = metrics.fCapHeight > 0 ? metrics.fCapHeight : size * 0.7f;
+    return &renderer->text_cache.emplace(std::move(key), std::move(entry)).first->second;
+}
+
+// `anchor`: 0 draws from x, 1 centres on x, 2 ends at x. `middle` treats y as
+// the vertical centre of the capital letters instead of the alphabetic
+// baseline, so text can be centred in a box without knowing its font metrics.
+extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *text,
+                                          size_t length, float x, float y, float size,
+                                          float r, float g, float b, float a,
+                                          int anchor, int middle) {
+    if (!renderer || !renderer->canvas || !text || length == 0 || size <= 0) return;
+    if (!renderer->default_typeface) return;
+    const CachedText *entry = cached_text(renderer, text, length, size);
+    SkPaint paint;
+    paint.setAntiAlias(true);
+    paint.setColor4f(SkColor4f{r, g, b, a}, nullptr);
+    if (anchor != 0) x -= anchor == 1 ? entry->width / 2 : entry->width;
+    const float baseline = middle ? y + entry->cap_height / 2 : y;
+    for (const auto& run : entry->runs)
+        renderer->canvas->drawTextBlob(run.blob, x + run.offset, baseline, paint);
 }
 
 static bool ends_with_case_insensitive(const std::string& value, const char *suffix) {

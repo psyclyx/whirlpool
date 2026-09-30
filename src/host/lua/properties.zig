@@ -25,6 +25,10 @@ pub fn apply(composition: anytype, id: lua_program.NodeId, key: []const u8, valu
         try setU32(composition, handle, value, .flex);
     } else if (std.mem.eql(u8, key, "font_size") or std.mem.eql(u8, key, "size")) {
         try setFontSize(composition, handle, value);
+    } else if (std.mem.eql(u8, key, "text_align")) {
+        try setTextAlign(composition, handle, value);
+    } else if (std.mem.eql(u8, key, "text_valign")) {
+        try setTextVAlign(composition, handle, value);
     } else if (std.mem.eql(u8, key, "opacity")) {
         try setOpacity(composition, handle, value);
     } else if (std.mem.eql(u8, key, "clip")) {
@@ -84,6 +88,26 @@ fn setFontSize(composition: anytype, handle: ui.NodeHandle, value: lua_program.V
     const number = try integerValue(value);
     if (number == 0 or number > std.math.maxInt(u16)) return error.InvalidProperty;
     try composition.delta.setFontSize(handle, @intCast(number));
+    composition.stats.applied_properties += 1;
+}
+
+fn setTextAlign(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
+    const name = switch (value) {
+        .string => |item| item,
+        else => return error.InvalidProperty,
+    };
+    const align_value = std.meta.stringToEnum(ui.TextAlign, name) orelse return error.InvalidProperty;
+    try composition.delta.setTextAlign(handle, align_value);
+    composition.stats.applied_properties += 1;
+}
+
+fn setTextVAlign(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
+    const name = switch (value) {
+        .string => |item| item,
+        else => return error.InvalidProperty,
+    };
+    const align_value = std.meta.stringToEnum(ui.TextVAlign, name) orelse return error.InvalidProperty;
+    try composition.delta.setTextVAlign(handle, align_value);
     composition.stats.applied_properties += 1;
 }
 
