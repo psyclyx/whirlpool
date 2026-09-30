@@ -35,11 +35,177 @@
 #include "gpu/ganesh/vk/GrVkTypes.h"
 #include "gpu/vk/VulkanBackendContext.h"
 #include "gpu/vk/VulkanExtensions.h"
+#include "gpu/vk/VulkanMemoryAllocator.h"
 #include "gpu/vk/VulkanMutableTextureState.h"
 #include "ports/SkFontMgr_empty.h"
 #include "ports/SkFontMgr_directory.h"
 #include "ports/SkFontMgr_fontconfig.h"
 #include "ports/SkFontScanner_FreeType.h"
+
+// Skia 148 no longer creates a default allocator, and requires the client to
+// supply one in VulkanBackendContext::fMemoryAllocator. This one gives every
+// resource its own VkDeviceMemory; that is simple and correct, and adequate
+// for a shell UI whose working set is a handful of small buffers.
+class DedicatedMemoryAllocator final : public skgpu::VulkanMemoryAllocator {
+public:
+    DedicatedMemoryAllocator(VkPhysicalDevice physical_device, VkDevice device)
+        : device_(device) {
+        vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_);
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(physical_device, &properties);
+        atom_size_ = properties.limits.nonCoherentAtomSize;
+    }
+
+    VkResult allocateImageMemory(VkImage image, uint32_t,
+                                 skgpu::VulkanBackendMemory *out) override {
+        VkMemoryRequirements requirements;
+        vkGetImageMemoryRequirements(device_, image, &requirements);
+        return allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, out);
+    }
+
+    VkResult allocateBufferMemory(VkBuffer buffer, BufferUsage usage, uint32_t,
+                                  skgpu::VulkanBackendMemory *out) override {
+        VkMemoryRequirements requirements;
+        vkGetBufferMemoryRequirements(device_, buffer, &requirements);
+        constexpr VkMemoryPropertyFlags visible =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        switch (usage) {
+        case BufferUsage::kGpuOnly:
+            return allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, out);
+        case BufferUsage::kCpuWritesGpuReads:
+            return allocate(requirements, visible, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, out);
+        case BufferUsage::kTransfersFromCpuToGpu:
+            return allocate(requirements, visible, 0, out);
+        case BufferUsage::kTransfersFromGpuToCpu:
+            return allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                            VK_MEMORY_PROPERTY_HOST_CACHED_BIT, out);
+        }
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    void getAllocInfo(const skgpu::VulkanBackendMemory &handle,
+                      skgpu::VulkanAlloc *info) const override {
+        const Block *block = from(handle);
+        info->fMemory = block->memory;
+        info->fOffset = 0;
+        info->fSize = block->size;
+        info->fFlags = 0;
+        if (block->properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            info->fFlags |= skgpu::VulkanAlloc::kMappable_Flag;
+        if ((block->properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            !(block->properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            info->fFlags |= skgpu::VulkanAlloc::kNoncoherent_Flag;
+        info->fBackendMemory = handle;
+    }
+
+    VkResult mapMemory(const skgpu::VulkanBackendMemory &handle, void **data) override {
+        Block *block = from(handle);
+        if (!block->mapped) {
+            const VkResult result =
+                vkMapMemory(device_, block->memory, 0, VK_WHOLE_SIZE, 0, &block->mapped);
+            if (result != VK_SUCCESS) return result;
+        }
+        *data = block->mapped;
+        return VK_SUCCESS;
+    }
+
+    void unmapMemory(const skgpu::VulkanBackendMemory &handle) override {
+        Block *block = from(handle);
+        if (!block->mapped) return;
+        vkUnmapMemory(device_, block->memory);
+        block->mapped = nullptr;
+    }
+
+    VkResult flushMemory(const skgpu::VulkanBackendMemory &handle, VkDeviceSize offset,
+                         VkDeviceSize size) override {
+        const Block *block = from(handle);
+        const VkMappedMemoryRange range = mapped_range(block, offset, size);
+        return vkFlushMappedMemoryRanges(device_, 1, &range);
+    }
+
+    VkResult invalidateMemory(const skgpu::VulkanBackendMemory &handle, VkDeviceSize offset,
+                              VkDeviceSize size) override {
+        const Block *block = from(handle);
+        const VkMappedMemoryRange range = mapped_range(block, offset, size);
+        return vkInvalidateMappedMemoryRanges(device_, 1, &range);
+    }
+
+    void freeMemory(const skgpu::VulkanBackendMemory &handle) override {
+        Block *block = from(handle);
+        if (block->mapped) vkUnmapMemory(device_, block->memory);
+        vkFreeMemory(device_, block->memory, nullptr);
+        total_ -= block->size;
+        delete block;
+    }
+
+    std::pair<uint64_t, uint64_t> totalAllocatedAndUsedMemory() const override {
+        return {total_, total_};
+    }
+
+private:
+    struct Block {
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize size = 0;
+        VkMemoryPropertyFlags properties = 0;
+        void *mapped = nullptr;
+    };
+
+    static Block *from(skgpu::VulkanBackendMemory handle) {
+        return reinterpret_cast<Block *>(handle);
+    }
+
+    // Non-coherent ranges must be aligned to nonCoherentAtomSize. A range that
+    // reaches the end of the block may use VK_WHOLE_SIZE instead of rounding up.
+    VkMappedMemoryRange mapped_range(const Block *block, VkDeviceSize offset,
+                                     VkDeviceSize size) const {
+        const VkDeviceSize start = offset - offset % atom_size_;
+        VkDeviceSize end = (offset + size + atom_size_ - 1) / atom_size_ * atom_size_;
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = block->memory;
+        range.offset = start;
+        range.size = end >= block->size ? VK_WHOLE_SIZE : end - start;
+        return range;
+    }
+
+    bool find_type(uint32_t type_bits, VkMemoryPropertyFlags wanted, uint32_t *out) const {
+        for (uint32_t index = 0; index < memory_.memoryTypeCount; ++index) {
+            if (!(type_bits & (1u << index))) continue;
+            if ((memory_.memoryTypes[index].propertyFlags & wanted) != wanted) continue;
+            *out = index;
+            return true;
+        }
+        return false;
+    }
+
+    VkResult allocate(const VkMemoryRequirements &requirements,
+                      VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred,
+                      skgpu::VulkanBackendMemory *out) {
+        uint32_t type = 0;
+        if (!(preferred && find_type(requirements.memoryTypeBits, required | preferred, &type)) &&
+            !find_type(requirements.memoryTypeBits, required, &type))
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        info.allocationSize = requirements.size;
+        info.memoryTypeIndex = type;
+        auto *block = new (std::nothrow) Block();
+        if (!block) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        const VkResult result = vkAllocateMemory(device_, &info, nullptr, &block->memory);
+        if (result != VK_SUCCESS) {
+            delete block;
+            return result;
+        }
+        block->size = requirements.size;
+        block->properties = memory_.memoryTypes[type].propertyFlags;
+        total_ += block->size;
+        *out = reinterpret_cast<skgpu::VulkanBackendMemory>(block);
+        return VK_SUCCESS;
+    }
+
+    VkDevice device_;
+    VkPhysicalDeviceMemoryProperties memory_{};
+    VkDeviceSize atom_size_ = 1;
+    uint64_t total_ = 0;
+};
 
 struct WhirlpoolSkia {
     SkColorType color_type = kBGRA_8888_SkColorType;
@@ -142,11 +308,19 @@ extern "C" WhirlpoolSkia *whirlpool_skia_create(int bgra) {
 extern "C" WhirlpoolSkia *whirlpool_skia_create_vulkan(
         void *instance, void *physical_device, void *device, void *queue,
         uint32_t queue_family) {
-    if (!instance || !physical_device || !device || !queue) return nullptr;
+    if (!instance || !physical_device || !device || !queue) {
+        std::fprintf(stderr, "skia: null vulkan handle (instance=%p physical_device=%p device=%p queue=%p)\n",
+                     instance, physical_device, device, queue);
+        return nullptr;
+    }
     auto *renderer = new (std::nothrow) WhirlpoolSkia();
-    if (!renderer) return nullptr;
+    if (!renderer) {
+        std::fprintf(stderr, "skia: renderer allocation failed\n");
+        return nullptr;
+    }
     renderer->color_type = kBGRA_8888_SkColorType;
     if (!initialize_fonts(renderer)) {
+        std::fprintf(stderr, "skia: font manager initialization failed\n");
         delete renderer;
         return nullptr;
     }
@@ -157,6 +331,8 @@ extern "C" WhirlpoolSkia *whirlpool_skia_create_vulkan(
     backend.fQueue = static_cast<VkQueue>(queue);
     backend.fGraphicsQueueIndex = queue_family;
     backend.fMaxAPIVersion = VK_API_VERSION_1_1;
+    backend.fMemoryAllocator = sk_make_sp<DedicatedMemoryAllocator>(
+        backend.fPhysicalDevice, backend.fDevice);
     backend.fGetProc = [](const char *name, VkInstance vk_instance, VkDevice vk_device) {
         if (vk_device != VK_NULL_HANDLE)
             return vkGetDeviceProcAddr(vk_device, name);
@@ -177,6 +353,8 @@ extern "C" WhirlpoolSkia *whirlpool_skia_create_vulkan(
     backend.fVkExtensions = &extensions;
     renderer->gpu_context = GrDirectContexts::MakeVulkan(backend);
     if (!renderer->gpu_context) {
+        std::fprintf(stderr, "skia: GrDirectContexts::MakeVulkan failed (queue_family=%u)\n",
+                     queue_family);
         delete renderer;
         return nullptr;
     }
