@@ -80,8 +80,7 @@ const Runner = struct {
 };
 
 fn focusedOutput(snapshot: *const script.Snapshot) ?wm.OutputId {
-    const window = snapshot.focusedWindow() orelse return snapshot.firstOutput();
-    return (snapshot.getWindow(window) orelse return snapshot.firstOutput()).output orelse snapshot.firstOutput();
+    return snapshot.focusedOutput();
 }
 
 test "configured spawn failures do not escape into the compositor loop" {

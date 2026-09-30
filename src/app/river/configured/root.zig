@@ -9,6 +9,34 @@ const river_keybindings = @import("whirlpool-river-keybindings");
 const river_layout = @import("whirlpool-river-layout-runtime");
 const river_policy = @import("whirlpool-river-policy-runtime");
 
+/// One state file kept current in the background. Producers hand over the newest
+/// text and return immediately; a task writes it (to a temporary file, then a
+/// rename, so a reader never sees half a file). If writes are slower than
+/// updates, only the newest waiting text is written.
+const StateFile = struct {
+    path: []u8,
+    temporary: []u8,
+    mutex: std.Io.Mutex = .init,
+    in_flight: bool = false,
+    pending: ?[]u8 = null,
+
+    fn init(allocator: std.mem.Allocator, path: []const u8) !StateFile {
+        const owned = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned);
+        return .{ .path = owned, .temporary = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) };
+    }
+
+    fn deinit(self: *StateFile, allocator: std.mem.Allocator) void {
+        if (self.pending) |text| allocator.free(text);
+        allocator.free(self.path);
+        allocator.free(self.temporary);
+    }
+};
+
+/// How often changed state is looked for. The check itself is cheap; this bounds
+/// how much of it is done during bursts of changes.
+const persist_interval_ms = 250;
+
 /// Owns config-derived services that the River host borrows while running.
 pub const Services = struct {
     allocator: std.mem.Allocator,
@@ -19,6 +47,9 @@ pub const Services = struct {
     policy: ?river_policy.Runtime = null,
     layout: ?river_layout.Runtime = null,
     keybindings: ?river_keybindings.Runtime = null,
+    layout_file: ?StateFile = null,
+    membership_file: ?StateFile = null,
+    last_persist_ms: f64 = -persist_interval_ms,
 
     /// Load optional user config and initialize its policy, layout, and keys.
     pub fn init(
@@ -26,6 +57,7 @@ pub const Services = struct {
         io: std.Io,
         client: *wayland_client.Client,
         config_path: ?[]const u8,
+        state_prefix: ?[]const u8,
     ) !Services {
         var self = Services{
             .allocator = allocator,
@@ -33,6 +65,14 @@ pub const Services = struct {
             .clock_origin = std.Io.Clock.awake.now(io),
         };
         errdefer self.deinit();
+        if (state_prefix) |prefix| {
+            const layout_path = try std.fmt.allocPrint(allocator, "{s}.layout", .{prefix});
+            defer allocator.free(layout_path);
+            self.layout_file = try StateFile.init(allocator, layout_path);
+            const membership_path = try std.fmt.allocPrint(allocator, "{s}.windows", .{prefix});
+            defer allocator.free(membership_path);
+            self.membership_file = try StateFile.init(allocator, membership_path);
+        }
         if (config_path) |path| {
             self.config = try script.config.load(allocator, io, path);
             const config = &self.config.?;
@@ -50,6 +90,8 @@ pub const Services = struct {
     /// Release configured services in reverse dependency order.
     pub fn deinit(self: *Services) void {
         self.commands.cancel(self.io);
+        if (self.layout_file) |*file| file.deinit(self.allocator);
+        if (self.membership_file) |*file| file.deinit(self.allocator);
         if (self.keybindings) |*value| value.deinit();
         if (self.layout) |*value| value.deinit();
         if (self.policy) |*value| value.deinit();
@@ -101,6 +143,102 @@ pub const Services = struct {
         try host.setSeatHook(.{ .context = @ptrCast(keybindings), .run = onSeat });
         try host.setManageHook(.{ .context = @ptrCast(keybindings), .run = onManage });
         try host.setSpawnHook(.{ .context = @ptrCast(self), .run = spawn });
+    }
+
+    /// Load what the previous session left behind, before any window is
+    /// admitted. Everything here is best effort: a missing, damaged or stale file
+    /// is logged and ignored, and the session starts as if it were new.
+    pub fn restoreState(self: *Services, host: *river_host.Runtime) void {
+        if (self.layout_file) |file| if (self.layout) |*layout| {
+            if (self.readState(file.path)) |text| {
+                defer self.allocator.free(text);
+                const accepted = layout.restoreState(text) catch |err| blk: {
+                    std.log.warn("layout state could not be restored: {s}", .{@errorName(err)});
+                    break :blk false;
+                };
+                if (accepted) std.log.info("Restored layout from {s}", .{file.path});
+            }
+        };
+        if (self.membership_file) |file| if (self.readState(file.path)) |text| {
+            defer self.allocator.free(text);
+            host.adapter.restoreMembership(text) catch |err|
+                std.log.warn("window membership could not be restored: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Reads a state file and takes it out of the way. Each file is tried at most
+    /// once: if what it holds ever brought the process down, the next start must
+    /// not meet it again. (The running session writes a fresh one on its first change.)
+    fn readState(self: *Services, path: []const u8) ?[]u8 {
+        const text = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1024 * 1024)) catch null;
+        if (text != null) {
+            const tried = std.fmt.allocPrint(self.allocator, "{s}.tried", .{path}) catch return text;
+            defer self.allocator.free(tried);
+            std.Io.Dir.renameAbsolute(path, tried, self.io) catch std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        }
+        return text;
+    }
+
+    /// Write out layout and window state that has changed, without blocking:
+    /// detecting a change is a comparison, and the writing happens in a task.
+    pub fn persist(self: *Services, host: *river_host.Runtime) void {
+        const now = monotonicMilliseconds(@ptrCast(self));
+        if (now - self.last_persist_ms < persist_interval_ms) return;
+        self.last_persist_ms = now;
+        if (self.layout_file) |*file| if (self.layout) |*layout| {
+            const saved = layout.saveState(self.allocator) catch |err| blk: {
+                std.log.warn("layout state could not be saved: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (saved) |text| self.submit(file, text);
+        };
+        if (self.membership_file) |*file| {
+            const saved = host.adapter.membershipText(self.allocator) catch null;
+            if (saved) |text| self.submit(file, text);
+        }
+    }
+
+    /// Take ownership of `text` and get it written.
+    fn submit(self: *Services, file: *StateFile, text: []u8) void {
+        file.mutex.lockUncancelable(self.io);
+        if (file.in_flight) {
+            // The running task will pick this up when it finishes its write.
+            if (file.pending) |older| self.allocator.free(older);
+            file.pending = text;
+            file.mutex.unlock(self.io);
+            return;
+        }
+        file.in_flight = true;
+        file.mutex.unlock(self.io);
+        self.commands.concurrent(self.io, writeStateFile, .{ self, file, text }) catch {
+            self.allocator.free(text);
+            file.mutex.lockUncancelable(self.io);
+            file.in_flight = false;
+            file.mutex.unlock(self.io);
+        };
+    }
+
+    fn writeStateFile(self: *Services, file: *StateFile, first: []u8) std.Io.Cancelable!void {
+        var text = first;
+        while (true) {
+            std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = file.temporary, .data = text }) catch |err| {
+                std.log.warn("state file write failed: {s}", .{@errorName(err)});
+            };
+            std.Io.Dir.renameAbsolute(file.temporary, file.path, self.io) catch |err| {
+                std.log.warn("state file rename failed: {s}", .{@errorName(err)});
+            };
+            self.allocator.free(text);
+            file.mutex.lockUncancelable(self.io);
+            if (file.pending) |next| {
+                file.pending = null;
+                file.mutex.unlock(self.io);
+                text = next;
+                continue;
+            }
+            file.in_flight = false;
+            file.mutex.unlock(self.io);
+            return;
+        }
     }
 
     /// Move queued key actions into the host at its post-dispatch safe point.

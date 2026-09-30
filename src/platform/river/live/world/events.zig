@@ -4,6 +4,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const host = @import("whirlpool-host");
 const live_objects = @import("objects.zig");
+const wm = @import("whirlpool-wm");
 
 const types = host.types;
 
@@ -16,9 +17,9 @@ pub fn onWindow(self: anytype, window: *wayland.client.river.WindowV1, event: wa
         .closed => _ = try self.closeWindowRef(proxy),
         .unreliable_pid,
         .presentation_hint,
-        .identifier,
         .capture_sessions,
         => {},
+        .identifier => |value| self.objects.windows.getPtr(id).?.identifier = wm.Identifier.init(std.mem.span(value.identifier)),
         .dimensions_hint => |value| {
             if (value.min_width < 0 or value.min_height < 0 or value.max_width < 0 or value.max_height < 0)
                 return error.InvalidDimensions;

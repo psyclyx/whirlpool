@@ -55,7 +55,8 @@ fn logUnfocusable(self: anytype, id: anytype) void {
         std.log.warn("focus dropped: window {d} unknown", .{id.raw()});
         return;
     };
-    const output = if (window.output) |output_id| self.world.getOutput(output_id) else null;
+    const output_id = self.world.windowOutput(id);
+    const output = if (output_id) |shown| self.world.getOutput(shown) else null;
     std.log.warn(
         "focus dropped: window={d} lifecycle={s} placement={s} tag={d} output={?d} output_active_tag={?d} focused={?d}",
         .{
@@ -63,7 +64,7 @@ fn logUnfocusable(self: anytype, id: anytype) void {
             @tagName(window.lifecycle),
             @tagName(window.placement),
             window.tag.raw(),
-            if (window.output) |o| o.raw() else null,
+            if (output_id) |o| o.raw() else null,
             if (output) |o| o.active_tag.raw() else null,
             if (self.world.focusedWindow()) |w| w.raw() else null,
         },
@@ -146,8 +147,8 @@ fn removeRetiredOutputs(self: anytype) !void {
             for (self.objects.window_order.items) |window| {
                 const entry = self.objects.windows.getPtr(window) orelse continue;
                 const window_id = entry.wm_id orelse continue;
-                const value = self.world.getWindow(window_id) orelse return error.UnknownWindow;
-                if (value.output != removed_output) continue;
+                _ = self.world.getWindow(window_id) orelse return error.UnknownWindow;
+                if (self.world.windowOutput(window_id) != removed_output) continue;
                 try destroyWindow(self, window_id);
                 std.debug.assert(self.objects.wm_to_window.remove(window_id));
                 entry.wm_id = null;
@@ -164,13 +165,23 @@ fn removeRetiredOutputs(self: anytype) !void {
 }
 
 fn materializeWindows(self: anytype) !void {
+    var admitted = false;
+    // The remembered membership is for the windows River already had when we
+    // started; once that first batch is placed it has served its purpose.
+    defer if (admitted) if (self.restored) |*restored| {
+        restored.deinit();
+        self.restored = null;
+    };
     for (self.objects.window_order.items) |window| {
         const entry = self.objects.windows.getPtr(window) orelse continue;
         if (entry.closed or entry.wm_id != null) continue;
-        const destination = preferredOrFirstOutput(self, entry.preferred_output) orelse return;
+        const destination = preferredOrFocusedOutput(self, entry.preferred_output) orelse return;
         const output_record = self.objects.outputs.get(destination).?;
         const output_value = self.world.getOutput(output_record.wm_id.?) orelse return error.UnknownOutput;
-        const active_tag = output_value.active_tag;
+        // A window seen in the previous session goes back to its tag; anything else
+        // opens on the focused monitor's tag.
+        const restored_tag = restoredTag(self, entry.identifier.slice());
+        const active_tag = restored_tag orelse output_value.active_tag;
         // New-window grouping and floating heuristics belong to the retained
         // Lua controller. Native reconciliation only establishes a neutral
         // managed window record from compositor facts.
@@ -178,8 +189,8 @@ fn materializeWindows(self: anytype) !void {
         const floating_geometry = initialFloatingGeometry(entry, output_value.usable);
         const result = try wm.lifecycle.applyEvent(&self.world, .{ .window_announced = .{
             .tag = active_tag,
-            .output = output_record.wm_id.?,
             .transient = entry.parent != null,
+            .identifier = entry.identifier,
             .placement = placement,
             .floating_geometry = floating_geometry,
             .size_hints = entry.dimensions_hint,
@@ -188,11 +199,22 @@ fn materializeWindows(self: anytype) !void {
         } });
         const window_id = result.announced_window.?;
         _ = try wm.lifecycle.applyEvent(&self.world, .{ .window_managed = window_id });
-        try focusIfFocusable(self, window_id);
+        // Remembered windows keep whatever focus they had; new ones take it.
+        const remembered = restored_tag != null;
+        const was_focused = if (self.restored) |restored| restored.isFocus(entry.identifier.slice()) else false;
+        if (!remembered or was_focused) try focusIfFocusable(self, window_id);
         entry.wm_id = window_id;
+        admitted = true;
         entry.requested_placement = null;
         try self.objects.wm_to_window.put(window_id, window);
     }
+}
+
+fn restoredTag(self: anytype, identifier: []const u8) ?wm.TagId {
+    const restored = self.restored orelse return null;
+    if (identifier.len == 0) return null;
+    const ordinal = restored.tagFor(identifier) orelse return null;
+    return self.world.tagAt(ordinal - 1);
 }
 
 fn syncWindowMetadata(self: anytype) !void {
@@ -243,12 +265,14 @@ fn moveWindowsToPreferredOutputs(self: anytype) !void {
         const destination_wm = destination.wm_id orelse continue;
         const window_id = entry.wm_id orelse continue;
         const current = self.world.getWindow(window_id) orelse return error.UnknownWindow;
-        if (current.output == destination_wm) continue;
         const destination_tag = (self.world.getOutput(destination_wm) orelse return error.UnknownOutput).active_tag;
+        // The hint is one-shot: honoring it once must not fight later moves
+        // (e.g. send-to-tag) by dragging the window back every cycle.
+        entry.preferred_output = null;
+        if (current.tag == destination_tag) continue;
         _ = try self.world.applyAtomically(&.{.{ .window = .{ .assign = .{
             .window = window_id,
             .tag = destination_tag,
-            .output = destination_wm,
         } } }});
     }
 }
@@ -317,6 +341,16 @@ fn removeClosedRecords(self: anytype) void {
         std.debug.assert(self.objects.windows.remove(id));
         _ = self.objects.window_order.orderedRemove(index);
     }
+}
+
+/// New windows open where the client asked, else on the focused monitor.
+fn preferredOrFocusedOutput(self: anytype, preferred: ?types.OutputId) ?types.OutputId {
+    if (preferred == null) if (self.world.focusedOutput()) |focused| {
+        if (self.objects.wm_to_output.get(focused)) |id| if (self.objects.outputs.get(id)) |record| {
+            if (!record.removed and record.wm_id != null) return id;
+        };
+    };
+    return preferredOrFirstOutput(self, preferred);
 }
 
 fn preferredOrFirstOutput(self: anytype, preferred: ?types.OutputId) ?types.OutputId {

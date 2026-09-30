@@ -8,6 +8,7 @@ pub fn one(world: anytype, item: command.Command) !void {
     switch (item) {
         .focus => |value| switch (value) {
             .window => |window| try policy.focusWindowInPlace(world, window),
+            .output => |output| try policy.focusOutputInPlace(world, output),
             .clear => policy.clearFocusInPlace(world),
         },
         .tag => |value| switch (value) {
@@ -27,7 +28,7 @@ pub fn one(world: anytype, item: command.Command) !void {
             .remove => |output| try policy.removeOutputInPlace(world, output),
         },
         .window => |value| switch (value) {
-            .assign => |item_value| try policy.assignWindowInPlace(world, item_value.window, item_value.tag, item_value.output),
+            .assign => |item_value| try policy.assignWindowInPlace(world, item_value.window, item_value.tag),
             .set_placement => |item_value| try policy.setPlacementInPlace(world, item_value.window, item_value.placement),
             .transition_placement => |item_value| try policy.transitionPlacementInPlace(world, item_value.window, item_value.transition),
             .set_floating_geometry => |item_value| try policy.setFloatingGeometryInPlace(world, item_value.window, item_value.geometry),

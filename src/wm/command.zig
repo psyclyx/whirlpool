@@ -3,7 +3,7 @@
 const ids = @import("ids.zig");
 const types = @import("types.zig");
 
-pub const Focus = union(enum) { window: ids.WindowId, clear };
+pub const Focus = union(enum) { window: ids.WindowId, output: ids.OutputId, clear };
 pub const Tag = union(enum) {
     activate: struct { output: ids.OutputId, tag: ids.TagId },
     toggle: struct { output: ids.OutputId, tag: ids.TagId },
@@ -22,7 +22,7 @@ pub const Output = union(enum) {
     remove: ids.OutputId,
 };
 pub const Window = union(enum) {
-    assign: struct { window: ids.WindowId, tag: ids.TagId, output: ?ids.OutputId },
+    assign: struct { window: ids.WindowId, tag: ids.TagId },
     set_placement: struct { window: ids.WindowId, placement: types.Placement },
     transition_placement: struct { window: ids.WindowId, transition: types.PlacementTransition },
     set_floating_geometry: struct { window: ids.WindowId, geometry: types.Rect },
@@ -43,6 +43,6 @@ pub const Batch = []const Command;
 test "commands expose only resource-level effects" {
     const window = ids.WindowId.fromParts(2, 1);
     const tag = ids.TagId.fromParts(3, 1);
-    const value: Command = .{ .window = .{ .assign = .{ .window = window, .tag = tag, .output = null } } };
+    const value: Command = .{ .window = .{ .assign = .{ .window = window, .tag = tag } } };
     try @import("std").testing.expectEqual(window, value.window.assign.window);
 }

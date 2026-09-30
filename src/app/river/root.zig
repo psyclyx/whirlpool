@@ -10,13 +10,13 @@ const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
 const configured = @import("whirlpool-app-river-configured");
 const presentation_app = @import("whirlpool-app-river-presentation");
 
-pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !void {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8, state_prefix: ?[]const u8) !void {
     var client = try wayland_client.Client.connect(allocator);
     defer client.deinit();
     const compositor = try bindCompositor(client);
     defer compositor.destroy();
 
-    var services = try configured.Services.init(allocator, io, client, config_path);
+    var services = try configured.Services.init(allocator, io, client, config_path, state_prefix);
     defer services.deinit();
 
     var manager = try river_live.Manager.claim(client);
@@ -24,6 +24,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     var host_runtime_live = true;
     defer if (host_runtime_live) host_runtime.deinit();
     try services.attach(&host_runtime);
+    services.restoreState(&host_runtime);
     try host_runtime.attachManager(manager);
     var hooks = river_host_runtime.Runtime.hooks();
     hooks.context = @ptrCast(&host_runtime);
@@ -115,6 +116,7 @@ const AfterDispatch = struct {
         try self.presentation.pollReleases();
         try self.roles.reconcile();
         try self.presentation.present();
+        self.services.persist(self.runtime);
         // Presentation can queue a newly completed asynchronous frame after
         // the first host safe point. Drain its transaction request now.
         try self.runtime.afterDispatch();

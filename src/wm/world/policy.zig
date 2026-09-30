@@ -9,10 +9,20 @@ pub fn focusWindowInPlace(world: anytype, window_id: ids.WindowId) !void {
     const window = world.windows.getConst(window_id) orelse return error.UnknownWindow;
     if (!validation.isFocusable(world, window)) return error.NotFocusable;
     world.focused = window_id;
+    world.focused_output = world.windowOutput(window_id);
 }
 
 pub fn clearFocusInPlace(world: anytype) void {
     world.focused = null;
+}
+
+/// Focus a monitor. Keyboard focus stays only if its window is on that monitor.
+pub fn focusOutputInPlace(world: anytype, output_id: ids.OutputId) !void {
+    _ = world.outputs.getConst(output_id) orelse return error.UnknownOutput;
+    world.focused_output = output_id;
+    if (world.focused) |focused| {
+        if (world.windowOutput(focused) != output_id) world.focused = null;
+    }
 }
 
 pub fn manageWindowInPlace(world: anytype, window_id: ids.WindowId) !void {
@@ -34,12 +44,18 @@ pub fn destroyWindowInPlace(world: anytype, window_id: ids.WindowId) !void {
     try world.windows.discard(window_id);
 }
 
-pub fn assignWindowInPlace(world: anytype, window_id: ids.WindowId, tag_id: ids.TagId, output_id: ?ids.OutputId) !void {
+/// Moving the focused window to a tag on another monitor must not drag the
+/// focused monitor along: keyboard focus drops, the monitor stays.
+pub fn assignWindowInPlace(world: anytype, window_id: ids.WindowId, tag_id: ids.TagId) !void {
     _ = world.tags.getConst(tag_id) orelse return error.UnknownTag;
-    if (output_id) |output| _ = world.outputs.getConst(output) orelse return error.UnknownOutput;
     const window = world.windows.get(window_id) orelse return error.UnknownWindow;
+    const focused_output = world.focusedOutput();
+    const was_focused = world.focused == window_id;
     window.tag = tag_id;
-    window.output = output_id;
+    if (was_focused and world.windowOutput(window_id) != focused_output) {
+        world.focused = null;
+        world.focused_output = focused_output;
+    }
     clearInvalidFocus(world);
 }
 
@@ -109,9 +125,15 @@ pub fn setWindowTransientInPlace(world: anytype, window_id: ids.WindowId, transi
     window.transient = transient;
 }
 
+/// A tag is shown on at most one output, otherwise each of its windows would be
+/// planned and positioned by two outputs at once. Activating a tag another
+/// output already shows is therefore a no-op; callers focus that output instead.
 pub fn setActiveTagInPlace(world: anytype, output_id: ids.OutputId, tag_id: ids.TagId) !void {
     _ = world.tags.getConst(tag_id) orelse return error.UnknownTag;
     const output = world.outputs.get(output_id) orelse return error.UnknownOutput;
+    for (world.outputs.slots.items) |slot| if (slot.value) |other| {
+        if (other.id != output_id and other.active_tag == tag_id) return;
+    };
     if (output.active_tag != tag_id) {
         output.previous_tag = output.active_tag;
         output.active_tag = tag_id;
@@ -125,9 +147,7 @@ pub fn toggleActiveTagInPlace(world: anytype, output_id: ids.OutputId, tag_id: i
     if (output.active_tag != tag_id) return setActiveTagInPlace(world, output_id, tag_id);
     const previous = output.previous_tag orelse return error.NoPreviousTag;
     _ = world.tags.getConst(previous) orelse return error.InvalidInvariant;
-    output.previous_tag = output.active_tag;
-    output.active_tag = previous;
-    clearInvalidFocus(world);
+    try setActiveTagInPlace(world, output_id, previous);
 }
 
 pub fn renameTagInPlace(world: anytype, tag_id: ids.TagId, name: []const u8) !void {
@@ -170,10 +190,8 @@ pub fn configureOutputInPlace(world: anytype, output_id: ids.OutputId, configura
 
 pub fn removeOutputInPlace(world: anytype, output_id: ids.OutputId) !void {
     _ = world.outputs.getConst(output_id) orelse return error.UnknownOutput;
-    for (world.windows.slots.items) |*slot| if (slot.value) |*window| {
-        if (window.output == output_id) window.output = null;
-    };
     try world.outputs.discard(output_id);
+    if (world.focused_output == output_id) world.focused_output = null;
     clearInvalidFocus(world);
 }
 

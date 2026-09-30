@@ -47,6 +47,9 @@ pub const World = struct {
     outputs: OutputStore,
     tags: TagStore,
     focused: ?WindowId = null,
+    /// The monitor last focused explicitly. A monitor can be focused with no
+    /// window on it; while a window is focused its own output wins.
+    focused_output: ?OutputId = null,
 
     pub fn init(allocator: std.mem.Allocator) World {
         return .{
@@ -103,7 +106,6 @@ pub const World = struct {
     pub fn createWindow(self: *World, spec: WindowSpec) !WindowId {
         self.assertValid();
         try self.requireTag(spec.tag);
-        if (spec.output) |output| try self.requireOutput(output);
         try validation.validateFloatingGeometry(spec.floating_geometry);
         try validation.validateSizeHints(spec.size_hints);
         try validation.validateOptionalSize(spec.actual_size);
@@ -111,7 +113,7 @@ pub const World = struct {
         const id = try self.windows.insert(.{
             .id = undefined,
             .tag = spec.tag,
-            .output = spec.output,
+            .identifier = spec.identifier,
             .transient = spec.transient,
             .placement = spec.placement,
             .restore_placement = if (spec.placement == .floating) .floating else .tiled,
@@ -191,6 +193,14 @@ pub const World = struct {
         return self.focused;
     }
 
+    /// The focused monitor: the output showing the focused window, else the one
+    /// focused explicitly, else the first.
+    pub fn focusedOutput(self: *const World) ?OutputId {
+        if (self.focused) |window| if (self.windowOutput(window)) |output| return output;
+        if (self.focused_output) |output| if (self.outputs.getConst(output) != null) return output;
+        return self.firstOutput();
+    }
+
     pub fn tagOrdinal(self: *const World, id: TagId) ?usize {
         var ordinal: usize = 0;
         for (self.tags.slots.items) |slot| {
@@ -217,6 +227,26 @@ pub const World = struct {
         return self.outputAt(0);
     }
 
+    /// Whether some output currently shows `tag`.
+    pub fn tagShownSomewhere(self: *const World, tag: TagId) bool {
+        for (self.outputs.slots.items) |slot| {
+            const output = slot.value orelse continue;
+            if (output.active_tag == tag) return true;
+        }
+        return false;
+    }
+
+    /// The output a window is presented on: the one showing its tag. Windows
+    /// carry no output of their own, so this cannot disagree with the tag.
+    pub fn windowOutput(self: *const World, id: WindowId) ?OutputId {
+        const window = self.getWindow(id) orelse return null;
+        for (self.outputs.slots.items) |slot| {
+            const output = slot.value orelse continue;
+            if (output.active_tag == window.tag) return output.id;
+        }
+        return null;
+    }
+
     pub fn liveOutputCount(self: *const World) usize {
         return self.outputs.liveCount();
     }
@@ -238,6 +268,7 @@ pub const World = struct {
         copy.outputs = try self.outputs.clone();
         copy.tags = try self.tags.clone();
         copy.focused = self.focused;
+        copy.focused_output = self.focused_output;
         copy.assertValid();
         return copy;
     }

@@ -18,7 +18,6 @@ pub fn validate(world: anytype) !void {
     for (world.windows.slots.items) |slot| {
         const window = slot.value orelse continue;
         if (world.tags.getConst(window.tag) == null) return error.InvalidInvariant;
-        if (window.output) |output| if (world.outputs.getConst(output) == null) return error.InvalidInvariant;
         try validateFloatingGeometry(window.floating_geometry);
         try validateSizeHints(window.size_hints);
         try validateOptionalSize(window.actual_size);
@@ -35,12 +34,7 @@ pub fn validate(world: anytype) !void {
 /// camera, tab selection and fullscreen occlusion are layout state.
 pub fn isFocusable(world: anytype, window: *const types.Window) bool {
     if (window.lifecycle != .managed or window.placement == .scratchpad) return false;
-    // A window pinned to an output counts only there. An unpinned one
-    // (e.g. after send-to-tag) follows its tag to whichever output shows it.
-    if (window.output) |output_id| {
-        const output = world.outputs.getConst(output_id) orelse return false;
-        return output.active_tag == window.tag;
-    }
+    // A window is where its tag is shown; a tag nobody shows has no focusable windows.
     for (world.outputs.slots.items) |slot| {
         const output = slot.value orelse continue;
         if (output.active_tag == window.tag) return true;

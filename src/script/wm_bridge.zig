@@ -9,9 +9,10 @@ pub const Snapshot = wm.WorldView;
 /// retained model into effects on concrete windows, tags, and outputs.
 pub const Intent = union(enum) {
     focus_window: wm.WindowId,
+    focus_output: wm.OutputId,
     clear_focus,
     close_window: wm.WindowId,
-    assign_window: struct { window: wm.WindowId, tag: wm.TagId, output: ?wm.OutputId },
+    assign_window: struct { window: wm.WindowId, tag: wm.TagId },
     set_placement: struct { window: wm.WindowId, placement: wm.Placement },
     transition_placement: struct { window: wm.WindowId, transition: wm.PlacementTransition },
     set_floating_geometry: struct { window: wm.WindowId, geometry: wm.Rect },
@@ -20,12 +21,12 @@ pub const Intent = union(enum) {
     pub fn toCommand(self: Intent) wm.Command {
         return switch (self) {
             .focus_window => |window| .{ .focus = .{ .window = window } },
+            .focus_output => |output| .{ .focus = .{ .output = output } },
             .clear_focus => .{ .focus = .clear },
             .close_window => |window| .{ .window = .{ .begin_close = window } },
             .assign_window => |value| .{ .window = .{ .assign = .{
                 .window = value.window,
                 .tag = value.tag,
-                .output = value.output,
             } } },
             .set_placement => |value| .{ .window = .{ .set_placement = .{
                 .window = value.window,
@@ -98,12 +99,12 @@ test "snapshot exposes flat windows without layout identities" {
     var world = wm.World.init(std.testing.allocator);
     defer world.deinit();
     const tag = try world.createTag();
-    const output = try world.createOutput(.{
+    _ = try world.createOutput(.{
         .active_tag = tag,
         .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
         .usable = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
     });
-    const window = try world.createWindow(.{ .tag = tag, .output = output });
+    const window = try world.createWindow(.{ .tag = tag });
     try world.manageWindow(window);
     const snapshot = world.view();
     try std.testing.expectEqual(window, snapshot.windowAt(0).?);

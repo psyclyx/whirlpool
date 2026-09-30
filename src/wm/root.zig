@@ -28,6 +28,7 @@ pub const ResizeEdges = types.ResizeEdges;
 pub const Tag = types.Tag;
 pub const Output = types.Output;
 pub const Window = types.Window;
+pub const Identifier = types.Identifier;
 pub const WindowSpec = types.WindowSpec;
 pub const OutputSpec = types.OutputSpec;
 pub const Command = command.Command;

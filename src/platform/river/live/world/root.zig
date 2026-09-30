@@ -25,6 +25,7 @@ pub const input_intents = @import("input.zig");
 pub const live_objects = @import("objects.zig");
 pub const events = @import("events.zig");
 const reconcile = @import("reconcile.zig");
+const membership = @import("membership.zig");
 
 pub const Error = error{
     AdapterPoisoned,
@@ -152,6 +153,10 @@ pub const Adapter = struct {
     input_queue: input_intents.Queue,
     pointer_actions: std.AutoHashMap(types.PointerBindingId, input_intents.NamedAction),
     reserved_bottom: u32 = 0,
+    /// Window membership read from the previous session, until it has been used.
+    restored: ?membership.Membership = null,
+    /// Hash of the membership text last handed out for persisting.
+    membership_hash: u64 = 0,
 
     revision: u64 = 0,
     poisoned: bool = false,
@@ -172,12 +177,52 @@ pub const Adapter = struct {
     /// with the manager/surface-role owner, so disconnect teardown never sends
     /// accidental Wayland requests through this adapter.
     pub fn deinit(self: *Adapter) void {
+        if (self.restored) |*value| value.deinit();
         self.pointer_actions.deinit();
         self.input_queue.deinit();
         self.objects.deinit();
         self.staged.deinit();
         self.world.deinit();
         self.* = undefined;
+    }
+
+    /// Load the previous session's window membership (tags and focus). Text that
+    /// is not recognisable is ignored.
+    pub fn restoreMembership(self: *Adapter, text: []const u8) !void {
+        if (self.restored) |*old| old.deinit();
+        self.restored = try membership.Membership.parse(self.allocator, text);
+    }
+
+    /// The membership file for the windows as they stand, or null when it is
+    /// the same as the last one returned.
+    pub fn membershipText(self: *Adapter, allocator: std.mem.Allocator) !?[]u8 {
+        var entries: std.ArrayList(membership.Entry) = .empty;
+        defer entries.deinit(allocator);
+        for (self.objects.window_order.items) |id| {
+            const record = self.objects.windows.getPtr(id) orelse continue;
+            const wm_id = record.wm_id orelse continue;
+            if (record.closed or record.identifier.len == 0) continue;
+            const window = self.world.getWindow(wm_id) orelse continue;
+            if (window.lifecycle != .managed) continue;
+            const ordinal = self.world.tagOrdinal(window.tag) orelse continue;
+            try entries.append(allocator, .{ .identifier = record.identifier.slice(), .tag_ordinal = ordinal + 1 });
+        }
+        var focus: ?[]const u8 = null;
+        if (self.world.focusedWindow()) |wm_id| {
+            if (self.objects.wm_to_window.get(wm_id)) |id| {
+                if (self.objects.windows.getPtr(id)) |record| {
+                    if (record.identifier.len != 0) focus = record.identifier.slice();
+                }
+            }
+        }
+        const text = try membership.format(allocator, entries.items, focus);
+        const hash = std.hash.Wyhash.hash(0, text);
+        if (hash == self.membership_hash) {
+            allocator.free(text);
+            return null;
+        }
+        self.membership_hash = hash;
+        return text;
     }
 
     pub fn worldView(self: *const Adapter) *const wm.World {
@@ -267,7 +312,7 @@ pub const Adapter = struct {
             switch (state.placement) {
                 .unplaced => {},
                 .fullscreen => {
-                    const wm_output = state.output orelse return error.UnknownOutput;
+                    const wm_output = self.world.windowOutput(wm_id) orelse return error.UnknownOutput;
                     const output = self.objects.wm_to_output.get(wm_output) orelse return error.UnknownOutput;
                     try operations.append(self.allocator, .{ .fullscreen = .{ .window = window, .output = output } });
                 },
@@ -608,6 +653,10 @@ fn validateSize(size: types.Size) !void {
     if (size.width <= 0 or size.height <= 0) return error.InvalidDimensions;
 }
 
+test {
+    _ = membership;
+}
+
 test "River layer-shell usable area replaces full output bounds" {
     const usable: wm.Rect = .{ .x = 0, .y = 32, .width = 1920, .height = 1048 };
     const spec = try reconcile.outputSpec(
@@ -652,7 +701,7 @@ fn testBuildLayout(
     var ordinal: usize = 0;
     while (snapshot.windowAt(ordinal)) |window_id| : (ordinal += 1) {
         const window = snapshot.getWindow(window_id) orelse return error.UnknownWindow;
-        if (window.output != output_id or window.tag != output.active_tag or window.lifecycle != .managed) continue;
+        if (window.tag != output.active_tag or window.lifecycle != .managed) continue;
         try result.manage.dimensions.append(allocator, .{ .window = window_id, .size = .{ .width = output.usable.width, .height = output.usable.height } });
         try result.render.entries.append(allocator, .{
             .window = window_id,
@@ -860,7 +909,6 @@ test "new windows are admitted as flat managed resources on the active tag" {
     try std.testing.expectEqual(wm.Lifecycle.managed, first_window.lifecycle);
     try std.testing.expectEqual(wm.Lifecycle.managed, second_window.lifecycle);
     try std.testing.expectEqual(first_window.tag, second_window.tag);
-    try std.testing.expectEqual(first_window.output, second_window.output);
     try std.testing.expectEqual(second_id, adapter.world.focusedWindow().?);
 
     try adapter.stageManageFact(.{ .window_closed = first });

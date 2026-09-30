@@ -5,7 +5,7 @@ const script = @import("whirlpool-script");
 const wm = @import("whirlpool-wm");
 
 pub const Limits = struct {
-    max_instructions: u64 = 200_000,
+    max_instructions: u64 = 2_000_000,
     hook_granularity: u32 = 100,
     max_entries: usize = 4096,
 };
@@ -82,6 +82,37 @@ pub const Runtime = struct {
         defer parsed.deinit();
         try parseActionIntents(&self.vm, snapshot, &parsed);
         for (parsed.intents.items) |intent| try intents.append(intent);
+    }
+
+    /// The layout's own state as text, or null when nothing worth writing has
+    /// changed since the last call. Costs one cheap script call when idle.
+    pub fn saveState(self: *Runtime, allocator: std.mem.Allocator) !?[]u8 {
+        defer self.vm.setTop(0);
+        self.vm.getGlobal("whirlpool_layout_provider");
+        if (self.vm.luaType(-1) != .table) return error.InvalidLayoutSource;
+        self.vm.getField(-1, "save");
+        if (self.vm.luaType(-1) != .function) return null;
+        self.instructions = 0;
+        try self.vm.setInstructionHook(instructionHook, self, self.limits.hook_granularity);
+        defer self.vm.clearInstructionHook();
+        try self.vm.call(0, 1);
+        const text = self.vm.string(-1) orelse return null;
+        return try allocator.dupe(u8, text);
+    }
+
+    /// Offer the layout a previous session's state. Returns whether it accepted it.
+    pub fn restoreState(self: *Runtime, text: []const u8) !bool {
+        defer self.vm.setTop(0);
+        self.vm.getGlobal("whirlpool_layout_provider");
+        if (self.vm.luaType(-1) != .table) return error.InvalidLayoutSource;
+        self.vm.getField(-1, "restore");
+        if (self.vm.luaType(-1) != .function) return false;
+        self.vm.pushString(text);
+        self.instructions = 0;
+        try self.vm.setInstructionHook(instructionHook, self, self.limits.hook_granularity);
+        defer self.vm.clearInstructionHook();
+        try self.vm.call(1, 1);
+        return self.vm.boolean(-1) orelse false;
     }
 
     pub fn beginActions(self: *Runtime) !void {
@@ -168,6 +199,9 @@ fn parseActionIntents(vm: *script.lua_vm.Vm, snapshot: *const wm.WorldView, inte
         if (std.mem.eql(u8, name, "focus-window")) {
             const window = try liveId(wm.WindowId, vm, snapshot, -1, "window");
             try intents.append(.{ .focus_window = window });
+        } else if (std.mem.eql(u8, name, "focus-output")) {
+            const output = try liveId(wm.OutputId, vm, snapshot, -1, "output");
+            try intents.append(.{ .focus_output = output });
         } else if (std.mem.eql(u8, name, "clear-focus")) {
             try intents.append(.clear_focus);
         } else if (std.mem.eql(u8, name, "close-window")) {
@@ -176,9 +210,7 @@ fn parseActionIntents(vm: *script.lua_vm.Vm, snapshot: *const wm.WorldView, inte
         } else if (std.mem.eql(u8, name, "move-window")) {
             const window = try liveId(wm.WindowId, vm, snapshot, -1, "window");
             const tag = try liveId(wm.TagId, vm, snapshot, -1, "tag");
-            const output = try optionalIdField(wm.OutputId, vm, -1, "output");
-            if (output) |id| _ = snapshot.getOutput(id) orelse return error.InvalidLayoutActionResult;
-            try intents.append(.{ .assign_window = .{ .window = window, .tag = tag, .output = output } });
+            try intents.append(.{ .assign_window = .{ .window = window, .tag = tag } });
         } else if (std.mem.eql(u8, name, "set-active-tag")) {
             const output = try liveId(wm.OutputId, vm, snapshot, -1, "output");
             const tag = try liveId(wm.TagId, vm, snapshot, -1, "tag");
@@ -238,6 +270,9 @@ fn pushSnapshot(vm: *script.lua_vm.Vm, snapshot: *const wm.WorldView, selected_o
     vm.createTable(0, 3);
     try setId(vm, "id", selected_output.raw());
     try setId(vm, "active_tag", output.active_tag.raw());
+    setBool(vm, "focused", snapshot.focusedOutput() == selected_output);
+    pushRect(vm, output.bounds);
+    vm.setField(-2, "bounds");
     pushRect(vm, output.usable);
     vm.setField(-2, "usable");
     vm.setField(-2, "output");
@@ -253,6 +288,7 @@ fn pushSnapshot(vm: *script.lua_vm.Vm, snapshot: *const wm.WorldView, selected_o
         vm.createTable(0, 5);
         try setId(vm, "id", id.raw());
         try setId(vm, "active_tag", item.active_tag.raw());
+        setBool(vm, "focused", snapshot.focusedOutput() == id);
         pushRect(vm, item.bounds);
         vm.setField(-2, "bounds");
         pushRect(vm, item.usable);
@@ -279,7 +315,7 @@ fn pushSnapshot(vm: *script.lua_vm.Vm, snapshot: *const wm.WorldView, selected_o
         vm.createTable(0, 12);
         try setId(vm, "id", id.raw());
         try setId(vm, "tag", item.tag.raw());
-        if (item.output) |value| try setId(vm, "output", value.raw()) else setNil(vm, "output");
+        setString(vm, "identifier", item.identifier.slice());
         setString(vm, "state", @tagName(item.placement));
         setString(vm, "lifecycle", @tagName(item.lifecycle));
         setBool(vm, "transient", item.transient);
@@ -528,7 +564,7 @@ test "flat snapshot and per-window plan contain no layout structure" {
     defer world.deinit();
     const tag = try world.createTag();
     const output = try world.createOutput(.{ .active_tag = tag, .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 }, .usable = .{ .x = 0, .y = 0, .width = 800, .height = 600 } });
-    const window = try world.createWindow(.{ .tag = tag, .output = output, .transient = true });
+    const window = try world.createWindow(.{ .tag = tag, .transient = true });
     try world.manageWindow(window);
     var runtime = try Runtime.init(std.testing.allocator, "return { layout = function(s) assert(s.windows[1].transient); return { epoch=s.epoch, output=s.output.id, tag=s.tag.id, entries={{window=s.windows[1].id, state='tiled', screen={x=0,y=0,width=800,height=600}, clip={x=0,y=0,width=800,height=600}, visible=true, propose={width=800,height=600}}} } end }", .{});
     defer runtime.deinit();
@@ -599,4 +635,711 @@ test "layout projections preserve generic overlay placement" {
     defer projection.deinit();
     try std.testing.expect(projection.items.items[0].overlay);
     try std.testing.expectEqual(@as(u32, 3), projection.items.items[0].width);
+}
+
+const scrolling_source_path = "config/lib/scrolling.lua";
+
+fn focusOutputTarget(
+    runtime: *Runtime,
+    snapshot: *const wm.WorldView,
+    from: wm.OutputId,
+    name: []const u8,
+) !?wm.WindowId {
+    var intents = script.IntentBatch.init(std.testing.allocator, 4);
+    defer intents.deinit();
+    try runtime.beginActions();
+    errdefer runtime.finishActions(false) catch {};
+    try runtime.handleAction(snapshot, from, name, &.{}, &intents);
+    try runtime.finishActions(true);
+    if (intents.count() == 0) return null;
+    return intents.intents.items[0].focus_window;
+}
+
+test "focus-output cycles to a window shown on the destination output" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        scrolling_source_path,
+        std.testing.allocator,
+        .limited(script.config.MaxLayoutSourceBytes),
+    );
+    defer std.testing.allocator.free(source);
+
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 800, .height = 600 };
+    var outputs: [3]wm.OutputId = undefined;
+    var windows: [3]wm.WindowId = undefined;
+    for (&outputs, &windows) |*output, *window| {
+        const tag = try world.createTag();
+        output.* = try world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect });
+        window.* = try world.createWindow(.{ .tag = tag });
+        try world.manageWindow(window.*);
+    }
+    // A window on a tag no output shows must never be picked.
+    const hidden_tag = try world.createTag();
+    const hidden = try world.createWindow(.{ .tag = hidden_tag });
+    try world.manageWindow(hidden);
+
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    const snapshot = world.view();
+
+    try std.testing.expectEqual(windows[1], (try focusOutputTarget(&runtime, &snapshot, outputs[0], "focus-output-next")).?);
+    try std.testing.expectEqual(windows[2], (try focusOutputTarget(&runtime, &snapshot, outputs[1], "focus-output-next")).?);
+    try std.testing.expectEqual(windows[0], (try focusOutputTarget(&runtime, &snapshot, outputs[2], "focus-output-next")).?);
+    try std.testing.expectEqual(windows[2], (try focusOutputTarget(&runtime, &snapshot, outputs[0], "focus-output-prev")).?);
+}
+
+test "focus-output does nothing with a single output" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        scrolling_source_path,
+        std.testing.allocator,
+        .limited(script.config.MaxLayoutSourceBytes),
+    );
+    defer std.testing.allocator.free(source);
+
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 800, .height = 600 };
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect });
+    const window = try world.createWindow(.{ .tag = tag });
+    try world.manageWindow(window);
+
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    const snapshot = world.view();
+    try std.testing.expectEqual(@as(?wm.WindowId, null), try focusOutputTarget(&runtime, &snapshot, output, "focus-output-next"));
+}
+
+const Round = struct {
+    sizes: [8]?wm.Size = .{null} ** 8,
+    screens: [8]wm.Rect = .{std.mem.zeroes(wm.Rect)} ** 8,
+    len: usize = 0,
+
+    fn eql(a: Round, b: Round) bool {
+        if (a.len != b.len) return false;
+        for (0..a.len) |i| {
+            if (!std.meta.eql(a.sizes[i], b.sizes[i])) return false;
+            if (!std.meta.eql(a.screens[i], b.screens[i])) return false;
+        }
+        return true;
+    }
+};
+
+/// One compositor round: lay out every output, then let every client answer
+/// with a size snapped to its terminal cell grid (as a real terminal does).
+fn layoutRound(world: *wm.World, runtime: *Runtime, outputs: []const wm.OutputId) !Round {
+    var round: Round = .{};
+    var updates: [8]struct { window: wm.WindowId, size: wm.Size } = undefined;
+    var update_count: usize = 0;
+    const snapshot = world.view();
+    for (outputs) |output| {
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0);
+        defer plans.deinit();
+        for (plans.manage.dimensions.items) |proposal| {
+            const size = proposal.size orelse continue;
+            round.sizes[round.len] = size;
+            updates[update_count] = .{
+                .window = proposal.window,
+                .size = .{ .width = @max(10, size.width / 10 * 10), .height = @max(20, size.height / 20 * 20) },
+            };
+            update_count += 1;
+            round.len += 1;
+        }
+        for (plans.render.entries.items, round.len - plans.manage.dimensions.items.len..) |entry, i| {
+            if (i < round.len) round.screens[i] = entry.screen;
+        }
+    }
+    for (updates[0..update_count]) |update| {
+        _ = try world.applyAtomically(&.{.{ .window = .{ .update_sizing = .{
+            .window = update.window,
+            .hints = .{},
+            .actual = update.size,
+            .proposed = null,
+        } } }});
+    }
+    return round;
+}
+
+test "layout reaches a fixed point when clients snap to a cell grid" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        scrolling_source_path,
+        std.testing.allocator,
+        .limited(script.config.MaxLayoutSourceBytes),
+    );
+    defer std.testing.allocator.free(source);
+
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const modes = [_]wm.Size{
+        .{ .width = 2560, .height = 1440 },
+        .{ .width = 1920, .height = 1080 },
+        .{ .width = 3440, .height = 1440 },
+    };
+    const window_counts = [_]usize{ 2, 1, 3 };
+    var outputs: [3]wm.OutputId = undefined;
+    for (&outputs, modes, window_counts) |*output, mode, count| {
+        const tag = try world.createTag();
+        const rect: wm.Rect = .{ .x = 0, .y = 0, .width = mode.width, .height = mode.height };
+        output.* = try world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect });
+        for (0..count) |_| {
+            const window = try world.createWindow(.{ .tag = tag });
+            try world.manageWindow(window);
+        }
+    }
+
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+
+    var previous = try layoutRound(&world, &runtime, &outputs);
+    var stable_rounds: usize = 0;
+    for (0..12) |_| {
+        const current = try layoutRound(&world, &runtime, &outputs);
+        stable_rounds = if (current.eql(previous)) stable_rounds + 1 else 0;
+        previous = current;
+    }
+    // A resize loop shows up as proposals or geometry that keep changing.
+    try std.testing.expect(stable_rounds >= 6);
+}
+
+/// Dispatch a layout action exactly as the host does: on the focused window's
+/// output, applying the resulting intents to the world, then relayout.
+fn dispatchAction(world: *wm.World, runtime: *Runtime, outputs: []const wm.OutputId, name: []const u8) !void {
+    var snapshot = world.view();
+    const output = snapshot.focusedOutput() orelse return error.NothingFocused;
+    var intents = script.IntentBatch.init(std.testing.allocator, 8);
+    defer intents.deinit();
+    try runtime.beginActions();
+    errdefer runtime.finishActions(false) catch {};
+    try runtime.handleAction(&snapshot, output, name, &.{}, &intents);
+    try runtime.finishActions(true);
+    for (intents.intents.items) |intent| _ = try world.applyAtomically(&.{intent.toCommand()});
+    _ = try layoutRound(world, runtime, outputs);
+}
+
+fn focusedOutputIndex(world: *const wm.World, outputs: []const wm.OutputId) !usize {
+    const output = world.focusedOutput() orelse return error.NothingFocused;
+    for (outputs, 0..) |candidate, index| if (candidate == output) return index;
+    return error.UnknownOutput;
+}
+
+test "repeated focus-output steps through every output, with layout between" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        scrolling_source_path,
+        std.testing.allocator,
+        .limited(script.config.MaxLayoutSourceBytes),
+    );
+    defer std.testing.allocator.free(source);
+
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const modes = [_]wm.Size{
+        .{ .width = 2560, .height = 1440 },
+        .{ .width = 1920, .height = 1080 },
+        .{ .width = 3440, .height = 1440 },
+    };
+    const window_counts = [_]usize{ 2, 1, 3 };
+    var outputs: [3]wm.OutputId = undefined;
+    var first_window: wm.WindowId = undefined;
+    for (&outputs, modes, window_counts, 0..) |*output, mode, count, index| {
+        const tag = try world.createTag();
+        const rect: wm.Rect = .{ .x = 0, .y = 0, .width = mode.width, .height = mode.height };
+        output.* = try world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect });
+        for (0..count) |n| {
+            const window = try world.createWindow(.{ .tag = tag });
+            try world.manageWindow(window);
+            if (index == 0 and n == 0) first_window = window;
+        }
+    }
+    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = first_window } }});
+
+    var runtime = try Runtime.init(std.testing.allocator, source, .{});
+    defer runtime.deinit();
+    _ = try layoutRound(&world, &runtime, &outputs);
+
+    var expected: usize = 0;
+    for (0..7) |_| {
+        try dispatchAction(&world, &runtime, &outputs, "focus-output-next");
+        expected = (expected + 1) % outputs.len;
+        try std.testing.expectEqual(expected, try focusedOutputIndex(&world, &outputs));
+    }
+    for (0..7) |_| {
+        try dispatchAction(&world, &runtime, &outputs, "focus-output-prev");
+        expected = (expected + outputs.len - 1) % outputs.len;
+        try std.testing.expectEqual(expected, try focusedOutputIndex(&world, &outputs));
+    }
+}
+
+const Desk = struct {
+    world: wm.World,
+    outputs: [3]wm.OutputId,
+    tags: [3]wm.TagId,
+    windows: [3]wm.WindowId,
+
+    /// One window per output, all unpinned: they follow their tag, as windows
+    /// moved with send-to-tag do.
+    fn unpinned(desk: *Desk) !void {
+        desk.world = wm.World.init(std.testing.allocator);
+        for (&desk.outputs, &desk.tags, &desk.windows, 0..) |*output, *tag, *window, index| {
+            const rect: wm.Rect = .{ .x = @intCast(index * 1280), .y = 0, .width = 1280, .height = 720 };
+            tag.* = try desk.world.createTag();
+            output.* = try desk.world.createOutput(.{ .active_tag = tag.*, .bounds = rect, .usable = rect });
+            window.* = try desk.world.createWindow(.{ .tag = tag.* });
+            try desk.world.manageWindow(window.*);
+        }
+        _ = try desk.world.applyAtomically(&.{.{ .focus = .{ .window = desk.windows[0] } }});
+    }
+};
+
+fn scrollingRuntime() !struct { source: []u8, runtime: Runtime } {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        scrolling_source_path,
+        std.testing.allocator,
+        .limited(script.config.MaxLayoutSourceBytes),
+    );
+    errdefer std.testing.allocator.free(source);
+    return .{ .source = source, .runtime = try Runtime.init(std.testing.allocator, source, .{}) };
+}
+
+test "focus-output steps through every output when windows are unpinned" {
+    var desk: Desk = undefined;
+    try desk.unpinned();
+    defer desk.world.deinit();
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    _ = try layoutRound(&desk.world, &fixture.runtime, &desk.outputs);
+
+    var expected: usize = 0;
+    for (0..7) |_| {
+        try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-output-next");
+        expected = (expected + 1) % 3;
+        try std.testing.expectEqual(expected, try focusedOutputIndex(&desk.world, &desk.outputs));
+    }
+    for (0..7) |_| {
+        try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-output-prev");
+        expected = (expected + 2) % 3;
+        try std.testing.expectEqual(expected, try focusedOutputIndex(&desk.world, &desk.outputs));
+    }
+}
+
+test "focus-tag on a tag another output shows only moves focus" {
+    var desk: Desk = undefined;
+    try desk.unpinned();
+    defer desk.world.deinit();
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    _ = try layoutRound(&desk.world, &fixture.runtime, &desk.outputs);
+
+    // Tag 3 ordinal is shown on output 3: focus goes there and nothing moves.
+    var snapshot = desk.world.view();
+    var intents = script.IntentBatch.init(std.testing.allocator, 8);
+    defer intents.deinit();
+    try fixture.runtime.beginActions();
+    try fixture.runtime.handleAction(&snapshot, desk.outputs[0], "focus-tag", &.{"3"}, &intents);
+    try fixture.runtime.finishActions(true);
+    try std.testing.expectEqual(@as(usize, 1), intents.count());
+    try std.testing.expectEqual(desk.windows[2], intents.intents.items[0].focus_window);
+
+    // A tag no output shows is switched to normally.
+    const hidden = try desk.world.createTag();
+    var hidden_snapshot = desk.world.view();
+    intents.clear();
+    try fixture.runtime.beginActions();
+    try fixture.runtime.handleAction(&hidden_snapshot, desk.outputs[0], "focus-tag", &.{"4"}, &intents);
+    try fixture.runtime.finishActions(true);
+    try std.testing.expect(intents.count() >= 1);
+    switch (intents.intents.items[0]) {
+        .set_active_tag => |value| {
+            try std.testing.expectEqual(desk.outputs[0], value.output);
+            try std.testing.expectEqual(hidden, value.tag);
+        },
+        else => return error.ExpectedSetActiveTag,
+    }
+}
+
+test "focus-tag reaches a tag shown on any other output, from any output" {
+    var desk: Desk = undefined;
+    try desk.unpinned();
+    defer desk.world.deinit();
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    _ = try layoutRound(&desk.world, &fixture.runtime, &desk.outputs);
+
+    var intents = script.IntentBatch.init(std.testing.allocator, 8);
+    defer intents.deinit();
+    for (desk.outputs, 0..) |from, from_index| for (desk.windows, 0..) |window, tag_index| {
+        if (from_index == tag_index) continue;
+        const snapshot = desk.world.view();
+        intents.clear();
+        var ordinal: [1]u8 = .{@intCast('1' + tag_index)};
+        try fixture.runtime.beginActions();
+        try fixture.runtime.handleAction(&snapshot, from, "focus-tag", &.{&ordinal}, &intents);
+        try fixture.runtime.finishActions(true);
+        try std.testing.expectEqual(@as(usize, 1), intents.count());
+        try std.testing.expectEqual(window, intents.intents.items[0].focus_window);
+    };
+}
+
+/// Windows on monitors 1 and 3; monitor 2 is empty. Focus starts on monitor 1.
+fn gappedDesk(desk: *Desk) !void {
+    try desk.unpinned();
+    _ = try desk.world.applyAtomically(&.{.{ .window = .{ .destroy = desk.windows[1] } }});
+}
+
+test "an empty monitor can be focused, and focus continues past it" {
+    var desk: Desk = undefined;
+    try gappedDesk(&desk);
+    defer desk.world.deinit();
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    _ = try layoutRound(&desk.world, &fixture.runtime, &desk.outputs);
+
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-output-next");
+    try std.testing.expectEqual(@as(usize, 1), try focusedOutputIndex(&desk.world, &desk.outputs));
+    try std.testing.expectEqual(@as(?wm.WindowId, null), desk.world.focusedWindow());
+
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-output-next");
+    try std.testing.expectEqual(@as(usize, 2), try focusedOutputIndex(&desk.world, &desk.outputs));
+    try std.testing.expectEqual(@as(?wm.WindowId, desk.windows[2]), desk.world.focusedWindow());
+
+    // Backwards, through the empty monitor again.
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-output-prev");
+    try std.testing.expectEqual(@as(usize, 1), try focusedOutputIndex(&desk.world, &desk.outputs));
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-output-prev");
+    try std.testing.expectEqual(@as(?wm.WindowId, desk.windows[0]), desk.world.focusedWindow());
+}
+
+test "focusing past a monitor's edge continues onto the neighbouring monitor" {
+    var desk: Desk = undefined;
+    try gappedDesk(&desk);
+    defer desk.world.deinit();
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    _ = try layoutRound(&desk.world, &fixture.runtime, &desk.outputs);
+
+    // Left of the leftmost monitor there is nothing to focus.
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-left");
+    try std.testing.expectEqual(@as(usize, 0), try focusedOutputIndex(&desk.world, &desk.outputs));
+
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-right");
+    try std.testing.expectEqual(@as(usize, 1), try focusedOutputIndex(&desk.world, &desk.outputs));
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-right");
+    try std.testing.expectEqual(@as(?wm.WindowId, desk.windows[2]), desk.world.focusedWindow());
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-right");
+    try std.testing.expectEqual(@as(usize, 2), try focusedOutputIndex(&desk.world, &desk.outputs));
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-left");
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-left");
+    try std.testing.expectEqual(@as(?wm.WindowId, desk.windows[0]), desk.world.focusedWindow());
+}
+
+test "actions run on the focused monitor even when it has no window" {
+    var desk: Desk = undefined;
+    try gappedDesk(&desk);
+    defer desk.world.deinit();
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    _ = try layoutRound(&desk.world, &fixture.runtime, &desk.outputs);
+    try dispatchAction(&desk.world, &fixture.runtime, &desk.outputs, "focus-output-next");
+
+    // Asking for tag 3 from empty monitor 2 finds it on monitor 3 and focuses it.
+    var snapshot = desk.world.view();
+    var intents = script.IntentBatch.init(std.testing.allocator, 8);
+    defer intents.deinit();
+    try fixture.runtime.beginActions();
+    try fixture.runtime.handleAction(&snapshot, snapshot.focusedOutput().?, "focus-tag", &.{"3"}, &intents);
+    try fixture.runtime.finishActions(true);
+    try std.testing.expectEqual(@as(usize, 1), intents.count());
+    try std.testing.expectEqual(desk.windows[2], intents.intents.items[0].focus_window);
+}
+
+test "windows entirely past a monitor's edge are hidden, not drawn on its neighbour" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect });
+    for (0..6) |_| {
+        const window = try world.createWindow(.{ .tag = tag });
+        try world.manageWindow(window);
+    }
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const outputs = [_]wm.OutputId{output};
+    for (0..3) |_| _ = try layoutRound(&world, &fixture.runtime, &outputs);
+
+    const snapshot = world.view();
+    var plans = try fixture.runtime.buildAt(std.testing.allocator, &snapshot, output, 0);
+    defer plans.deinit();
+    var hidden: usize = 0;
+    var shown: usize = 0;
+    for (plans.render.entries.items) |entry| {
+        if (entry.visible) {
+            shown += 1;
+            // An empty clip box means "no clip" to River, so it must never
+            // accompany a visible window.
+            try std.testing.expect(entry.clip.width > 0 and entry.clip.height > 0);
+            try std.testing.expect(entry.screen.x < @as(i32, @intCast(rect.width)) and entry.screen.x + @as(i32, @intCast(entry.screen.width)) > 0);
+        } else {
+            hidden += 1;
+        }
+    }
+    try std.testing.expect(shown >= 1);
+    try std.testing.expect(hidden >= 1);
+}
+
+/// Lua VM instructions one layout call runs for `count` tiled windows, once the
+/// model has settled.
+fn layoutInstructions(count: usize) !u64 {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        scrolling_source_path,
+        std.testing.allocator,
+        .limited(script.config.MaxLayoutSourceBytes),
+    );
+    defer std.testing.allocator.free(source);
+    // A generous budget: this measures the work, not the safety limit.
+    var runtime = try Runtime.init(std.testing.allocator, source, .{ .max_instructions = 2_000_000_000, .max_entries = 100_000 });
+    defer runtime.deinit();
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect });
+    for (0..count) |_| {
+        const window = try world.createWindow(.{ .tag = tag });
+        try world.manageWindow(window);
+    }
+    const snapshot = world.view();
+    for (0..3) |_| {
+        var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0);
+        plans.deinit();
+    }
+    var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0);
+    plans.deinit();
+    return runtime.instructions;
+}
+
+test "layout work grows in proportion to the windows, not their square" {
+    // Deterministic: Lua VM instructions, not wall time. Quadrupling the
+    // windows should roughly quadruple the work; a scan of every strip per
+    // window would make it sixteen times.
+    const small = try layoutInstructions(100);
+    const large = try layoutInstructions(400);
+    try std.testing.expect(small > 0);
+    try std.testing.expect(large < small * 5);
+}
+
+test "a few hundred windows fit the default instruction budget" {
+    var world = wm.World.init(std.testing.allocator);
+    defer world.deinit();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+    const tag = try world.createTag();
+    const output = try world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect });
+    for (0..300) |_| {
+        const window = try world.createWindow(.{ .tag = tag });
+        try world.manageWindow(window);
+    }
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const snapshot = world.view();
+    for (0..3) |_| {
+        var plans = try fixture.runtime.buildAt(std.testing.allocator, &snapshot, output, 0);
+        plans.deinit();
+    }
+}
+
+fn sameSizes(a: Round, b: Round) bool {
+    if (a.len != b.len) return false;
+    for (0..a.len) |i| if (!std.meta.eql(a.sizes[i], b.sizes[i])) return false;
+    return true;
+}
+
+const Lone = struct {
+    world: wm.World,
+    output: [1]wm.OutputId,
+    windows: [3]wm.WindowId,
+
+    fn init(lone: *Lone) !void {
+        lone.world = wm.World.init(std.testing.allocator);
+        const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+        const tag = try lone.world.createTag();
+        lone.output[0] = try lone.world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect });
+        const names = [_][]const u8{ "alpha", "beta", "gamma" };
+        for (&lone.windows, names) |*window, name| {
+            window.* = try lone.world.createWindow(.{ .tag = tag, .identifier = wm.Identifier.init(name) });
+            try lone.world.manageWindow(window.*);
+        }
+        _ = try lone.world.applyAtomically(&.{.{ .focus = .{ .window = lone.windows[1] } }});
+    }
+};
+
+test "layout state saved by one runtime rebuilds the same arrangement in another" {
+    var first: Lone = undefined;
+    try first.init();
+    defer first.world.deinit();
+    var one = try scrollingRuntime();
+    defer std.testing.allocator.free(one.source);
+    defer one.runtime.deinit();
+    _ = try layoutRound(&first.world, &one.runtime, &first.output);
+    try dispatchAction(&first.world, &one.runtime, &first.output, "absorb-right");
+    _ = try layoutRound(&first.world, &one.runtime, &first.output);
+    const arranged = try layoutRound(&first.world, &one.runtime, &first.output);
+
+    const text = (try one.runtime.saveState(std.testing.allocator)) orelse return error.ExpectedState;
+    defer std.testing.allocator.free(text);
+    // Nothing has changed since: nothing to write.
+    try std.testing.expectEqual(@as(?[]u8, null), try one.runtime.saveState(std.testing.allocator));
+
+    // A new process, a new world whose windows have new ids but the same identifiers.
+    var second: Lone = undefined;
+    try second.init();
+    defer second.world.deinit();
+    var two = try scrollingRuntime();
+    defer std.testing.allocator.free(two.source);
+    defer two.runtime.deinit();
+    try std.testing.expect(try two.runtime.restoreState(text));
+    _ = try layoutRound(&second.world, &two.runtime, &second.output);
+    _ = try layoutRound(&second.world, &two.runtime, &second.output);
+    const restored = try layoutRound(&second.world, &two.runtime, &second.output);
+    // Positions animate from where windows were (time stands still in a test), so
+    // compare the sizes the arrangement asks for.
+    try std.testing.expect(sameSizes(restored, arranged));
+
+    // Without the saved state the same windows are laid out differently.
+    var third: Lone = undefined;
+    try third.init();
+    defer third.world.deinit();
+    var three = try scrollingRuntime();
+    defer std.testing.allocator.free(three.source);
+    defer three.runtime.deinit();
+    _ = try layoutRound(&third.world, &three.runtime, &third.output);
+    _ = try layoutRound(&third.world, &three.runtime, &third.output);
+    const fresh = try layoutRound(&third.world, &three.runtime, &third.output);
+    try std.testing.expect(!sameSizes(fresh, arranged));
+}
+
+test "damaged or foreign layout state is refused and changes nothing" {
+    const junk = [_][]const u8{ "", "not lua at all (", "return 42", "return { version = 99 }", "os.exit(1)", "error('boom')" };
+    for (junk) |text| {
+        var lone: Lone = undefined;
+        try lone.init();
+        defer lone.world.deinit();
+        var fixture = try scrollingRuntime();
+        defer std.testing.allocator.free(fixture.source);
+        defer fixture.runtime.deinit();
+        const accepted = fixture.runtime.restoreState(text) catch false;
+        try std.testing.expect(!accepted);
+        const round = try layoutRound(&lone.world, &fixture.runtime, &lone.output);
+        try std.testing.expectEqual(@as(usize, 3), round.len);
+    }
+}
+
+const hostile_layouts = [_][]const u8{
+    // Not JSON: nothing is evaluated, all of it is refused.
+    "local t = {} t[1] = t return {version = 1, tags = t}",
+    "while true do end",
+    "return (\"x\"):rep(1e10)",
+    "{\"version\":1,\"tags\":[",
+    "{\"version\":1} trailing",
+    "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    // Well-formed, but the wrong shape.
+    "{\"version\":1,\"tags\":5}",
+    "{\"version\":1,\"tags\":[5,null,\"x\",[]]}",
+    "{\"version\":1,\"tags\":[{\"ordinal\":1,\"strips\":7}]}",
+    "{\"version\":1,\"tags\":[{\"ordinal\":1,\"strips\":[5,{\"roots\":3}]}]}",
+    "{\"version\":1,\"tags\":[{\"ordinal\":1,\"strips\":[{\"roots\":[{\"node\":4}]}]}]}",
+    "{\"version\":1,\"states\":3,\"marks\":4}",
+    // Numbers that would poison geometry.
+    "{\"version\":1,\"tags\":[{\"ordinal\":1,\"strips\":[{\"roots\":[{\"width\":1e999,\"node\":{\"mode\":\"x\",\"axis\":1,\"active\":2.5,\"children\":[{\"weight\":-1,\"node\":{\"window\":\"alpha\"}},{\"weight\":1e999,\"node\":{\"window\":\"beta\"}}]}}]}]}]}",
+    "{\"version\":1,\"tags\":[{\"ordinal\":1,\"strips\":[{\"roots\":[{\"width\":-5,\"node\":{\"children\":[{\"weight\":0,\"node\":{\"window\":\"alpha\"}},{\"weight\":0,\"node\":{\"window\":\"beta\"}}]}}]}]}]}",
+    // The same window in many places.
+    "{\"version\":1,\"tags\":[{\"ordinal\":1,\"strips\":[{\"roots\":[{\"node\":{\"window\":\"alpha\"}},{\"node\":{\"window\":\"alpha\"}},{\"node\":{\"children\":[{\"node\":{\"window\":\"alpha\"}},{\"node\":{\"window\":\"alpha\"}}]}}]}]}]}",
+    // Wrong tags, unknown states, silly ordinals.
+    "{\"version\":1,\"tags\":[{\"ordinal\":2,\"strips\":[{\"roots\":[{\"node\":{\"window\":\"alpha\",\"state\":\"bogus\"}}]}]}],\"states\":{\"alpha\":\"bogus\"}}",
+    "{\"version\":1,\"tags\":[{\"ordinal\":1e9},{\"ordinal\":-1},{\"ordinal\":0.5},{\"ordinal\":\"1\"}]}",
+};
+
+test "hostile layout state never breaks layout" {
+    for (hostile_layouts, 0..) |text, case| {
+        errdefer std.debug.print("hostile case {d}\n", .{case});
+        var lone: Lone = undefined;
+        try lone.init();
+        defer lone.world.deinit();
+        var fixture = try scrollingRuntime();
+        defer std.testing.allocator.free(fixture.source);
+        defer fixture.runtime.deinit();
+        _ = fixture.runtime.restoreState(text) catch false;
+        // Several rounds, and actions, must all still work and place every window.
+        var round: Round = .{};
+        for (0..3) |_| round = try layoutRound(&lone.world, &fixture.runtime, &lone.output);
+        try dispatchAction(&lone.world, &fixture.runtime, &lone.output, "focus-right");
+        try dispatchAction(&lone.world, &fixture.runtime, &lone.output, "absorb-left");
+        round = try layoutRound(&lone.world, &fixture.runtime, &lone.output);
+        try std.testing.expectEqual(@as(usize, 3), round.len);
+        for (round.sizes[0..round.len]) |size| {
+            try std.testing.expect(size != null and size.?.width > 0 and size.?.height > 0);
+        }
+    }
+}
+
+test "the parts of a damaged file that make sense are still applied" {
+    // Tag 1 is good: beta over gamma beside alpha. Tag 2 is garbage, and so is a
+    // stray root inside tag 1.
+    const text =
+        \\{"version":1,"tags":[
+        \\ {"ordinal":1,"strips":[{"roots":[
+        \\   {"width":0.5,"node":{"window":"alpha"}},
+        \\   "garbage",
+        \\   {"width":0.5,"node":{"mode":"split","axis":"vertical","active":1,"children":[
+        \\      {"weight":1,"node":{"window":"beta"}},{"weight":1,"node":{"window":"gamma"}}]}}]}]},
+        \\ {"ordinal":2,"strips":"nonsense"}, 17]}
+    ;
+    var lone: Lone = undefined;
+    try lone.init();
+    defer lone.world.deinit();
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    try std.testing.expect(try fixture.runtime.restoreState(text));
+    var round: Round = .{};
+    for (0..3) |_| round = try layoutRound(&lone.world, &fixture.runtime, &lone.output);
+    // alpha full height beside a stacked pair: the same sizes as the round-trip test.
+    try std.testing.expectEqual(@as(usize, 3), round.len);
+    try std.testing.expect(round.sizes[0].?.height > round.sizes[1].?.height);
+    try std.testing.expectEqual(round.sizes[1].?.height, round.sizes[2].?.height);
+}
+
+test "fields the layout gains later are saved and restored without the persistence code knowing them" {
+    const text =
+        \\{"version":1,"tags":[{"ordinal":1,"strips":[{"roots":[
+        \\  {"width":0.5,"sticky":true,"node":{"window":"alpha","note":"hello"}},
+        \\  {"width":0.5,"node":{"mode":"split","axis":"vertical","active":1,"colour":7,"children":[
+        \\     {"weight":1,"pinned":true,"node":{"window":"beta"}},{"weight":1,"node":{"window":"gamma"}}]}}]}]}]}
+    ;
+    var lone: Lone = undefined;
+    try lone.init();
+    defer lone.world.deinit();
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    try std.testing.expect(try fixture.runtime.restoreState(text));
+    _ = try layoutRound(&lone.world, &fixture.runtime, &lone.output);
+    const saved = (try fixture.runtime.saveState(std.testing.allocator)) orelse return error.ExpectedState;
+    defer std.testing.allocator.free(saved);
+    for ([_][]const u8{ "\"sticky\":true", "\"note\":\"hello\"", "\"colour\":7", "\"pinned\":true" }) |field| {
+        try std.testing.expect(std.mem.indexOf(u8, saved, field) != null);
+    }
 }

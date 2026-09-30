@@ -30,7 +30,7 @@ pub const Event = union(enum) {
     window_managed: WindowId,
     window_close_requested: WindowId,
     window_destroyed: WindowId,
-    window_assigned: struct { window: WindowId, tag: TagId, output: ?OutputId },
+    window_assigned: struct { window: WindowId, tag: TagId },
     placement: struct { window: WindowId, transition: PlacementTransition },
 };
 
@@ -57,7 +57,6 @@ pub fn applyEvent(world: *World, event: Event) !ApplyResult {
         .window_assigned => |value| _ = try world.applyAtomically(&.{.{ .window = .{ .assign = .{
             .window = value.window,
             .tag = value.tag,
-            .output = value.output,
         } } }}),
         .placement => |value| _ = try world.applyAtomically(&.{.{ .window = .{ .transition_placement = .{
             .window = value.window,
@@ -84,12 +83,12 @@ test "lifecycle admission does not require a layout destination" {
     var world = World.init(std.testing.allocator);
     defer world.deinit();
     const tag = (try applyEvent(&world, .tag_announced)).announced_tag.?;
-    const output = (try applyEvent(&world, .{ .output_announced = .{
+    _ = (try applyEvent(&world, .{ .output_announced = .{
         .active_tag = tag,
         .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
         .usable = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
     } })).announced_output.?;
-    const window = (try applyEvent(&world, .{ .window_announced = .{ .tag = tag, .output = output } })).announced_window.?;
+    const window = (try applyEvent(&world, .{ .window_announced = .{ .tag = tag } })).announced_window.?;
     _ = try applyEvent(&world, .{ .window_managed = window });
     try std.testing.expectEqual(types.Lifecycle.managed, world.getWindow(window).?.lifecycle);
 }

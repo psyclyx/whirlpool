@@ -24,6 +24,7 @@ pub const WindowRecord = struct {
     app_id: []u8 = &.{},
     title: []u8 = &.{},
     closed: bool = false,
+    identifier: wm.Identifier = .{},
 
     pub fn deinit(self: *WindowRecord, allocator: std.mem.Allocator) void {
         if (self.app_id.len != 0) allocator.free(self.app_id);

@@ -100,10 +100,29 @@ pub const Output = struct {
         return self;
     }
 };
+/// River's stable name for a window (up to 32 printable ASCII bytes): it
+/// survives a window-manager restart, so persisted layout can be matched back
+/// to the same windows.
+pub const Identifier = struct {
+    bytes: [32]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn init(text: []const u8) Identifier {
+        var result = Identifier{};
+        result.len = @intCast(@min(text.len, result.bytes.len));
+        @memcpy(result.bytes[0..result.len], text[0..result.len]);
+        return result;
+    }
+
+    pub fn slice(self: *const Identifier) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 pub const Window = struct {
     id: WindowId = WindowId.invalid,
     tag: TagId = TagId.invalid,
-    output: ?OutputId = null,
+    identifier: Identifier = .{},
     lifecycle: Lifecycle = .announced,
     transient: bool = false,
     placement: Placement = .tiled,
@@ -119,7 +138,7 @@ pub const Window = struct {
 };
 pub const WindowSpec = struct {
     tag: TagId,
-    output: ?OutputId = null,
+    identifier: Identifier = .{},
     transient: bool = false,
     placement: Placement = .tiled,
     floating_geometry: Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },

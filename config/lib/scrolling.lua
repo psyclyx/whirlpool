@@ -230,29 +230,439 @@ local function current_insertion(state, focused_window)
   end
   return strip, index
 end
-local function sync(snapshot)
-  local seen = {}
-  for _, fact in ipairs(snapshot.windows or {}) do
-    seen[fact.id], model.windows[fact.id] = true, fact
-    if fact.lifecycle ~= "closed" then
-      local leaf = node(model.window_nodes[fact.id]) or new_leaf(fact.id)
-      leaf.state = leaf.state or classify(fact)
-      leaf.tag = leaf.tag or fact.tag
-      local state = tag_state(fact.tag)
-      local owner = location_for_node(leaf.id)
-      if leaf.state == "tiled" and not owner then
-        local strip, index = current_insertion(state,
-          snapshot.tag.id == fact.tag and snapshot.tag.focused_window or nil)
-        attach_root(state, strip, leaf.id, index, 0.5)
-      elseif leaf.state ~= "tiled" and owner then
-        local root = containing_root(leaf.id)
-        if root then detach(root.id) end
+
+-- Persistence -------------------------------------------------------------
+-- The retained model can be written out and read back so a restart of the
+-- window manager keeps the arrangement. Windows are named by the compositor's
+-- stable identifier, never by our own ids (which do not survive a restart).
+-- Loading is best effort: whatever no longer matches is simply dropped, and
+-- windows the file does not know about are placed as new windows are.
+
+-- Nodes are written as they are: every plain field (string, number, boolean) they
+-- carry goes into the file, so a field added to nodes later is persisted without
+-- touching this code. Only what refers to this process (ids, parent links, the
+-- window and its tag) is left out or translated. Reading applies the same rule
+-- in reverse, then checks the fields it knows the meaning of.
+local RUNTIME_FIELDS = { id = true, parent = true, tag = true, kind = true, window = true, children = true, node = true }
+
+local function plain_fields(source)
+  local out = {}
+  for key, value in pairs(source) do
+    local kind = type(value)
+    if type(key) == "string" and not RUNTIME_FIELDS[key]
+      and (kind == "string" or kind == "number" or kind == "boolean") then
+      out[key] = value
+    end
+  end
+  return out
+end
+
+local function apply_fields(target, saved)
+  for key, value in pairs(plain_fields(saved)) do target[key] = value end
+end
+
+local function serialize_tree(id)
+  local current = node(id)
+  if not current then return nil end
+  local out = plain_fields(current)
+  if current.kind == "window" then
+    local fact = model.windows[current.window]
+    if not fact or (fact.identifier or "") == "" then return nil end
+    out.window = fact.identifier
+    return out
+  end
+  local children = {}
+  for _, child in ipairs(current.children) do
+    local saved = serialize_tree(child.node)
+    if saved then
+      local entry = plain_fields(child)
+      entry.node = saved
+      children[#children + 1] = entry
+    end
+  end
+  if #children == 0 then return nil end
+  out.children = children
+  out.active = clamp(current.active or 1, 1, #children)
+  return out
+end
+
+-- The file is JSON: a real, dumb format with a real reader. Nothing in it is
+-- ever executed. Encoding sorts keys, so identical models give identical text and
+-- an unchanged one is never rewritten.
+local function json_encode(value, out)
+  local kind = type(value)
+  if kind == "string" then
+    out[#out + 1] = '"' .. value:gsub('[%c"\\]', function(c)
+      return string.format("\\u%04x", c:byte())
+    end) .. '"'
+  elseif kind == "number" then out[#out + 1] = string.format("%.17g", value)
+  elseif kind == "boolean" then out[#out + 1] = tostring(value)
+  elseif kind == "table" then
+    if value[1] ~= nil or next(value) == nil then
+      out[#out + 1] = "["
+      for index, item in ipairs(value) do
+        if index > 1 then out[#out + 1] = "," end
+        json_encode(item, out)
+      end
+      out[#out + 1] = "]"
+    else
+      local keys = {}
+      for key in pairs(value) do keys[#keys + 1] = key end
+      table.sort(keys)
+      out[#out + 1] = "{"
+      for index, key in ipairs(keys) do
+        if index > 1 then out[#out + 1] = "," end
+        json_encode(key, out)
+        out[#out + 1] = ":"
+        json_encode(value[key], out)
+      end
+      out[#out + 1] = "}"
+    end
+  else out[#out + 1] = "null" end
+end
+
+local MAX_STATE_BYTES = 1024 * 1024
+local MAX_JSON_DEPTH = 64
+local json_escapes = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" }
+
+-- Returns the decoded value, or nil for anything that is not well-formed JSON
+-- (or is too large or too deeply nested to be ours).
+local function json_decode(text)
+  if type(text) ~= "string" or #text > MAX_STATE_BYTES then return nil end
+  local position, depth = 1, 0
+  local function fail() error("bad json", 0) end
+  local function skip() position = text:find("[^ \t\r\n]", position) or #text + 1 end
+  local function peek() return text:sub(position, position) end
+  local function read_string()
+    local out = {}
+    position = position + 1
+    while true do
+      local stop = text:find('["\\]', position)
+      if not stop then fail() end
+      out[#out + 1] = text:sub(position, stop - 1)
+      if text:sub(stop, stop) == '"' then
+        position = stop + 1
+        return table.concat(out)
+      end
+      local code = text:sub(stop + 1, stop + 1)
+      if code == "u" then
+        local hex = text:match("^%x%x%x%x", stop + 2)
+        if not hex then fail() end
+        out[#out + 1] = utf8 and utf8.char(tonumber(hex, 16)) or "?"
+        position = stop + 6
+      else
+        out[#out + 1] = json_escapes[code] or fail()
+        position = stop + 2
       end
     end
   end
-  local stale = {}
-  for window in pairs(model.windows) do if not seen[window] then stale[#stale + 1] = window end end
-  for _, window in ipairs(stale) do remove_window(window) end
+  local read_value
+  local function read_container(close, item)
+    depth = depth + 1
+    if depth > MAX_JSON_DEPTH then fail() end
+    position = position + 1
+    skip()
+    if peek() == close then
+      position = position + 1
+      depth = depth - 1
+      return
+    end
+    while true do
+      item()
+      skip()
+      local separator = peek()
+      position = position + 1
+      if separator == close then break elseif separator ~= "," then fail() end
+    end
+    depth = depth - 1
+  end
+  function read_value()
+    skip()
+    local c = peek()
+    if c == "{" then
+      local result = {}
+      read_container("}", function()
+        skip()
+        if peek() ~= '"' then fail() end
+        local key = read_string()
+        skip()
+        if peek() ~= ":" then fail() end
+        position = position + 1
+        result[key] = read_value()
+      end)
+      return result
+    elseif c == "[" then
+      local result, count = {}, 0
+      read_container("]", function()
+        count = count + 1
+        result[count] = read_value()
+      end)
+      return result
+    elseif c == '"' then return read_string()
+    elseif text:find("^true", position) then position = position + 4; return true
+    elseif text:find("^false", position) then position = position + 5; return false
+    elseif text:find("^null", position) then position = position + 4; return nil end
+    local number = text:match("^-?%d+%.?%d*[eE]?[+-]?%d*", position)
+    local parsed = number and tonumber(number)
+    if not parsed then fail() end
+    position = position + #number
+    return parsed
+  end
+  local ok, result = pcall(function()
+    local value = read_value()
+    skip()
+    if position <= #text then fail() end
+    return value
+  end)
+  if ok then return result end
+  return nil
+end
+
+local function serialize_model()
+  local data = { version = 1, tags = {}, states = {}, marks = {} }
+  local ordinals = {}
+  for tag_id, state in pairs(model.tags) do
+    local ordinal = model.tag_ordinal and model.tag_ordinal[tag_id]
+    if ordinal then
+      local strips, current = {}, 1
+      for _, strip in ipairs(state.strips) do
+        local roots = {}
+        for _, slot in ipairs(strip.roots) do
+          local saved = serialize_tree(slot.node)
+          if saved then
+            local entry = plain_fields(slot)
+            entry.node = saved
+            roots[#roots + 1] = entry
+          end
+        end
+        if #roots > 0 then
+          strips[#strips + 1] = { roots = roots }
+          if strip == state.current then current = #strips end
+        end
+      end
+      if #strips > 0 then
+        ordinals[#ordinals + 1] = ordinal
+        data.tags[ordinal] = { ordinal = ordinal, current = current, strips = strips }
+      end
+    end
+  end
+  for window, fact in pairs(model.windows) do
+    local leaf = node(model.window_nodes[window])
+    if leaf and leaf.state ~= "tiled" and (fact.identifier or "") ~= "" then
+      data.states[fact.identifier] = leaf.state
+    end
+  end
+  for name, mark in pairs(model.marks) do
+    local target = mark.target
+    local fact = target and target.kind == "window" and model.windows[target.window]
+    local ordinal = model.tag_ordinal and model.tag_ordinal[mark.tag]
+    if fact and (fact.identifier or "") ~= "" and ordinal then
+      data.marks[name] = { window = fact.identifier, tag = ordinal }
+    end
+  end
+  -- Tags are a list in ordinal order, not a sparse table.
+  table.sort(ordinals)
+  local tags = {}
+  for _, ordinal in ipairs(ordinals) do tags[#tags + 1] = data.tags[ordinal] end
+  data.tags = tags
+  local out = {}
+  json_encode(data, out)
+  return table.concat(out)
+end
+
+-- The text to persist, or nil when nothing worth writing has changed.
+local function save()
+  if not model.dirty then return nil end
+  model.dirty = false
+  local text = serialize_model()
+  if text == model.saved_text then return nil end
+  model.saved_text = text
+  return text
+end
+
+-- Read a previous session's file.
+local function restore(text)
+  local data = json_decode(text)
+  if type(data) ~= "table" or data.version ~= 1 then return false end
+  model.saved = data
+  return true
+end
+
+-- Rebuild the saved arrangement over the windows that are present now. This is
+-- best effort, piece by piece: a tag, a subtree, a mark or a window's state that
+-- makes no sense is skipped and everything else still applies.
+local function restore_saved_unchecked(snapshot)
+  local saved = model.saved
+  local present = {}
+  for _, fact in ipairs(snapshot.windows or {}) do
+    if (fact.identifier or "") ~= "" and fact.lifecycle ~= "closed" then present[fact.identifier] = fact end
+  end
+  -- Windows may not have been announced yet; keep waiting for the first batch.
+  if next(present) == nil then return end
+  model.saved = nil
+
+  -- Numbers from a file may be anything; keep them finite and in range.
+  local function number_in(value, low, high, fallback)
+    if type(value) ~= "number" or value ~= value then return fallback end
+    return clamp(value, low, high)
+  end
+  local function list(value) return type(value) == "table" and value or {} end
+  local known_states = { tiled = true, floating = true, fullscreen = true }
+  local used = {} -- a window has one place; repeats in the file are dropped
+
+  local function build(tree, tag_id, depth)
+    if type(tree) ~= "table" or depth > MAX_JSON_DEPTH then return nil end
+    if tree.window ~= nil then
+      local fact = present[tree.window]
+      -- A window now on another tag has lost its place here.
+      if not fact or fact.tag ~= tag_id or used[fact.id] then return nil end
+      used[fact.id] = true
+      local leaf = node(model.window_nodes[fact.id]) or new_leaf(fact.id)
+      apply_fields(leaf, tree)
+      if not known_states[leaf.state] then leaf.state = classify(fact) end
+      leaf.tag = fact.tag
+      return leaf
+    end
+    local children = {}
+    for _, child in ipairs(list(tree.children)) do
+      local built = type(child) == "table" and build(child.node, tag_id, depth + 1)
+      if built then
+        local entry = { node = built.id }
+        apply_fields(entry, child)
+        entry.weight = number_in(entry.weight, 0.2, 5, 1)
+        children[#children + 1] = entry
+      end
+    end
+    if #children == 0 then return nil end
+    if #children == 1 then
+      local only = node(children[1].node)
+      only.parent = nil
+      return only
+    end
+    local group = new_group()
+    apply_fields(group, tree)
+    group.mode = group.mode == "tabbed" and "tabbed" or "split"
+    group.axis = group.axis == "horizontal" and "horizontal" or "vertical"
+    group.children, group.active = children, math.floor(number_in(group.active, 1, #children, 1))
+    for _, child in ipairs(children) do node(child.node).parent = group.id end
+    return group
+  end
+
+  local function restore_tag(saved_tag)
+    local tag_id = model.tag_by_ordinal and model.tag_by_ordinal[saved_tag.ordinal]
+    if not tag_id then return end
+    local strips, current = {}, nil
+    for index, saved_strip in ipairs(list(saved_tag.strips)) do
+      local strip = new_strip()
+      for _, saved_root in ipairs(list(list(saved_strip).roots)) do
+        local built = type(saved_root) == "table" and build(saved_root.node, tag_id, 1)
+        if built then
+          local slot = { node = built.id }
+          apply_fields(slot, saved_root)
+          slot.width = number_in(slot.width, min_root_width, max_root_width, 0.5)
+          strip.roots[#strip.roots + 1] = slot
+        end
+      end
+      if #strip.roots > 0 then
+        strips[#strips + 1] = strip
+        if index == saved_tag.current then current = strip end
+      end
+    end
+    if #strips > 0 then
+      local state = tag_state(tag_id)
+      state.strips, state.current = strips, current or strips[1]
+    end
+  end
+
+  for _, saved_tag in ipairs(list(saved.tags)) do
+    if type(saved_tag) == "table" then
+      -- If one tag's data defeats us, forget what it built and carry on with the rest.
+      local first_node = model.next_node_id
+      local before = {}
+      for id in pairs(used) do before[id] = true end
+      if not pcall(restore_tag, saved_tag) then
+        for id, item in pairs(model.nodes) do
+          if id >= first_node then
+            model.nodes[id] = nil
+            if item.kind == "window" then model.window_nodes[item.window] = nil end
+          end
+        end
+        for id in pairs(used) do if not before[id] then used[id] = nil end end
+      end
+    end
+  end
+  -- Windows that were floating or fullscreen have no place in a strip.
+  for identifier, state_name in pairs(list(saved.states)) do
+    local fact = present[identifier]
+    if fact and not node(model.window_nodes[fact.id]) then
+      local leaf = new_leaf(fact.id)
+      leaf.state, leaf.tag = known_states[state_name] and state_name or classify(fact), fact.tag
+    end
+  end
+  for name, mark in pairs(list(saved.marks)) do
+    local fact = type(mark) == "table" and present[mark.window]
+    if fact then
+      model.marks[name] = { tag = fact.tag, target = { kind = "window", window = fact.id }, anchor_window = fact.id }
+    end
+  end
+end
+
+-- Last resort, for a failure the piecewise handling above did not anticipate:
+-- throw away whatever was built and start as a new session.
+local function restore_saved(snapshot)
+  local ok = pcall(restore_saved_unchecked, snapshot)
+  if ok then return end
+  model.saved = nil
+  model.tags, model.nodes, model.window_nodes, model.marks = {}, {}, {}, {}
+end
+
+
+local function sync(snapshot)
+  -- Tag ordinals are what persist across restarts (ids do not).
+  model.tag_ordinal, model.tag_by_ordinal = {}, {}
+  for ordinal, tag in ipairs(snapshot.tags or {}) do
+    model.tag_ordinal[tag.id], model.tag_by_ordinal[ordinal] = ordinal, tag.id
+  end
+  -- Window facts only change when the world does, and every output asks with the
+  -- same epoch, so reconciling the model with them happens once per change
+  -- rather than once per call (per output, per animation frame).
+  if model.synced_epoch ~= snapshot.epoch then
+    model.synced_epoch = snapshot.epoch
+    model.dirty = true
+    if model.saved then restore_saved(snapshot) end
+    local seen = {}
+    -- Which roots are already placed in a strip, found in one pass: asking
+    -- root_location per window would scan every strip for each of them.
+    local placed = {}
+    for _, state in pairs(model.tags) do
+      for _, strip in ipairs(state.strips) do
+        for _, slot in ipairs(strip.roots) do placed[slot.node] = true end
+      end
+    end
+    for _, fact in ipairs(snapshot.windows or {}) do
+      seen[fact.id], model.windows[fact.id] = true, fact
+      if fact.lifecycle ~= "closed" then
+        local leaf = node(model.window_nodes[fact.id]) or new_leaf(fact.id)
+        leaf.state = leaf.state or classify(fact)
+        leaf.tag = leaf.tag or fact.tag
+        local state = tag_state(fact.tag)
+        local root = containing_root(leaf.id)
+        local owner = root and placed[root.id]
+        if leaf.state == "tiled" and not owner then
+          local strip, index = current_insertion(state,
+            snapshot.tag.id == fact.tag and snapshot.tag.focused_window or nil)
+          attach_root(state, strip, leaf.id, index, 0.5)
+          placed[leaf.id] = true
+        elseif leaf.state ~= "tiled" and owner then
+          detach(root.id)
+          placed[root.id] = nil
+        end
+      end
+    end
+    local stale = {}
+    for window in pairs(model.windows) do if not seen[window] then stale[#stale + 1] = window end end
+    for _, window in ipairs(stale) do remove_window(window) end
+  end
   for _, state in pairs(model.tags) do compact_strips(state) end
   local state, focused = tag_state(snapshot.tag.id), snapshot.tag.focused_window
   if state.focus and state.focus_anchor ~= focused then state.focus, state.focus_anchor = nil, nil end
@@ -446,6 +856,79 @@ local function resolve_tag(snapshot, ordinal)
   return type(value) == "table" and value.id or value
 end
 
+-- Focus moves to `output`: to the model's remembered window for its active
+-- tag, else its first window. If the monitor has no window it is focused on
+-- its own (keyboard focus clears). Only windows the compositor actually shows
+-- there qualify (a window is on whichever output shows its tag).
+local function focus_output(snapshot, output, exclude)
+  local visible, first = {}, nil
+  for _, fact in ipairs(snapshot.windows or {}) do
+    if fact.lifecycle == "managed" and fact.tag == output.active_tag and not (exclude and exclude[fact.id]) then
+      visible[fact.id] = true
+      first = first or fact.id
+    end
+  end
+  local wanted
+  local state = tag_state(output.active_tag)
+  local strips = { state.current }
+  for _, strip in ipairs(state.strips) do strips[#strips + 1] = strip end
+  for _, strip in ipairs(strips) do
+    for _, slot in ipairs(strip.roots) do
+      local leaf = active_leaf(slot.node)
+      if leaf and leaf.window and visible[leaf.window] then wanted = leaf.window; break end
+    end
+    if wanted then break end
+  end
+  wanted = wanted or first
+  if wanted then return { { name = "focus-window", window = wanted } } end
+  return { { name = "focus-output", output = output.id } }
+end
+
+-- Monitors in physical reading order, so "next" means the one to the right.
+local function outputs_by_position(snapshot)
+  local list = {}
+  for _, output in ipairs(snapshot.outputs or {}) do list[#list + 1] = output end
+  table.sort(list, function(a, b)
+    if a.bounds.x ~= b.bounds.x then return a.bounds.x < b.bounds.x end
+    if a.bounds.y ~= b.bounds.y then return a.bounds.y < b.bounds.y end
+    return a.id < b.id
+  end)
+  return list
+end
+
+-- The nearest monitor in `direction` from the focused one, preferring one
+-- that shares an edge over one that only lies that way.
+local function output_toward(snapshot, direction)
+  local from = snapshot.output.bounds
+  local horizontal = direction == "left" or direction == "right"
+  local best, best_key
+  for _, output in ipairs(snapshot.outputs or {}) do
+    if output.id ~= snapshot.output.id then
+      local b = output.bounds
+      local distance
+      if direction == "left" then distance = from.x - (b.x + b.width)
+      elseif direction == "right" then distance = b.x - (from.x + from.width)
+      elseif direction == "up" then distance = from.y - (b.y + b.height)
+      else distance = b.y - (from.y + from.height) end
+      if distance >= 0 then
+        local low = math.max(horizontal and from.y or from.x, horizontal and b.y or b.x)
+        local high = math.min(horizontal and from.y + from.height or from.x + from.width,
+          horizontal and b.y + b.height or b.x + b.width)
+        local overlap = math.max(0, high - low)
+        local key = { overlap > 0 and 0 or 1, distance, -overlap }
+        local better = not best_key
+        if best_key then
+          for i = 1, 3 do
+            if key[i] ~= best_key[i] then better = key[i] < best_key[i]; break end
+          end
+        end
+        if better then best, best_key = output, key end
+      end
+    end
+  end
+  return best
+end
+
 local function mutate_action(snapshot, request)
   local state = sync(snapshot)
   local target, name = focused_descriptor(state, snapshot), request.name
@@ -507,6 +990,13 @@ local function mutate_action(snapshot, request)
   if name == "focus-tag" then
     local id = resolve_tag(snapshot, request.args[1])
     if not id then return {} end
+    -- A tag is shown on one output at a time: asking for one that another
+    -- output shows just moves focus there.
+    for _, output in ipairs(snapshot.outputs or {}) do
+      if output.id ~= snapshot.output.id and output.active_tag == id then
+        return focus_output(snapshot, output)
+      end
+    end
     local destination, result = tag_state(id), { { name = "set-active-tag", output = snapshot.output.id, tag = id } }
     local windows = target_windows(destination, destination.focus)
     if windows[1] then result[#result + 1] = { name = "focus-window", window = windows[1] } end
@@ -516,7 +1006,15 @@ local function mutate_action(snapshot, request)
     local id = resolve_tag(snapshot, request.args[1])
     if not id then return {} end
     local destination = tag_state(id)
-    return move_effects(move_target(state, target, destination, destination.current), id, nil)
+    local moved = move_target(state, target, destination, destination.current)
+    local result = move_effects(moved, id, nil)
+    if id ~= snapshot.tag.id then
+      -- The windows leave this monitor; keyboard focus stays on it.
+      local leaving = {}
+      for _, window in ipairs(moved) do leaving[window] = true end
+      for _, effect in ipairs(focus_output(snapshot, snapshot.output, leaving)) do result[#result + 1] = effect end
+    end
+    return result
   end
   if name == "cycle-container-mode" then
     local current = descriptor_node(target)
@@ -567,18 +1065,12 @@ local function mutate_action(snapshot, request)
     return result
   end
   if name == "focus-output-next" or name == "focus-output-prev" then
-    local outputs, current_index = snapshot.outputs or {}, nil
+    local outputs, current_index = outputs_by_position(snapshot), nil
     for index, output in ipairs(outputs) do if output.id == snapshot.output.id then current_index = index end end
     if not current_index or #outputs < 2 then return {} end
     local step = name == "focus-output-next" and 1 or -1
     local destination = outputs[(current_index - 1 + step) % #outputs + 1]
-    local destination_state = tag_state(destination.active_tag)
-    local windows = target_windows(destination_state, destination_state.focus)
-    local wanted = windows[1]
-    if not wanted then for _, tag in ipairs(snapshot.tags or {}) do
-      if tag.id == destination.active_tag then wanted = tag.focused_window end
-    end end
-    return wanted and { { name = "focus-window", window = wanted } } or {}
+    return focus_output(snapshot, destination)
   end
 
   local verb, direction = name:match("^(focus)%-(.+)$")
@@ -593,7 +1085,10 @@ local function mutate_action(snapshot, request)
     if start then adjacent, crossed, crossed_strip, crossed_index = neighbor(state, start.id, direction) end
     if verb == "focus" then
       set_focus(state, nil, snapshot)
-      return adjacent and { { name = "focus-window", window = adjacent.window } } or {}
+      if adjacent then return { { name = "focus-window", window = adjacent.window } } end
+      -- Past the edge of this monitor: continue onto the neighbouring one.
+      local toward = output_toward(snapshot, direction)
+      return toward and focus_output(snapshot, toward) or {}
     end
     if not current then return {} end
     if crossed then
@@ -674,6 +1169,7 @@ local function finish_actions(commit)
   assert(action_checkpoint ~= nil, "no action batch active")
   if not commit then model = action_checkpoint end
   action_checkpoint = nil
+  if commit then model.dirty = true end
 end
 
 local function ease_out_cubic(progress)
@@ -857,8 +1353,12 @@ local function layout(snapshot)
     and viewport_cross - 2 * (outer_gap + peek + border_width + inner_gap)
     or viewport_cross - 2 * outer_gap - border_width)
   local entries, strip_metrics, cross_cursor, z = {}, {}, outer_gap, 1
+  -- Which strip holds each root, recorded as strips are laid out so placing an
+  -- entry never has to search for it.
+  local strip_of_root = {}
   for strip_index, strip in ipairs(state.strips) do
     local strip_cross, main_cursor, metrics = base_cross, outer_gap, {}
+    for _, slot in ipairs(strip.roots) do strip_of_root[slot.node] = strip end
     for _, slot in ipairs(strip.roots) do
       local minimum = minimum_for(slot.node)
       strip_cross = math.max(strip_cross,
@@ -936,8 +1436,7 @@ local function layout(snapshot)
     local fact = model.windows[entry.window] or {}
     local leaf = node(model.window_nodes[entry.window])
     local root = containing_root(model.window_nodes[entry.window])
-    local strip
-    if root then local _; _, strip = root_location(root.id) end
+    local strip = root and strip_of_root[root.id]
     local frame = entry.frame
     if entry.state == "tiled" and leaf then
       local moving_x, moving_y
@@ -958,6 +1457,11 @@ local function layout(snapshot)
       or { x = 0, y = 0, width = 0, height = 0 }
     entry.window_clip = entry.visible and clipped(entry.screen, usable, true)
       or { x = 0, y = 0, width = 0, height = 0 }
+    -- River treats an empty clip box as "no clip", so a window with nothing
+    -- left inside this monitor would be drawn in full on its neighbour. Hide it.
+    if entry.visible and (entry.clip.width == 0 or entry.window_clip.width == 0) then
+      entry.visible = false
+    end
     local focused = entry.window == snapshot.tag.focused_window
     entry.border = {
       edges = 0xf, width = border_width,
@@ -1073,4 +1577,5 @@ end
 return {
   layout = layout, action = action, project = project,
   begin_actions = begin_actions, finish_actions = finish_actions,
+  save = save, restore = restore,
 }

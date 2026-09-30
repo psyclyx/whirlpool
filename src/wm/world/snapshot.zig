@@ -33,6 +33,10 @@ pub fn View(comptime World: type) type {
             return self.world.focusedWindow();
         }
 
+        pub fn focusedOutput(self: Self) ?ids.OutputId {
+            return self.world.focusedOutput();
+        }
+
         pub fn tagAt(self: Self, ordinal: usize) ?ids.TagId {
             return self.world.tagAt(ordinal);
         }
@@ -47,6 +51,10 @@ pub fn View(comptime World: type) type {
 
         pub fn firstOutput(self: Self) ?ids.OutputId {
             return self.world.firstOutput();
+        }
+
+        pub fn windowOutput(self: Self, id: ids.WindowId) ?ids.OutputId {
+            return self.world.windowOutput(id);
         }
 
         pub fn liveOutputCount(self: Self) usize {
@@ -108,6 +116,10 @@ pub fn Checkpoint(comptime World: type) type {
             return self.state.world.focusedWindow();
         }
 
+        pub fn focusedOutput(self: *const Self) ?ids.OutputId {
+            return self.state.world.focusedOutput();
+        }
+
         pub fn tagAt(self: *const Self, ordinal: usize) ?ids.TagId {
             return self.state.world.tagAt(ordinal);
         }
@@ -122,6 +134,10 @@ pub fn Checkpoint(comptime World: type) type {
 
         pub fn firstOutput(self: *const Self) ?ids.OutputId {
             return self.state.world.firstOutput();
+        }
+
+        pub fn windowOutput(self: *const Self, id: ids.WindowId) ?ids.OutputId {
+            return self.state.world.windowOutput(id);
         }
 
         pub fn liveOutputCount(self: *const Self) usize {
