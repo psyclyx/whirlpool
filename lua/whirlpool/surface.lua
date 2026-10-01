@@ -13,9 +13,19 @@ function surface.on(service, handler)
   surface.handlers[service] = handler
 end
 
+-- Each value of an update is delivered in order: most services send one (an
+-- object of named fields), event services such as `pointer` one per event.
 function surface.dispatch(service, values)
   local handler = surface.handlers[service]
-  if handler then handler(values, service) end
+  if not handler then return end
+  for _, value in ipairs(values) do handler(value, service) end
+end
+
+-- Ask the host to do something, e.g. `surface.act("layout", "focus-window", id)`
+-- or `surface.act("spawn", "foot")`. Arguments are strings (numbers convert).
+-- The host decides what each name means; unknown ones are ignored.
+function surface.act(name, ...)
+  whirlpool_native_act(name, ...)
 end
 
 return surface

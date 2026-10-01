@@ -2,7 +2,6 @@ const std = @import("std");
 const graphics = @import("whirlpool-graphics");
 const host = @import("whirlpool-host");
 const script = @import("whirlpool-script");
-const status = @import("whirlpool-app-status");
 
 const warmup_iterations = 20;
 const measured_iterations = 200;
@@ -13,9 +12,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
     var example_modules = try script.modules.collect(allocator, init.io, "config");
     defer example_modules.deinit();
-    var shell = try host.surface_composition.Composition.init(allocator, example_modules.modules,
-        \\return require("lib.bar")
-    );
+    var shell = try host.surface_composition.Composition.initModule(allocator, example_modules.modules, "lib.bar", "{}");
     defer shell.deinit();
     try populate(&shell);
 
@@ -33,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
         const update_start = std.Io.Clock.awake.now(init.io);
         try shell.update(.{
             .service = "frame",
-            .values = &.{.{ .number = @floatFromInt(index * 16) }},
+            .values = &.{.{ .object = &.{.{ .key = "now", .value = .{ .number = 16_000 + @as(f64, @floatFromInt(index * 16)) } }} }},
         });
         const lower_start = std.Io.Clock.awake.now(init.io);
         var frame = try shell.lower(.{ .width = viewport_width, .height = viewport_height });
@@ -117,39 +114,41 @@ fn measureDraw(io: std.Io, renderer: *graphics.skia.Renderer, list: graphics.ski
     return @as(f64, @floatFromInt(total_ns)) / measured_iterations;
 }
 
+/// A desktop with two windows and steady CPU and network history: what a
+/// host feeds the bar between frames.
 fn populate(shell: *host.surface_composition.Composition) !void {
-    const first_window = [_]script.program_loader.Value{
-        .{ .string = "window" }, .{ .string = "" },     .{ .string = "foot" }, .{ .string = "terminal" },
-        .{ .boolean = true },    .{ .number = 148 },    .{ .string = "" },     .{ .string = "" },
-        .{ .number = 0 },        .{ .boolean = false },
-    };
-    const second_window = [_]script.program_loader.Value{
-        .{ .string = "window" }, .{ .string = "" },     .{ .string = "firefox" }, .{ .string = "browser" },
-        .{ .boolean = false },   .{ .number = 148 },    .{ .string = "" },        .{ .string = "" },
-        .{ .number = 152 },      .{ .boolean = false },
-    };
-    const windows = [_]script.program_loader.Value{
-        .{ .array = &first_window },
-        .{ .array = &second_window },
-    };
-    try shell.update(.{
-        .service = "desktop",
-        .values = &.{
-            .{ .number = 1 },   .{ .array = &.{} }, .{ .array = &windows }, .{ .number = 0 },
-            .{ .number = 300 }, .{ .number = 0 },   .{ .number = 0 },
-        },
-    });
-
-    var snapshot = status.Snapshot{};
-    snapshot.cpu_core_count = 32;
-    snapshot.cpu_core_equivalents = 1.25;
-    snapshot.cpu_cores[0] = 100;
-    snapshot.cpu_cores[1] = 25;
-    snapshot.cpu_sample_sequence = 1;
-    snapshot.network_sample_sequence = 1;
-    for (&snapshot.cpu_history) |*sample| sample.* = 1.25;
-    for (&snapshot.network_rx_history) |*sample| sample.* = 256 * 1024;
-    for (&snapshot.network_tx_history) |*sample| sample.* = 128 * 1024;
-    var storage: status.StatusValues(script.program_loader.Value) = .{};
-    try shell.update(.{ .service = "status", .values = storage.build(&snapshot) });
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const b = host.values.Builder{ .arena = arena };
+    const window = struct {
+        fn make(builder: host.values.Builder, id: []const u8, app_id: []const u8, focused: bool) host.values.Value {
+            return builder.object(.{
+                .{ "kind", "window" }, .{ "label", "" }, .{ "detail", "" }, .{ "focused", focused },
+                .{ "overlay", false }, .{ "window", 1 }, .{ "app_id", app_id }, .{ "title", "terminal" },
+                .{ "icon", "" }, .{ "action", "focus-window" }, .{ "args", builder.array(&.{builder.from(id)}) },
+            });
+        }
+    }.make;
+    var tags: [9]host.values.Value = undefined;
+    for (&tags, 0..) |*tag, index| tag.* = b.object(.{ .{ "occupied", index < 2 }, .{ "active", index == 0 } });
+    try shell.update(.{ .service = "desktop", .values = &.{b.object(.{
+        .{ "tag", 1 }, .{ "focused", true }, .{ "tags", b.array(&tags) },
+        .{ "items", b.array(&.{ window(b, "1", "foot", true), window(b, "2", "firefox", false) }) },
+    })} });
+    const t = host.values.times(arena, 0, 500, 32);
+    const busy = [_]f64{1.25} ** 32;
+    var cores = [_]f64{0} ** 32;
+    cores[0] = 100;
+    cores[1] = 25;
+    try shell.update(.{ .service = "cpu", .values = &.{b.object(.{
+        .{ "t", b.numbers(t) }, .{ "busy", b.numbers(&busy) }, .{ "percent", b.numbers(&busy) },
+        .{ "count", 32 }, .{ "cores", b.numbers(&cores) },
+    })} });
+    const rx = [_]f64{256 * 1024} ** 32;
+    const tx = [_]f64{128 * 1024} ** 32;
+    try shell.update(.{ .service = "network", .values = &.{b.object(.{
+        .{ "t", b.numbers(t) }, .{ "rx", b.numbers(host.values.counter(arena, &rx, 500)) },
+        .{ "tx", b.numbers(host.values.counter(arena, &tx, 500)) }, .{ "interface", "eth0" },
+    })} });
 }

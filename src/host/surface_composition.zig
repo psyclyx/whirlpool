@@ -8,6 +8,8 @@ const std = @import("std");
 const script = @import("whirlpool-script");
 const lua_composition = @import("lua/composition.zig");
 
+pub const Action = lua_composition.Action;
+
 pub const Composition = struct {
     vm: script.program_loader.Vm,
     program: script.program_loader.Program,
@@ -19,11 +21,15 @@ pub const Composition = struct {
     pub fn init(allocator: std.mem.Allocator, modules: []const script.modules.Module, source: []const u8) !Composition {
         var vm = try script.program_loader.Vm.init(true);
         errdefer vm.deinit();
-        // Surface programs are policy callbacks, not data providers. Removing
-        // these libraries makes accidental file/process/timer I/O impossible
-        // in the controller lane; application services must supply values.
+        // Surface programs are policy callbacks, not data providers: no file,
+        // process or environment access, so they cannot block a render worker.
+        // Data comes from host services. Reading the clock is not I/O, so `os`
+        // keeps its time functions (a clock is formatted with `os.date`).
         vm.removeGlobal("io");
-        vm.removeGlobal("os");
+        try vm.run(
+            \\local date, time, clock, difftime = os.date, os.time, os.clock, os.difftime
+            \\os = { date = date, time = time, clock = clock, difftime = difftime }
+        , "=whirlpool.sandbox");
 
         const loader = script.program_loader.Loader.init(allocator, .{});
         var program = try loader.loadShared("surface", &.{.{ .name = "surface", .source = source }}, modules);
@@ -31,6 +37,14 @@ pub const Composition = struct {
 
         const retained = try lua_composition.Composition.mount(allocator, &vm, &program, .{});
         return .{ .vm = vm, .program = program, .retained = retained };
+    }
+
+    /// Mount content module `name` exactly as a configured surface would,
+    /// with options given as a Lua literal (e.g. "{}").
+    pub fn initModule(allocator: std.mem.Allocator, modules: []const script.modules.Module, name: []const u8, options: []const u8) !Composition {
+        const entry = try script.config.surfaceEntry(allocator, name, options);
+        defer allocator.free(entry);
+        return init(allocator, modules, entry);
     }
 
     pub fn deinit(self: *Composition) void {
@@ -56,6 +70,17 @@ pub const Composition = struct {
         return self.retained.lower(viewport);
     }
 
+    /// Actions the surface program requested since the last call; the caller
+    /// owns them (free each with `deinit(allocator)`).
+    pub fn takeActions(self: *Composition) ![]Action {
+        return self.retained.takeActions();
+    }
+
+    /// The surface's size, so geometry queries work before the first frame.
+    pub fn setViewport(self: *Composition, viewport: @import("skia_scene.zig").Viewport) void {
+        self.retained.viewport = viewport;
+    }
+
     /// Measure text with the fonts of the renderer that will draw it.
     pub fn setTextMetrics(self: *Composition, metrics: @import("whirlpool-graphics").skia.TextMetrics) void {
         self.retained.setMeasurer(@import("skia_scene.zig").measurer(metrics));
@@ -79,7 +104,8 @@ test "surface composition mounts retained Lua source" {
 test "surface composition cannot perform file or process I/O" {
     var composition = try Composition.init(std.testing.allocator, testModules(),
         \\assert(io == nil)
-        \\assert(os == nil)
+        \\assert(os.execute == nil and os.getenv == nil and os.remove == nil)
+        \\assert(type(os.date("%H")) == "string")
         \\return function(root)
         \\  root:text({ text = string.format("%s", "pure") })
         \\  return { update = function() end }
@@ -106,870 +132,218 @@ test "surface controllers can retain nodes created during later updates" {
     try std.testing.expectEqual(@as(usize, 2), frame.node_count);
 }
 
-test "sample shell and decoration modules mount as distinct compositions" {
-    var shell = try Composition.init(std.testing.allocator, testModules(),
-        \\return require("lib.bar")
-    );
-    defer shell.deinit();
-    var shell_frame = try shell.lower(.{ .width = 800, .height = 600 });
-    defer shell_frame.deinit();
-    try std.testing.expect(shell_frame.node_count > 100);
-    var shell_background: ?@import("whirlpool-graphics").skia.Rect = null;
-    var has_nonrectangular_polygon = false;
-    for (shell_frame.drawList().ops) |operation| switch (operation) {
-        .rect => |rect| if (rect.rect.width == 800 and rect.rect.height == 38) {
-            shell_background = rect.rect;
-        },
-        .polygon => |polygon| {
-            if (polygon.points.len == 4 and
-                polygon.points.points[0].x > polygon.points.points[3].x and
-                polygon.points.points[1].x > polygon.points.points[2].x)
-            {
-                has_nonrectangular_polygon = true;
-            }
-        },
-        .text, .icon, .push_clip, .pop_clip => {},
-    };
-    const background = shell_background orelse return error.MissingShellBackground;
-    try std.testing.expectEqual(@as(f32, 0), background.x);
-    try std.testing.expectEqual(@as(f32, 562), background.y);
-    try std.testing.expect(has_nonrectangular_polygon);
-
-    const window_token = [_]script.program_loader.Value{
-        .{ .string = "window" },
-        .{ .string = "" },
-        .{ .string = "foot" },
-        .{ .string = "terminal" },
-        .{ .boolean = true },
-        .{ .number = 148 },
-        .{ .string = "/icons/foot.svg" },
-        .{ .string = "" },
-        .{ .number = 0 },
-        .{ .boolean = false },
-    };
-    const tokens = [_]script.program_loader.Value{.{ .array = &window_token }};
-    try shell.update(.{
-        .service = "desktop",
-        .values = &.{
-            .{ .number = 1 },
-            .{ .array = &.{} },
-            .{ .array = &tokens },
-            .{ .number = 0 },
-            .{ .number = 148 },
-            .{ .number = 0 },
-            .{ .number = 0 },
-        },
-    });
-    var positioned = try shell.lower(.{ .width = 800, .height = 600 });
-    defer positioned.deinit();
-    var title_x: ?f32 = null;
-    var icon_source: ?[]const u8 = null;
-    for (positioned.drawList().ops) |operation| switch (operation) {
-        .text => |text| if (std.mem.eql(u8, text.text, "terminal")) {
-            title_x = text.x;
-        },
-        .icon => |icon| icon_source = icon.source,
-        .rect, .polygon, .push_clip, .pop_clip => {},
-    };
-    const positioned_title = title_x orelse return error.MissingShellTitle;
-    try std.testing.expect(positioned_title > 100 and positioned_title < 300);
-    try std.testing.expectEqualStrings("/icons/foot.svg", icon_source orelse return error.MissingShellIcon);
-
-    const second_window_token = [_]script.program_loader.Value{
-        .{ .string = "window" },
-        .{ .string = "" },
-        .{ .string = "firefox" },
-        .{ .string = "abcdefghijklm" },
-        .{ .boolean = false },
-        .{ .number = 148 },
-        .{ .string = "/icons/firefox.svg" },
-        .{ .string = "" },
-        .{ .number = 152 },
-        .{ .boolean = false },
-    };
-    const two_tokens = [_]script.program_loader.Value{
-        .{ .array = &window_token },
-        .{ .array = &second_window_token },
-    };
-    try shell.update(.{
-        .service = "desktop",
-        .values = &.{
-            .{ .number = 1 },
-            .{ .array = &.{} },
-            .{ .array = &two_tokens },
-            .{ .number = 0 },
-            .{ .number = 300 },
-            .{ .number = 0 },
-            .{ .number = 0 },
-        },
-    });
-    var two_windows = try shell.lower(.{ .width = 1200, .height = 600 });
-    defer two_windows.deinit();
-    var first_app_x: ?f32 = null;
-    var second_app_x: ?f32 = null;
-    var first_app_baseline: ?f32 = null;
-    var first_title_baseline: ?f32 = null;
-    for (two_windows.drawList().ops) |operation| switch (operation) {
-        .text => |text| {
-            if (std.mem.eql(u8, text.text, "foot")) {
-                first_app_x = text.x;
-                first_app_baseline = text.baseline;
-            }
-            if (std.mem.eql(u8, text.text, "terminal")) first_title_baseline = text.baseline;
-            if (std.mem.eql(u8, text.text, "firefox")) second_app_x = text.x;
-        },
-        .rect, .polygon, .icon, .push_clip, .pop_clip => {},
-    };
-    try std.testing.expect((second_app_x orelse return error.MissingSecondShellWindow) >
-        (first_app_x orelse return error.MissingFirstShellWindow));
-    try std.testing.expect((first_title_baseline orelse return error.MissingFirstShellTitle) >
-        (first_app_baseline orelse return error.MissingFirstShellAppId));
-
-    const insertion_token = [_]script.program_loader.Value{
-        .{ .string = "insertion" }, .{ .string = "" },    .{ .string = "" }, .{ .string = "" },
-        .{ .boolean = false },      .{ .number = 3 },     .{ .string = "" }, .{ .string = "" },
-        .{ .number = 148 },         .{ .boolean = true },
-    };
-    const marked_tokens = [_]script.program_loader.Value{
-        .{ .array = &window_token },
-        .{ .array = &insertion_token },
-        .{ .array = &second_window_token },
-    };
-    try shell.update(.{
-        .service = "desktop",
-        .values = &.{
-            .{ .number = 1 }, .{ .array = &.{} }, .{ .array = &marked_tokens },
-            .{ .number = 0 }, .{ .number = 300 }, .{ .number = 0 },
-            .{ .number = 0 },
-        },
-    });
-    var with_marker = try shell.lower(.{ .width = 1200, .height = 600 });
-    defer with_marker.deinit();
-    var marked_second_x: ?f32 = null;
-    for (with_marker.drawList().ops) |operation| switch (operation) {
-        .text => |text| if (std.mem.eql(u8, text.text, "firefox")) {
-            marked_second_x = text.x;
-        },
-        else => {},
-    };
-    try std.testing.expectEqual(second_app_x.?, marked_second_x orelse return error.MissingSecondShellWindow);
-
-    var cpu_history = [_]script.program_loader.Value{.{ .number = 1 }} ** 24;
-    var cpu_cores = [_]script.program_loader.Value{.{ .number = 0 }} ** 32;
-    cpu_cores[0] = .{ .number = 100 };
-    var rx_history = [_]script.program_loader.Value{.{ .number = 256 * 1024 }} ** 24;
-    var tx_history = [_]script.program_loader.Value{.{ .number = 128 * 1024 }} ** 24;
-    const cpu = [_]script.program_loader.Value{
-        .{ .number = 0 }, .{ .number = 1 }, .{ .number = 32 }, .{ .array = &cpu_cores }, .{ .array = &cpu_history }, .{ .number = 1 },
-    };
-    const network = [_]script.program_loader.Value{
-        .{ .number = 256 * 1024 }, .{ .number = 128 * 1024 }, .{ .array = &rx_history }, .{ .array = &tx_history }, .{ .number = 1 },
-    };
-    try shell.update(.{
-        .service = "status",
-        .values = &.{
-            .{ .string = "12:34" },
-            .{ .string = "Mon" },
-            .{ .string = "2026-09-01" },
-            .{ .array = &cpu },
-            .{ .array = &network },
-        },
-    });
-    try shell.update(.{ .service = "frame", .values = &.{.{ .number = 250 }} });
-    var network_frame = try shell.lower(.{ .width = 1200, .height = 600 });
-    defer network_frame.deinit();
-    var rx_rises_from_center = false;
-    var tx_falls_from_center = false;
-    for (network_frame.drawList().ops) |operation| switch (operation) {
-        .polygon => |polygon| {
-            if (polygon.points.len <= 4) continue;
-            var reaches_center = false;
-            var rises = false;
-            var falls = false;
-            for (polygon.points.points[0..polygon.points.len]) |point| {
-                reaches_center = reaches_center or @abs(point.y - 581) < 0.01;
-                rises = rises or point.y < 580;
-                falls = falls or point.y > 582;
-            }
-            rx_rises_from_center = rx_rises_from_center or (reaches_center and rises);
-            tx_falls_from_center = tx_falls_from_center or (reaches_center and falls);
-        },
-        else => {},
-    };
-    try std.testing.expect(rx_rises_from_center);
-    try std.testing.expect(tx_falls_from_center);
-
-    var decoration = try Composition.init(std.testing.allocator, testModules(),
-        \\return require("lib.decorator")
-    );
-    defer decoration.deinit();
-    try decoration.update(.{
-        .service = "decoration",
-        .values = &.{ .{ .string = "Whirlpool" }, .{ .boolean = true } },
-    });
-    var frame = try decoration.lower(.{ .width = 800, .height = 28 });
-    defer frame.deinit();
-    try std.testing.expect(frame.node_count < 50);
-    try std.testing.expectEqual(@as(usize, 2), frame.operationCount());
-}
-
-fn countPolygonsColored(composition: *Composition, rgb: [3]u8) !usize {
-    var frame = try composition.lower(.{ .width = 800, .height = 600 });
-    defer frame.deinit();
-    var count: usize = 0;
-    for (frame.drawList().ops) |operation| switch (operation) {
-        .polygon => |polygon| {
-            const color = polygon.color;
-            const close = struct {
-                fn eq(actual: f32, expected: u8) bool {
-                    return @abs(actual * 255 - @as(f32, @floatFromInt(expected))) < 1;
-                }
-            };
-            if (close.eq(color.r, rgb[0]) and close.eq(color.g, rgb[1]) and close.eq(color.b, rgb[2])) count += 1;
-        },
-        else => {},
-    };
-    return count;
-}
-
-test "the shell shows the active tag differently on an unfocused monitor" {
-    const accent = [3]u8{ 0x89, 0xb4, 0xfa }; // theme.accent: monitor focused
-    const overlay = [3]u8{ 0x45, 0x47, 0x5a }; // theme.overlay: active tag, monitor not focused
-    const desktop = struct {
-        fn values(focused: bool) [8]script.program_loader.Value {
-            return .{
-                .{ .number = 1 },
-                .{ .array = &.{} },
-                .{ .array = &.{} },
-                .{ .number = 0 },
-                .{ .number = 0 },
-                .{ .number = 0 },
-                .{ .number = 0 },
-                .{ .boolean = focused },
-            };
-        }
-    };
-
-    var shell = try Composition.init(std.testing.allocator, testModules(),
-        \\return require("lib.bar")
-    );
-    defer shell.deinit();
-
-    const focused = desktop.values(true);
-    try shell.update(.{ .service = "desktop", .values = &focused });
-    const accent_focused = try countPolygonsColored(&shell, accent);
-    const overlay_focused = try countPolygonsColored(&shell, overlay);
-
-    const unfocused = desktop.values(false);
-    try shell.update(.{ .service = "desktop", .values = &unfocused });
-    const accent_unfocused = try countPolygonsColored(&shell, accent);
-    const overlay_unfocused = try countPolygonsColored(&shell, overlay);
-
-    // Exactly the active tag's cell changes colour.
-    try std.testing.expectEqual(accent_focused - 1, accent_unfocused);
-    try std.testing.expectEqual(overlay_focused + 1, overlay_unfocused);
-}
-
-// ---------------------------------------------------------------------------
-// Bar layout: the angled design language.
-
-const bar_width = 1500;
-const bar_height = 38;
-const slant = 0.30;
-
+const values = @import("values.zig");
 const Op = @import("whirlpool-graphics").skia.DrawOp;
+const Value = values.Value;
+const bar_width = 900;
+const bar_height = 38;
 
-fn colorNear(color: @import("whirlpool-graphics").skia.Color, rgb: [3]u8) bool {
-    const close = struct {
-        fn eq(actual: f32, expected: u8) bool {
-            return @abs(actual * 255 - @as(f32, @floatFromInt(expected))) < 1;
-        }
-    };
-    return close.eq(color.r, rgb[0]) and close.eq(color.g, rgb[1]) and close.eq(color.b, rgb[2]);
-}
-
-fn findText(ops: []const Op, text: []const u8) ?@FieldType(Op, "text") {
-    for (ops) |operation| switch (operation) {
-        .text => |item| if (std.mem.eql(u8, item.text, text)) return item,
-        else => {},
-    };
+fn findText(frame: *const lua_composition.Frame, text: []const u8) ?@FieldType(Op, "text") {
+    for (frame.drawList().ops) |op| if (op == .text and std.mem.eql(u8, op.text.text, text)) return op.text;
     return null;
 }
 
-/// First four-point polygon of the given colour (a panel outline).
-fn findPanel(ops: []const Op, rgb: [3]u8) ?[4]@import("whirlpool-graphics").skia.Point {
-    for (ops) |operation| switch (operation) {
-        .polygon => |polygon| if (polygon.points.len == 4 and colorNear(polygon.color, rgb))
-            return polygon.points.points[0..4].*,
-        else => {},
-    };
-    return null;
-}
-
-/// Where the parallelogram's left edge is at a given height.
-fn panelLeftAt(panel: [4]@import("whirlpool-graphics").skia.Point, y: f32) f32 {
-    const t = (y - panel[0].y) / (panel[3].y - panel[0].y);
-    return panel[0].x + (panel[3].x - panel[0].x) * t;
-}
-
-/// Where the parallelogram's horizontal middle is at a given height.
-fn panelCenterAt(panel: [4]@import("whirlpool-graphics").skia.Point, y: f32) f32 {
-    // Points run top-left, top-right, bottom-right, bottom-left.
-    const t = (y - panel[0].y) / (panel[3].y - panel[0].y);
-    const left = panel[0].x + (panel[3].x - panel[0].x) * t;
-    const right = panel[1].x + (panel[2].x - panel[1].x) * t;
-    return (left + right) / 2;
-}
-
-fn barShell(desktop_windows: []const script.program_loader.Value) !Composition {
-    var shell = try Composition.init(std.testing.allocator, testModules(),
-        \\return require("lib.bar")
-    );
-    errdefer shell.deinit();
-    try shell.update(.{
-        .service = "desktop",
-        .values = &.{
-            .{ .number = 2 },
-            .{ .array = &.{} },
-            .{ .array = desktop_windows },
-            .{ .number = 0 },
-            .{ .number = 400 },
-            .{ .number = 0 },
-            .{ .number = 0 },
-            .{ .boolean = true },
-        },
-    });
-    return shell;
-}
-
-test "text placed in a tag is centred in the slanted panel, without any per-glyph nudging" {
-    var shell = try barShell(&.{});
-    defer shell.deinit();
-    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
-    defer frame.deinit();
-    const ops = frame.drawList().ops;
-    const panel = findPanel(ops, .{ 0x89, 0xb4, 0xfa }) orelse return error.MissingActiveTag;
-    const label = findText(ops, "2") orelse return error.MissingTagLabel;
-
-    try std.testing.expectEqual(@import("whirlpool-graphics").skia.TextAnchor.center, label.anchor);
-    try std.testing.expectEqual(@import("whirlpool-graphics").skia.TextVertical.middle, label.vertical);
-    const middle = (panel[0].y + panel[3].y) / 2;
-    try std.testing.expectApproxEqAbs(panelCenterAt(panel, middle), label.x, 0.5);
-    try std.testing.expectApproxEqAbs(middle, label.baseline, 0.5);
-}
-
-test "window indicators keep their icon and labels inside the slant with even margins" {
-    const icon = "/icons/foot.svg";
-    const window = [_]script.program_loader.Value{
-        .{ .string = "window" }, .{ .string = "" },     .{ .string = "foot" }, .{ .string = "shell" },
-        .{ .boolean = true },    .{ .number = 200 },    .{ .string = icon },   .{ .string = "" },
-        .{ .number = 0 },        .{ .boolean = false },
-    };
-    const windows = [_]script.program_loader.Value{.{ .array = &window }};
-    var shell = try barShell(&windows);
-    defer shell.deinit();
-    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
-    defer frame.deinit();
-    const ops = frame.drawList().ops;
-
-    var icon_rect: ?@import("whirlpool-graphics").skia.Rect = null;
-    for (ops) |operation| switch (operation) {
-        .icon => |item| icon_rect = item.rect,
-        else => {},
-    };
-    const rect = icon_rect orelse return error.MissingWindowIcon;
-    // Vertically centred in the bar.
-    try std.testing.expectApproxEqAbs(@as(f32, bar_height) / 2, rect.y + rect.height / 2, 0.5);
-    // theme.blend(accent, 112) over the bar background: the focused window's panel.
-    const panel = findPanel(ops, .{ 77, 96, 136 }) orelse return error.MissingWindowPanel;
-    // The icon clears the slanted left edge along its whole height: the margin
-    // at its top (where the edge leans furthest in) is the body inset, and the
-    // bottom corner is further out only by the slant's own travel.
-    const margin_top = rect.x - panelLeftAt(panel, rect.y);
-    const margin_bottom = rect.x - panelLeftAt(panel, rect.y + rect.height);
-    try std.testing.expect(margin_top >= 8 and margin_top < 14);
-    try std.testing.expectApproxEqAbs(slant * rect.height, margin_bottom - margin_top, 0.5);
-
-    const app = findText(ops, "foot") orelse return error.MissingWindowLabel;
-    const title = findText(ops, "shell") orelse return error.MissingWindowTitle;
-    // Eight pixels between the icon and the label beside it.
-    try std.testing.expectApproxEqAbs(rect.x + rect.width + 8, app.x, 0.5);
-    try std.testing.expectApproxEqAbs(app.x, title.x, 0.01);
-    // The two lines straddle the bar's middle.
-    try std.testing.expect(app.baseline < @as(f32, bar_height) / 2 and title.baseline > @as(f32, bar_height) / 2 - 1);
-}
-
-test "level bars are flush with the panel's slanted edge" {
-    var shell = try barShell(&.{});
-    defer shell.deinit();
-    try shell.update(.{ .service = "frame", .values = &.{.{ .number = 0 }} });
-    const audio = [_]script.program_loader.Value{ .{ .number = 63 }, .{ .boolean = false }, .{ .boolean = false } };
-    try shell.update(.{
-        .service = "status",
-        .values = &.{
-            .{ .string = "12:34" }, .{ .string = "Mon" }, .{ .string = "2026-09-01" },
-            .{ .array = &.{} },     .{ .array = &.{} },   .{ .array = &audio },
-        },
-    });
-    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
-    defer frame.deinit();
-    const ops = frame.drawList().ops;
-    // The purple level fill and the purple panel it sits in.
-    const purple = [3]u8{ 0xcb, 0xa6, 0xf7 };
-    // theme.blend(purple) over the bar background: 100/255 of purple.
-    const panel_color = [3]u8{ 98, 83, 125 };
-    var fill: ?[4]@import("whirlpool-graphics").skia.Point = null;
-    for (ops) |operation| switch (operation) {
-        .polygon => |polygon| if (fill == null and polygon.points.len == 4 and colorNear(polygon.color, purple) and polygon.color.a > 0.9) {
-            fill = polygon.points.points[0..4].*;
-        },
-        else => {},
-    };
-    const level = fill orelse return error.MissingLevelFill;
-    // Bottom-left of the fill is the panel's bottom-left; its left edge leans
-    // by the panel slant, and the fill's height is the level.
-    const panel = findPanel(ops, panel_color) orelse return error.MissingAudioPanel;
-    const rise = level[3].y - level[0].y;
-    // Both left vertices of the fill lie on the panel's own left edge.
-    for ([_]usize{ 0, 3 }) |index| {
-        const t = (level[index].y - panel[0].y) / (panel[3].y - panel[0].y);
-        const edge = panel[0].x + (panel[3].x - panel[0].x) * t;
-        try std.testing.expectApproxEqAbs(edge, level[index].x, 0.5);
-    }
-    try std.testing.expectApproxEqAbs(@as(f32, bar_height) * 0.63, rise, 1.5);
-    try std.testing.expectApproxEqAbs(slant, (level[0].x - level[3].x) / rise, 0.01);
-}
-
-const Feed = struct {
+const BarTest = struct {
+    arena: std.heap.ArenaAllocator,
     shell: Composition,
-    history: [24]script.program_loader.Value,
-    sequence: f64 = 0,
+    now: f64 = 1000,
 
-    fn init() !Feed {
-        return .{ .shell = try barShell(&.{}), .history = [_]script.program_loader.Value{.{ .number = 0 }} ** 24 };
+    fn init(self: *BarTest) !void {
+        self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        self.shell = try Composition.initModule(std.testing.allocator, testModules(), "lib.bar", "{}");
+        self.shell.setViewport(.{ .width = bar_width, .height = bar_height });
     }
 
-    fn deinit(self: *Feed) void {
+    fn deinit(self: *BarTest) void {
         self.shell.deinit();
+        self.arena.deinit();
     }
 
-    /// One 500ms status sample at time `at_ms` with network receive rate `rate`.
-    fn sample(self: *Feed, at_ms: f64, rate: f64) !void {
-        self.sequence += 1;
-        for (&self.history) |*value| value.* = .{ .number = rate };
-        const network = [_]script.program_loader.Value{
-            .{ .number = rate }, .{ .number = 0 }, .{ .array = &self.history }, .{ .array = &self.history }, .{ .number = self.sequence },
-        };
-        try self.shell.update(.{ .service = "frame", .values = &.{.{ .number = at_ms }} });
-        try self.shell.update(.{
-            .service = "status",
-            .values = &.{
-                .{ .string = "12:34" }, .{ .string = "Mon" },   .{ .string = "2026-09-01" },
-                .{ .array = &.{} },     .{ .array = &network },
-            },
+    fn b(self: *BarTest) values.Builder {
+        return .{ .arena = self.arena.allocator() };
+    }
+
+    fn send(self: *BarTest, service: []const u8, value: Value) !void {
+        try self.shell.update(.{ .service = service, .values = &.{value} });
+    }
+
+    fn frame(self: *BarTest, advance: f64) !void {
+        self.now += advance;
+        try self.send("frame", self.b().object(.{.{ "now", self.now }}));
+    }
+
+    fn lower(self: *BarTest) !lua_composition.Frame {
+        return self.shell.lower(.{ .width = bar_width, .height = bar_height });
+    }
+
+    fn pointer(self: *BarTest, kind: []const u8, x: f64, y: f64, pressed: bool, dy: f64) !void {
+        try self.send("pointer", self.b().object(.{
+            .{ "type", kind }, .{ "x", x }, .{ "y", y }, .{ "button", 0x110 },
+            .{ "pressed", pressed }, .{ "dx", 0 }, .{ "dy", dy },
+        }));
+    }
+
+    fn window(self: *BarTest, id: u32, app_id: []const u8, focused: bool) Value {
+        const b_ = self.b();
+        const id_text = std.fmt.allocPrint(self.arena.allocator(), "{d}", .{id}) catch unreachable;
+        return b_.object(.{
+            .{ "kind", "window" },  .{ "label", "" },        .{ "detail", "" },
+            .{ "focused", focused }, .{ "overlay", false },  .{ "window", id },
+            .{ "app_id", app_id },   .{ "title", "a title" }, .{ "icon", "" },
+            .{ "action", "focus-window" }, .{ "args", b_.array(&.{b_.from(id_text)}) },
         });
     }
 
-    fn frame(self: *Feed, at_ms: f64) !void {
-        try self.shell.update(.{ .service = "frame", .values = &.{.{ .number = at_ms }} });
-    }
-
-    /// How intense the receive heat cells are, 0..1: how far their colour has
-    /// moved from the panel colour towards the receive colour (judged by red).
-    fn receiveLevel(self: *Feed) !f32 {
-        var frame_value = try self.shell.lower(.{ .width = bar_width, .height = bar_height });
-        defer frame_value.deinit();
-        const panel_red: f32 = (148.0 * 100.0 + 30.0 * 155.0) / 255.0;
-        const fill_red: f32 = (166.0 * 220.0 + 30.0 * 35.0) / 255.0;
-        const half: f32 = bar_height / 2;
-        var level: f32 = 0;
-        for (frame_value.drawList().ops) |operation| switch (operation) {
-            .polygon => |polygon| {
-                if (polygon.points.len != 4 or polygon.color.a < 0.99) continue;
-                // Heat cells span their whole half of the bar, the top half here.
-                var top: f32 = bar_height;
-                var bottom: f32 = 0;
-                for (polygon.points.points[0..4]) |point| {
-                    top = @min(top, point.y);
-                    bottom = @max(bottom, point.y);
-                }
-                if (bottom > half + 0.5 or bottom - top < half - 0.01) continue;
-                const red = polygon.color.r * 255;
-                if (red < panel_red - 1 or red > fill_red + 1) continue;
-                level = @max(level, (red - panel_red) / (fill_red - panel_red));
-            },
-            else => {},
-        };
-        return level;
-    }
-
-    fn text(self: *Feed, wanted: []const u8) !bool {
-        var frame_value = try self.shell.lower(.{ .width = bar_width, .height = bar_height });
-        defer frame_value.deinit();
-        return findText(frame_value.drawList().ops, wanted) != null;
+    fn desktop(self: *BarTest, windows: []const Value) !void {
+        const b_ = self.b();
+        var tags: [5]Value = undefined;
+        for (&tags, 0..) |*tag, index| tag.* = b_.object(.{ .{ "occupied", index == 0 or index == 3 }, .{ "active", index == 1 } });
+        try self.send("desktop", b_.object(.{
+            .{ "tag", 2 }, .{ "focused", true }, .{ "tags", b_.array(&tags) }, .{ "items", b_.array(windows) },
+        }));
     }
 };
 
-test "the network chart's scale follows the data smoothly" {
-    var feed = try Feed.init();
-    defer feed.deinit();
-    // Sustained 10 MB/s: after settling, the cells are nearly at full intensity.
-    var time: f64 = 0;
-    while (time <= 8000) : (time += 500) try feed.sample(time, 10_000_000);
-    const settled = try feed.receiveLevel();
-    try std.testing.expect(settled > 0.85 and settled < 1.0);
-
-    // Traffic drops to a tenth. The ceiling must not snap down: the cells dim
-    // at first, then slowly brighten as the scale follows the data.
-    time += 500;
-    try feed.sample(time, 1_000_000);
-    time += 250;
-    try feed.frame(time);
-    const just_after = try feed.receiveLevel();
-    try std.testing.expect(just_after < 0.45);
-    const stop = time + 12_000;
-    while (time <= stop) : (time += 500) try feed.sample(time, 1_000_000);
-    const adapted = try feed.receiveLevel();
-    try std.testing.expect(adapted > 0.75);
-    // ...and it grew gradually rather than in one step.
-    var midway_feed = try Feed.init();
-    defer midway_feed.deinit();
-    var t: f64 = 0;
-    while (t <= 8000) : (t += 500) try midway_feed.sample(t, 10_000_000);
-    t += 500;
-    try midway_feed.sample(t, 1_000_000);
-    const midpoint = t + 2000;
-    while (t <= midpoint) : (t += 500) try midway_feed.sample(t, 1_000_000);
-    const partway = try midway_feed.receiveLevel();
-    try std.testing.expect(partway > just_after and partway < adapted);
-}
-
-test "slow traffic stays dim, and a burst is fitted within a sample interval" {
-    var feed = try Feed.init();
-    defer feed.deinit();
-    var time: f64 = 0;
-    while (time <= 6000) : (time += 500) try feed.sample(time, 20_000);
-    // Below the zoom floor the chart does not magnify quiet traffic.
-    const idle = try feed.receiveLevel();
-    try std.testing.expect(idle > 0.05 and idle < 0.25);
-    // 175 MB/s (a gigabit and change) arrives. It stays offscreen for a sample
-    // interval, and by then the scale has risen to (nearly) fit it, and it
-    // settles just under the top of the range rather than being clipped.
-    time += 500;
-    try feed.sample(time, 175_000_000);
-    time += 500;
-    try feed.frame(time);
-    try std.testing.expect(try feed.receiveLevel() > 0.85);
-    time += 500;
-    try feed.frame(time);
-    const burst = try feed.receiveLevel();
-    try std.testing.expect(burst > 0.85 and burst < 1.0);
-}
-
-fn slantOf(top: @import("whirlpool-graphics").skia.Point, bottom: @import("whirlpool-graphics").skia.Point) f32 {
-    return (top.x - bottom.x) / (bottom.y - top.y);
-}
-
-test "memory shows programs, ZFS ARC and cache as stacked bands, plus swap" {
-    var shell = try barShell(&.{});
-    defer shell.deinit();
-    const memory = [_]script.program_loader.Value{
-        .{ .number = 100 }, .{ .number = 40 },   .{ .number = 30 },  .{ .number = 10 },
-        .{ .number = 20 },  .{ .number = 1000 }, .{ .number = 250 },
-    };
-    try shell.update(.{
-        .service = "status",
-        .values = &.{
-            .{ .string = "12:34" }, .{ .string = "Mon" }, .{ .string = "2026-09-01" }, .{ .array = &.{} },
-            .{ .array = &.{} },     .{ .array = &.{} },   .{ .array = &memory },
-        },
-    });
-    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
+test "the bar shows the active tag and occupied ones, and the windows on this tag" {
+    var bar: BarTest = undefined;
+    try bar.init();
+    defer bar.deinit();
+    try bar.desktop(&.{ bar.window(11, "foot", true), bar.window(12, "firefox", false) });
+    var frame = try bar.lower();
     defer frame.deinit();
-    const ops = frame.drawList().ops;
+    for ([_][]const u8{ "1", "2", "4", "foot", "firefox" }) |text| try std.testing.expect(findText(&frame, text) != null);
+    for ([_][]const u8{ "3", "5" }) |text| try std.testing.expect(findText(&frame, text) == null);
+}
 
-    // theme.green / theme.cyan / theme.orange bands, as heights of their polygons.
-    const Band = struct { rgb: [3]u8, alpha_min: f32, alpha_max: f32, expected_rows: f32 };
-    const bands = [_]Band{
-        .{ .rgb = .{ 166, 227, 161 }, .alpha_min = 0.9, .alpha_max = 1.01, .expected_rows = 15 }, // used 40%
-        .{ .rgb = .{ 148, 226, 213 }, .alpha_min = 0.9, .alpha_max = 1.01, .expected_rows = 4 }, // arc 10%
-        .{ .rgb = .{ 166, 227, 161 }, .alpha_min = 0.4, .alpha_max = 0.5, .expected_rows = 11 }, // cache 30%
-        .{ .rgb = .{ 250, 179, 135 }, .alpha_min = 0.9, .alpha_max = 1.01, .expected_rows = 10 }, // swap 25%
-    };
-    var tops: [4]f32 = undefined;
-    for (bands, 0..) |band, index| {
-        var found = false;
-        for (ops) |operation| switch (operation) {
-            .polygon => |polygon| if (polygon.points.len == 4 and colorNear(polygon.color, band.rgb) and
-                polygon.color.a > band.alpha_min and polygon.color.a < band.alpha_max)
-            {
-                const rows = polygon.points.points[3].y - polygon.points.points[0].y;
-                if (@abs(rows - band.expected_rows) < 0.6) {
-                    found = true;
-                    tops[index] = polygon.points.points[0].y;
-                }
-            },
-            else => {},
-        };
-        try std.testing.expect(found);
+test "clicking a window asks the layout to focus it; clicking a tag shows it" {
+    var bar: BarTest = undefined;
+    try bar.init();
+    defer bar.deinit();
+    try bar.desktop(&.{ bar.window(11, "foot", true), bar.window(12, "firefox", false) });
+    var frame = try bar.lower();
+    const firefox = findText(&frame, "firefox").?;
+    const tag = findText(&frame, "4").?;
+    frame.deinit();
+
+    for ([_]@FieldType(Op, "text"){ firefox, tag }) |target| {
+        try bar.pointer("motion", target.x + 2, target.baseline, false, 0);
+        try bar.pointer("button", target.x + 2, target.baseline, true, 0);
+        try bar.pointer("button", target.x + 2, target.baseline, false, 0);
     }
-    // The stack is contiguous: each band starts where the one below ends.
-    try std.testing.expectApproxEqAbs(@as(f32, bar_height) - 15, tops[0], 0.6);
-    try std.testing.expectApproxEqAbs(tops[0] - 4, tops[1], 0.6);
-    try std.testing.expectApproxEqAbs(tops[1] - 11, tops[2], 0.6);
-}
-
-test "throughput readouts keep unit and digit positions fixed as values change" {
-    // Network rates arrive in bytes per second and read in bits per second.
-    const Case = struct { bytes: f64, number: []const u8, unit: []const u8 };
-    const cases = [_]Case{
-        .{ .bytes = 0, .number = "0", .unit = "b/s" },
-        .{ .bytes = 12_500, .number = "100", .unit = "kb/s" },
-        .{ .bytes = 1_250_000, .number = "10", .unit = "Mb/s" },
-        .{ .bytes = 17_500_000, .number = "140", .unit = "Mb/s" },
-        .{ .bytes = 175_000_000, .number = "1.4", .unit = "Gb/s" },
-        // Rounds up across the unit boundary instead of reading "1000kb/s".
-        .{ .bytes = 124_960, .number = "1.0", .unit = "Mb/s" },
-    };
-    var right_edge: ?f32 = null;
-    var unit_left: ?f32 = null;
-    for (cases) |case| {
-        var feed = try Feed.init();
-        defer feed.deinit();
-        try feed.sample(0, case.bytes);
-        var frame_value = try feed.shell.lower(.{ .width = bar_width, .height = bar_height });
-        defer frame_value.deinit();
-        const ops = frame_value.drawList().ops;
-        const number = findText(ops, case.number) orelse return error.MissingNumber;
-        const unit = findText(ops, case.unit) orelse return error.MissingUnit;
-        try std.testing.expectEqual(@import("whirlpool-graphics").skia.TextAnchor.end, number.anchor);
-        if (right_edge) |edge| try std.testing.expectEqual(edge, number.x) else right_edge = number.x;
-        if (unit_left) |edge| try std.testing.expectEqual(edge, unit.x) else unit_left = unit.x;
+    const actions = try bar.shell.takeActions();
+    defer {
+        for (actions) |*action| action.deinit(std.testing.allocator);
+        std.testing.allocator.free(actions);
     }
+    try std.testing.expectEqual(@as(usize, 2), actions.len);
+    try std.testing.expectEqualStrings("layout", actions[0].name);
+    try std.testing.expectEqualStrings("focus-window", actions[0].args[0]);
+    try std.testing.expectEqualStrings("12", actions[0].args[1]);
+    try std.testing.expectEqualStrings("focus-tag", actions[1].args[0]);
+    try std.testing.expectEqualStrings("4", actions[1].args[1]);
 }
 
-test "the readout holds still through small changes and once-a-second refreshes" {
-    var feed = try Feed.init();
-    defer feed.deinit();
-    // 5 MB/s is 40 Mb/s.
-    try feed.sample(0, 5_000_000);
-    try std.testing.expect(try feed.text("40"));
-    // Within 10% of what is shown: unchanged however often it is sampled.
-    try feed.sample(1500, 5_200_000);
-    try feed.sample(3000, 4_800_000);
-    try std.testing.expect(try feed.text("40"));
-    // A real change is picked up, but not before a second has passed.
-    try feed.sample(3500, 10_000_000);
-    try std.testing.expect(try feed.text("40"));
-    try feed.sample(4600, 10_000_000);
-    try std.testing.expect(try feed.text("80"));
-}
+test "hovering a window item changes how it is drawn" {
+    var bar: BarTest = undefined;
+    try bar.init();
+    defer bar.deinit();
+    try bar.desktop(&.{ bar.window(11, "foot", true), bar.window(12, "firefox", false) });
+    var before = try bar.lower();
+    const firefox = findText(&before, "firefox").?;
+    var colors_before = std.ArrayList(f32).empty;
+    defer colors_before.deinit(std.testing.allocator);
+    for (before.drawList().ops) |op| if (op == .polygon) try colors_before.append(std.testing.allocator, op.polygon.color.r);
+    before.deinit();
 
-test "sparklines and core cells lean with the panel instead of being rectangular" {
-    var shell = try barShell(&.{});
-    defer shell.deinit();
-    var history = [_]script.program_loader.Value{.{ .number = 4 }} ** 24;
-    var cores = [_]script.program_loader.Value{.{ .number = 100 }} ** 32;
-    const cpu = [_]script.program_loader.Value{
-        .{ .number = 90 }, .{ .number = 8 }, .{ .number = 32 }, .{ .array = &cores }, .{ .array = &history }, .{ .number = 1 },
+    try bar.pointer("enter", firefox.x, firefox.baseline, false, 0);
+    var after = try bar.lower();
+    defer after.deinit();
+    var changed: usize = 0;
+    var index: usize = 0;
+    for (after.drawList().ops) |op| if (op == .polygon) {
+        if (op.polygon.color.r != colors_before.items[index]) changed += 1;
+        index += 1;
     };
-    try shell.update(.{
-        .service = "status",
-        .values = &.{
-            .{ .string = "12:34" }, .{ .string = "Mon" }, .{ .string = "2026-09-01" }, .{ .array = &cpu },
-        },
-    });
-    try shell.update(.{ .service = "frame", .values = &.{.{ .number = 200 }} });
-    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
+    try std.testing.expectEqual(@as(usize, 1), changed);
+}
+
+test "the window list follows focus, and the wheel scrolls it" {
+    var bar: BarTest = undefined;
+    try bar.init();
+    defer bar.deinit();
+    var windows: [16]Value = undefined;
+    const names = [_][]const u8{ "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9", "wa", "wb", "wc", "wd", "we", "wf" };
+    for (&windows, names, 0..) |*window, name, index| window.* = bar.window(@intCast(index + 1), name, index == 15);
+    try bar.desktop(&windows);
+    for (0..20) |_| try bar.frame(50);
+    var followed = try bar.lower();
+    const last = findText(&followed, "wf").?;
+    const first_x = findText(&followed, "w0").?.x;
+    followed.deinit();
+    // The focused (last) window is scrolled into view.
+    try std.testing.expect(last.x > 0 and last.x < bar_width);
+    try std.testing.expect(first_x < 0);
+
+    // The wheel scrolls back towards the start.
+    try bar.pointer("enter", last.x, last.baseline, false, 0);
+    try bar.pointer("scroll", last.x, last.baseline, false, -200);
+    for (0..20) |_| try bar.frame(50);
+    var scrolled = try bar.lower();
+    defer scrolled.deinit();
+    try std.testing.expect(findText(&scrolled, "w0").?.x > first_x);
+}
+
+test "a status panel stays hidden until its source reports" {
+    var bar: BarTest = undefined;
+    try bar.init();
+    defer bar.deinit();
+    var before = try bar.lower();
+    try std.testing.expect(findText(&before, "87%") == null);
+    before.deinit();
+    const b = bar.b();
+    try bar.send("battery", b.object(.{
+        .{ "t", b.numbers(&.{0}) },       .{ "present", b.numbers(&.{1}) },
+        .{ "percent", b.numbers(&.{87}) }, .{ "charging", b.numbers(&.{0}) },
+        .{ "on_ac", b.numbers(&.{1}) },
+    }));
+    var after = try bar.lower();
+    defer after.deinit();
+    try std.testing.expect(findText(&after, "87%") != null);
+}
+
+test "network readouts are rates computed from cumulative counters" {
+    var bar: BarTest = undefined;
+    try bar.init();
+    defer bar.deinit();
+    const b = bar.b();
+    const arena = bar.arena.allocator();
+    // A steady 1 MB/s down, 0 up: 8.0 Mb/s.
+    const rates = [_]f64{1e6} ** 12;
+    try bar.send("network", b.object(.{
+        .{ "t", b.numbers(values.times(arena, 1000, 500, 12)) },
+        .{ "rx", b.numbers(values.counter(arena, &rates, 500)) },
+        .{ "tx", b.numbers(&([_]f64{0} ** 12)) },
+        .{ "interface", "eth0" },
+    }));
+    try bar.frame(100);
+    var frame = try bar.lower();
     defer frame.deinit();
-
-    // The main CPU plot sits immediately left of the core heat cells.
-    var cell_x: f32 = std.math.inf(f32);
-    for (frame.drawList().ops) |operation| switch (operation) {
-        .polygon => |polygon| if (polygon.points.len == 4 and colorNear(polygon.color, .{ 249, 226, 175 })) {
-            cell_x = @min(cell_x, polygon.points.points[0].x);
-        },
-        else => {},
-    };
-    // Copied out: a slice into the loop's by-value capture would dangle.
-    var last_plot: ?@import("whirlpool-graphics").skia.Polygon = null;
-    var cells: usize = 0;
-    for (frame.drawList().ops) |operation| switch (operation) {
-        .polygon => |polygon| {
-            const points = polygon.points.points[0..polygon.points.len];
-            // Plot outlines are many-vertex yellow polygons: baseline, curve..., baseline.
-            if (points.len > 4 and colorNear(polygon.color, .{ 219, 199, 157 }) and points[0].x < cell_x and points[0].x > cell_x - 140)
-                last_plot = polygon.points;
-            // Core heat cells are small yellow parallelograms, not rectangles.
-            if (points.len == 4 and colorNear(polygon.color, .{ 249, 226, 175 }) and polygon.color.a < 1.01) {
-                const height = points[3].y - points[0].y;
-                if (height > 6 and height < 10) {
-                    cells += 1;
-                    try std.testing.expectApproxEqAbs(slant, slantOf(points[0], points[3]), 0.02);
-                    try std.testing.expectApproxEqAbs(slant, slantOf(points[1], points[2]), 0.02);
-                }
-            }
-        },
-        else => {},
-    };
-    // The plot's two ends are slanted edges, parallel to the panel's.
-    const found = last_plot orelse return error.MissingPlot;
-    const plot = found.points[0..found.len];
-    try std.testing.expectApproxEqAbs(slant, slantOf(plot[1], plot[0]), 0.02);
-    try std.testing.expectApproxEqAbs(slant, slantOf(plot[plot.len - 2], plot[plot.len - 1]), 0.02);
-    try std.testing.expectEqual(@as(usize, 16), cells);
+    try std.testing.expect(findText(&frame, "8.0") != null);
+    try std.testing.expect(findText(&frame, "Mb/s") != null);
 }
 
-test "each reported filesystem is a chip with its own bar, name, free space and I/O" {
-    var shell = try barShell(&.{});
-    defer shell.deinit();
-    const gib = 1024.0 * 1024.0 * 1024.0;
-    const root_fs = [_]script.program_loader.Value{
-        .{ .string = "/" },               .{ .number = 1000 * gib }, .{ .number = 600 * gib }, .{ .number = 400 * gib },
-        .{ .number = 120 * 1024 * 1024 }, .{ .number = 2048 },
-    };
-    const pool = [_]script.program_loader.Value{
-        .{ .string = "tank" }, .{ .number = 7000 * gib }, .{ .number = 4000 * gib }, .{ .number = 3000 * gib },
-        .{ .number = 0 },      .{ .number = 0 },
-    };
-    // More filesystems than the old single column could show, one of them a
-    // pool with nothing mounted.
-    const unmounted = [_]script.program_loader.Value{
-        .{ .string = "bulk" }, .{ .number = 2000 * gib }, .{ .number = 500 * gib }, .{ .number = 1500 * gib },
-        .{ .number = 0 },      .{ .number = 0 },
-    };
-    const fourth = [_]script.program_loader.Value{
-        .{ .string = "backup" }, .{ .number = 500 * gib }, .{ .number = 450 * gib }, .{ .number = 50 * gib },
-        .{ .number = 0 },        .{ .number = 0 },
-    };
-    const disks = [_]script.program_loader.Value{
-        .{ .array = &root_fs }, .{ .array = &pool }, .{ .array = &unmounted }, .{ .array = &fourth },
-    };
-    try shell.update(.{
-        .service = "status",
-        .values = &.{
-            .{ .string = "12:34" }, .{ .string = "Mon" }, .{ .string = "2026-09-01" }, .{ .array = &.{} },
-            .{ .array = &.{} },     .{ .array = &.{} },   .{ .array = &.{} },          .{ .array = &disks },
-        },
-    });
-    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
+test "window titles show on decorations, brighter when focused" {
+    var decoration = try Composition.initModule(std.testing.allocator, testModules(), "lib.decorator", "{}");
+    defer decoration.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const b = values.Builder{ .arena = arena.allocator() };
+    try decoration.update(.{ .service = "decoration", .values = &.{b.object(.{
+        .{ "title", "notes.txt" }, .{ "app_id", "foot" }, .{ "focused", true },
+    })} });
+    var frame = try decoration.lower(.{ .width = 300, .height = 28 });
     defer frame.deinit();
-    const ops = frame.drawList().ops;
-
-    const names = [_][]const u8{ "/", "tank", "bulk", "backup" };
-    const frees = [_][]const u8{ "400G", "2.93T", "1.46T", "50.0G" };
-    var previous_x: f32 = -1;
-    for (names, frees) |name, free| {
-        const name_text = findText(ops, name) orelse return error.MissingChipName;
-        const free_text = findText(ops, free) orelse return error.MissingChipFree;
-        // Name left-aligned, free space right-aligned, on one line; chips run left to right.
-        try std.testing.expectEqual(@import("whirlpool-graphics").skia.TextAnchor.start, name_text.anchor);
-        try std.testing.expectEqual(@import("whirlpool-graphics").skia.TextAnchor.end, free_text.anchor);
-        try std.testing.expectEqual(name_text.baseline, free_text.baseline);
-        try std.testing.expect(name_text.x > previous_x);
-        try std.testing.expect(free_text.x > name_text.x);
-        previous_x = free_text.x;
-    }
-    // The root filesystem's throughput: number and unit in one right-aligned slot.
-    try std.testing.expect(findText(ops, "120M") != null);
-    try std.testing.expect(findText(ops, "2.0K") != null);
-}
-
-test "memory says what its numbers are out of, and swap is quiet until used" {
-    const gib = 1024.0 * 1024.0 * 1024.0;
-    const Case = struct { swap_used: f64, expect_dim: bool };
-    for ([_]Case{ .{ .swap_used = 0, .expect_dim = true }, .{ .swap_used = 60 * gib, .expect_dim = false } }) |case| {
-        var shell = try barShell(&.{});
-        defer shell.deinit();
-        const memory = [_]script.program_loader.Value{
-            .{ .number = 126 * gib }, .{ .number = 10.9 * gib }, .{ .number = 30 * gib },       .{ .number = 12 * gib },
-            .{ .number = 70 * gib },  .{ .number = 160 * gib },  .{ .number = case.swap_used }, .{ .number = 3 * gib },
-            .{ .number = 1 * gib },
-        };
-        try shell.update(.{
-            .service = "status",
-            .values = &.{
-                .{ .string = "12:34" }, .{ .string = "Mon" }, .{ .string = "2026-09-01" }, .{ .array = &.{} },
-                .{ .array = &.{} },     .{ .array = &.{} },   .{ .array = &memory },
-            },
-        });
-        var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
-        defer frame.deinit();
-        const ops = frame.drawList().ops;
-        // "used/total", in the total's unit.
-        try std.testing.expect(findText(ops, "10.9/126G") != null);
-        try std.testing.expect(findText(ops, "42.0G cache") != null);
-        // Swap: used out of its total; zswap noted subtly on the caption line.
-        const ratio = if (case.expect_dim) "0.00/160G" else "60.0/160G";
-        const swap = findText(ops, ratio) orelse return error.MissingSwapRatio;
-        try std.testing.expect(findText(ops, "swap · zs 3.00G") != null);
-        // Unused swap is dim text, not an alarm colour.
-        const is_dim = swap.color.a < 0.7 and swap.color.r > 0.7;
-        try std.testing.expectEqual(case.expect_dim, is_dim);
-    }
-}
-
-test "adjacent panels tuck under their neighbour so no seam shows between them" {
-    var shell = try barShell(&.{});
-    defer shell.deinit();
-    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
-    defer frame.deinit();
-    // Section backgrounds are the tall four-point polygons. Consecutive ones in
-    // the right-hand group must overlap along the shared diagonal.
-    var previous: ?[4]@import("whirlpool-graphics").skia.Point = null;
-    var checked: usize = 0;
-    for (frame.drawList().ops) |operation| switch (operation) {
-        .polygon => |polygon| if (polygon.points.len == 4 and polygon.color.a > 0.99) {
-            const points = polygon.points.points[0..4].*;
-            const height = points[3].y - points[0].y;
-            const wide = points[2].x - points[3].x > 40;
-            if (height > 37 and wide) {
-                if (previous) |before| {
-                    // Right edge of the earlier panel reaches past the left edge of this one.
-                    const gap = points[3].x - before[2].x;
-                    if (@abs(gap) < 3) {
-                        try std.testing.expect(gap <= -1.0);
-                        checked += 1;
-                    }
-                }
-                previous = points;
-            }
-        },
-        else => {},
-    };
-    try std.testing.expect(checked >= 3);
-}
-
-test "every history style stays inside its slanted cell and draws its samples" {
-    var shell = try barShell(&.{});
-    defer shell.deinit();
-    var history = [_]script.program_loader.Value{.{ .number = 4 }} ** 24;
-    var cores = [_]script.program_loader.Value{.{ .number = 50 }} ** 8;
-    const cpu = [_]script.program_loader.Value{
-        .{ .number = 40 }, .{ .number = 4 }, .{ .number = 8 }, .{ .array = &cores }, .{ .array = &history }, .{ .number = 1 },
-    };
-    try shell.update(.{
-        .service = "status",
-        .values = &.{
-            .{ .string = "12:34" }, .{ .string = "Mon" }, .{ .string = "2026-09-01" }, .{ .array = &cpu },
-        },
-    });
-    try shell.update(.{ .service = "frame", .values = &.{.{ .number = 100 }} });
-    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
-    defer frame.deinit();
-    // The showcase has one plot per style: columns and ticks draw one narrow
-    // polygon per sample (small 4-point polygons of the plot colour), the rest
-    // draw few larger outlines.
-    var small_plot_polygons: usize = 0;
-    for (frame.drawList().ops) |operation| switch (operation) {
-        .polygon => |polygon| if (polygon.points.len == 4 and colorNear(polygon.color, .{ 219, 199, 157 })) {
-            const width = polygon.points.points[1].x - polygon.points.points[0].x;
-            if (width < 4) small_plot_polygons += 1;
-        },
-        else => {},
-    };
-    // columns + ticks, each with a bar per visible sample.
-    try std.testing.expect(small_plot_polygons >= 2 * 20);
+    try std.testing.expect(findText(&frame, "notes.txt") != null);
 }
 
 /// The example configuration's modules, shared by every test here (and so

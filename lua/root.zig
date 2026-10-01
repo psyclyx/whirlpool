@@ -8,4 +8,7 @@ pub const modules = [_]Module{
     .{ .name = "whirlpool", .source = @embedFile("whirlpool/init.lua") },
     .{ .name = "whirlpool.surface", .source = @embedFile("whirlpool/surface.lua") },
     .{ .name = "whirlpool.format", .source = @embedFile("whirlpool/format.lua") },
+    .{ .name = "whirlpool.series", .source = @embedFile("whirlpool/series.lua") },
+    .{ .name = "whirlpool.pointer", .source = @embedFile("whirlpool/pointer.lua") },
+    .{ .name = "whirlpool.scroll", .source = @embedFile("whirlpool/scroll.lua") },
 };

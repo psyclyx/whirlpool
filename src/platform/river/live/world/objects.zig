@@ -88,6 +88,9 @@ pub const Registry = struct {
     output_order: std.ArrayList(types.OutputId) = .empty,
     wm_to_window: std.AutoHashMap(wm.WindowId, types.WindowId),
     wm_to_output: std.AutoHashMap(wm.OutputId, types.OutputId),
+    /// Changes whenever a window's title or app id does (neither passes
+    /// through a manage cycle).
+    metadata_revision: u64 = 0,
     next_window: u64 = 1,
     next_output: u64 = 1,
     next_seat: u64 = 1,
@@ -254,11 +257,13 @@ pub const Registry = struct {
     pub fn setWindowAppId(self: *Registry, window: types.WindowId, value: []const u8) !void {
         const record = self.windows.getPtr(window) orelse return error.UnknownWindow;
         try replaceOwned(self.allocator, &record.app_id, value);
+        self.metadata_revision +%= 1;
     }
 
     pub fn setWindowTitle(self: *Registry, window: types.WindowId, value: []const u8) !void {
         const record = self.windows.getPtr(window) orelse return error.UnknownWindow;
         try replaceOwned(self.allocator, &record.title, value);
+        self.metadata_revision +%= 1;
     }
 
     pub fn setWindowDimensionsHint(self: *Registry, window: types.WindowId, hint: wm.SizeHints) !void {

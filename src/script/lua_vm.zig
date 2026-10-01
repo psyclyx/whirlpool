@@ -19,6 +19,7 @@ const GetGlobal = *const fn (*State, [*:0]const u8) callconv(.c) c_int;
 const SetGlobal = *const fn (*State, [*:0]const u8) callconv(.c) void;
 const RawGetI = *const fn (*State, c_int, i64) callconv(.c) c_int;
 const RawSetI = *const fn (*State, c_int, i64) callconv(.c) void;
+const RawSet = *const fn (*State, c_int) callconv(.c) void;
 const RawLen = *const fn (*State, c_int) callconv(.c) usize;
 const ToInteger = *const fn (*State, c_int, ?*c_int) callconv(.c) i64;
 const ToNumber = *const fn (*State, c_int, ?*c_int) callconv(.c) f64;
@@ -56,6 +57,7 @@ const Api = struct {
     set_global: SetGlobal,
     raw_get_i: RawGetI,
     raw_set_i: RawSetI,
+    raw_set: RawSet,
     raw_len: RawLen,
     to_integer: ToInteger,
     to_number: ToNumber,
@@ -107,6 +109,7 @@ const Api = struct {
             .set_global = try symbol(SetGlobal, &loaded, "lua_setglobal"),
             .raw_get_i = try symbol(RawGetI, &loaded, "lua_rawgeti"),
             .raw_set_i = try symbol(RawSetI, &loaded, "lua_rawseti"),
+            .raw_set = try symbol(RawSet, &loaded, "lua_rawset"),
             .raw_len = try symbol(RawLen, &loaded, "lua_rawlen"),
             .to_integer = try symbol(ToInteger, &loaded, "lua_tointegerx"),
             .to_number = try symbol(ToNumber, &loaded, "lua_tonumberx"),
@@ -154,6 +157,7 @@ pub const CallbackApi = struct {
     create_table: CreateTable,
     raw_get_i: RawGetI,
     raw_set_i: RawSetI,
+    raw_set: RawSet,
     to_integer: ToInteger,
     to_number: ToNumber,
     to_boolean: ToBoolean,
@@ -252,6 +256,7 @@ pub const Vm = struct {
             .create_table = self.api.create_table,
             .raw_get_i = self.api.raw_get_i,
             .raw_set_i = self.api.raw_set_i,
+            .raw_set = self.api.raw_set,
             .to_integer = self.api.to_integer,
             .to_number = self.api.to_number,
             .to_boolean = self.api.to_boolean,

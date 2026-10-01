@@ -1,4 +1,11 @@
 //! River role-to-presentation lifetime bridge.
+//!
+//! Feeds surface programs the services they draw from, all as objects of named
+//! fields: `desktop` (tags, the layout's projected items, window metadata),
+//! one service per configured measurement source, `pointer` events, and
+//! `decoration` for window titles. It knows nothing about what a surface draws
+//! or where: input goes to the program as events, and the program answers with
+//! actions (`whirlpool.surface.act`) this bridge performs.
 
 const std = @import("std");
 const wayland = @import("wayland");
@@ -11,7 +18,14 @@ const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
 const river_presenter_runtime = @import("whirlpool-river-presenter-runtime");
 const status_app = @import("whirlpool-app-status");
 const desktop_icons = @import("whirlpool-app-desktop-icons");
-const item_flow = @import("item_flow.zig");
+
+const Value = script.program_loader.Value;
+
+/// Starts programs for surfaces that ask (`surface.act("spawn", ...)`).
+pub const Spawner = struct {
+    context: ?*anyopaque,
+    run: *const fn (?*anyopaque, []const []const u8) anyerror!void,
+};
 
 /// Owns the optional graphics runtime and its River role callback context.
 pub const Bridge = struct {
@@ -21,7 +35,6 @@ pub const Bridge = struct {
     graphics: ?*river_presenter_runtime.Runtime = null,
     status: ?*status_app.Service = null,
     icons: ?*desktop_icons.Service = null,
-    status_revision: u64 = 0,
     context: Context = undefined,
     input_seats: std.ArrayList(*InputSeat) = .empty,
     generation: u64 = 1,
@@ -35,6 +48,8 @@ pub const Bridge = struct {
         runtime: *river_host_runtime.Runtime,
         surface: ?*const script.config.SurfaceSpec,
         decoration_surface: ?*const script.config.SurfaceSpec,
+        sources: []const script.config.SourceSpec,
+        spawner: ?Spawner,
     ) !river_role_lifecycle.Hooks {
         self.* = .{};
         self.allocator = allocator;
@@ -49,7 +64,7 @@ pub const Bridge = struct {
             self.graphics.?.deinit() catch {};
             self.graphics = null;
         }
-        self.status = try status_app.Service.init(allocator, io);
+        self.status = try startSources(allocator, io, self.clock_origin, sources);
         errdefer {
             self.status.?.deinit();
             self.status = null;
@@ -60,7 +75,16 @@ pub const Bridge = struct {
             self.icons = null;
         }
         try runtime.setSurfaceHooks(self.graphics.?.surfaceHooks());
-        self.context = .{ .allocator = allocator, .runtime = runtime, .roles = undefined, .graphics = self.graphics.?, .icons = self.icons.? };
+        self.context = .{
+            .allocator = allocator,
+            .runtime = runtime,
+            .roles = undefined,
+            .graphics = self.graphics.?,
+            .icons = self.icons.?,
+            .spawner = spawner,
+            .source_revisions = try allocator.alloc(u64, self.status.?.sourceCount()),
+        };
+        @memset(self.context.source_revisions, std.math.maxInt(u64));
         try self.bindInputSeats(client);
         return self.context.hooks();
     }
@@ -90,15 +114,12 @@ pub const Bridge = struct {
         _ = try graphics.pollReleases();
     }
 
-    /// Update shell services and present all retained roles once per dispatch.
+    /// Perform surface actions, update what changed, and present every role.
     pub fn present(self: *Bridge) !void {
-        if (self.graphics == null) return;
-        if (self.status.?.latestAfter(self.status_revision)) |latest| {
-            self.status_revision = latest.revision;
-            self.context.status = latest.value;
-        }
-        try self.context.roles.forEachShell(&self.context, Context.updateShellServices);
-        try self.context.roles.forEachShell(&self.context, Context.updateStatusServices);
+        const graphics = self.graphics orelse return;
+        graphics.drainActions(&self.context, Context.perform);
+        try self.context.refreshDesktop();
+        try self.context.refreshSources(self.status.?);
         self.context.frame_ms = self.monotonicMilliseconds();
         try self.context.roles.forEachShell(&self.context, Context.updateFrameServices);
         try self.context.roles.forEachDecoration(&self.context, Context.updateDecorationServices);
@@ -164,6 +185,26 @@ pub const Bridge = struct {
     }
 };
 
+/// Start the configured sources; an unknown kind is skipped with a warning.
+fn startSources(allocator: std.mem.Allocator, io: std.Io, origin: std.Io.Timestamp, sources: []const script.config.SourceSpec) !*status_app.Service {
+    var specs = std.ArrayList(status_app.Spec).empty;
+    defer specs.deinit(allocator);
+    for (sources) |source| {
+        const kind = std.meta.stringToEnum(status_app.Kind, source.kind) orelse {
+            std.log.warn("unknown source kind '{s}' for source '{s}'", .{ source.kind, source.name });
+            continue;
+        };
+        try specs.append(allocator, .{
+            .name = source.name,
+            .kind = kind,
+            .every_ms = source.every_ms,
+            .keep_ms = source.keep_ms,
+            .argv = source.argv,
+        });
+    }
+    return status_app.Service.init(allocator, io, origin, specs.items);
+}
+
 const InputSeat = struct {
     allocator: std.mem.Allocator,
     context: *Context,
@@ -205,26 +246,56 @@ const InputSeat = struct {
         }
     }
 
+    /// Pointer input becomes `pointer` events for the shell program on that
+    /// output: `{ type = "enter" | "motion" | "leave" | "button" | "scroll",
+    /// x, y, button, pressed, dx, dy }` in surface coordinates.
     fn onPointer(_: *wayland.client.wl.Pointer, event: wayland.client.wl.Pointer.Event, self: *InputSeat) void {
         switch (event) {
             .enter => |value| {
                 self.output = if (value.surface) |surface| self.context.roles.outputForSurface(surface) else null;
                 self.x = wayland.client.wl.Fixed.toDouble(value.surface_x);
                 self.y = wayland.client.wl.Fixed.toDouble(value.surface_y);
+                self.send(.{ .kind = "enter" });
             },
-            .leave => self.output = null,
+            .leave => {
+                self.send(.{ .kind = "leave" });
+                self.output = null;
+            },
             .motion => |value| {
                 self.x = wayland.client.wl.Fixed.toDouble(value.surface_x);
                 self.y = wayland.client.wl.Fixed.toDouble(value.surface_y);
+                self.send(.{ .kind = "motion" });
             },
-            .button => |value| if (value.state == .pressed and value.button == 0x110) {
-                if (self.output) |output| self.context.activateAt(output, self.x) catch {};
-            },
-            .axis => |value| if (value.axis == .vertical_scroll) {
-                if (self.output) |output| self.context.scrollAt(output, self.x, wayland.client.wl.Fixed.toDouble(value.value)) catch {};
+            .button => |value| self.send(.{
+                .kind = "button",
+                .button = value.button,
+                .pressed = value.state == .pressed,
+            }),
+            .axis => |value| {
+                const amount = wayland.client.wl.Fixed.toDouble(value.value);
+                self.send(if (value.axis == .vertical_scroll) .{ .kind = "scroll", .dy = amount } else .{ .kind = "scroll", .dx = amount });
             },
             .frame, .axis_source, .axis_stop, .axis_discrete, .axis_value120, .axis_relative_direction => {},
         }
+    }
+
+    const Event = struct { kind: []const u8, button: u32 = 0, pressed: bool = false, dx: f64 = 0, dy: f64 = 0 };
+
+    fn send(self: *InputSeat, event: Event) void {
+        const output = self.output orelse return;
+        const shell = self.context.shells.get(output.value) orelse return;
+        const fields = [_]Value.Field{
+            .{ .key = "type", .value = .{ .string = event.kind } },
+            .{ .key = "x", .value = .{ .number = self.x } },
+            .{ .key = "y", .value = .{ .number = self.y } },
+            .{ .key = "button", .value = .{ .number = @floatFromInt(event.button) } },
+            .{ .key = "pressed", .value = .{ .boolean = event.pressed } },
+            .{ .key = "dx", .value = .{ .number = event.dx } },
+            .{ .key = "dy", .value = .{ .number = event.dy } },
+        };
+        const values = [_]Value{.{ .object = &fields }};
+        self.context.graphics.deliver(.{ .shell = shell }, .{ .service = "pointer", .values = &values }, .events) catch |err|
+            std.log.warn("pointer event dropped: {s}", .{@errorName(err)});
     }
 };
 
@@ -234,25 +305,32 @@ pub const Context = struct {
     roles: *river_role_lifecycle.Runtime,
     graphics: *river_presenter_runtime.Runtime,
     icons: *desktop_icons.Service,
-    status: status_app.Snapshot = .{},
+    spawner: ?Spawner,
     frame_ms: f64 = 0,
-    flow_states: std.AutoHashMapUnmanaged(u64, FlowState) = .empty,
+    /// The shell surface on each output, by output id.
+    shells: std.AutoHashMapUnmanaged(u64, host.types.ShellSurfaceId) = .empty,
+    /// The desktop inputs each shell last received, by shell id.
+    desktop_keys: std.AutoHashMapUnmanaged(u64, DesktopKey) = .empty,
+    /// Per source, the revision every shell has; maxInt means none sent.
+    source_revisions: []u64,
+    /// Bumped when a shell appears, so it is sent every source.
+    shells_created: u64 = 0,
+    sources_sent_for: u64 = 0,
 
-    const FlowState = struct {
-        offset: u32 = 0,
-        focused_x: ?u32 = null,
-        viewport_width: u32 = 0,
+    /// What the desktop service depends on. While it is unchanged, nothing is
+    /// recomputed: no layout projection runs, no payload is built.
+    const DesktopKey = struct {
+        manage_revision: u64,
+        epoch: u64,
+        metadata: u64,
+        icons: u64,
+        focused_output: ?wm.OutputId,
     };
 
-    const workspace_gap: u32 = 8;
-    const workspace_visible_width: u32 = 30;
-    const workspace_hidden_width: u32 = 1;
-    const workspace_padding_right: u32 = 8;
-    const right_width_without_battery: u32 = 654;
-    const right_width_with_battery: u32 = 697;
-
     fn deinit(self: *Context) void {
-        self.flow_states.deinit(self.allocator);
+        self.shells.deinit(self.allocator);
+        self.desktop_keys.deinit(self.allocator);
+        self.allocator.free(self.source_revisions);
     }
 
     pub fn hooks(self: *Context) river_role_lifecycle.Hooks {
@@ -265,152 +343,143 @@ pub const Context = struct {
         };
     }
 
-    fn activateAt(self: *Context, output_id: host.types.OutputId, x: f64) !void {
-        const world = self.runtime.adapter.worldView();
-        const wm_output = try self.runtime.adapter.objects.wmOutputId(output_id);
-        const output = world.getOutput(wm_output) orelse return error.UnknownOutput;
-        const selected = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
-        const workspace_width = self.workspaceWidth(world, selected);
-        if (x >= @as(f64, @floatFromInt(workspace_width))) {
-            const viewport = self.itemViewport(try self.presentationWidth(output_id), workspace_width);
-            const right_edge = workspace_width + viewport;
-            if (x >= @as(f64, @floatFromInt(right_edge))) return;
-            const flow = try self.buildItemFlow(wm_output);
-            const state = try self.flowState(output_id);
-            const local = x - @as(f64, @floatFromInt(workspace_width)) + @as(f64, @floatFromInt(state.offset));
-            if (local < 0 or local > std.math.maxInt(u32)) return;
-            const item = flow.itemAt(@intFromFloat(local)) orelse return;
-            if (item.action.len == 0) return;
-            var args: [script.layout_projection.max_action_args][]const u8 = undefined;
-            for (item.args[0..item.arg_count], 0..) |arg, index| args[index] = arg.slice();
-            try self.runtime.queueLayoutAction(wm_output, item.action.slice(), args[0..item.arg_count]);
-            return;
-        }
-
-        var cursor: f64 = 0;
-        for (0..9) |index| {
-            const visible = index == selected or self.tagOccupied(world, world.tagAt(index));
-            const width: f64 = if (visible) workspace_visible_width else workspace_hidden_width;
-            if (visible and x >= cursor and x < cursor + width) {
-                const tag = world.tagAt(index) orelse return;
-                try self.runtime.queueIntent(.{ .set_active_tag = .{ .output = wm_output, .tag = tag } });
-                return;
-            }
-            cursor += width + workspace_gap;
+    /// An action a surface program asked for. `layout` runs a layout action
+    /// on the surface's output; `spawn` starts a program. Others are ignored.
+    fn perform(self: *Context, role: river_presenter_runtime.SurfaceRole, action: host.surface_composition.Action) void {
+        const args = action.args;
+        if (std.mem.eql(u8, action.name, "layout")) {
+            const shell = switch (role) {
+                .shell => |id| id,
+                .decoration => return,
+            };
+            if (args.len == 0) return;
+            const output = self.outputForShell(shell) orelse return;
+            const wm_output = self.runtime.adapter.objects.wmOutputId(output) catch return;
+            var rest: [script.layout_projection.max_action_args][]const u8 = undefined;
+            const count = @min(args.len - 1, rest.len);
+            for (args[1 .. 1 + count], 0..) |arg, index| rest[index] = arg;
+            self.runtime.queueLayoutAction(wm_output, args[0], rest[0..count]) catch |err|
+                std.log.warn("surface layout action '{s}' failed: {s}", .{ args[0], @errorName(err) });
+        } else if (std.mem.eql(u8, action.name, "spawn")) {
+            const spawner = self.spawner orelse return;
+            if (args.len == 0) return;
+            var argv: [script.config.MaxArguments][]const u8 = undefined;
+            const count = @min(args.len, argv.len);
+            for (args[0..count], 0..) |arg, index| argv[index] = arg;
+            spawner.run(spawner.context, argv[0..count]) catch |err|
+                std.log.warn("surface spawn failed: {s}", .{@errorName(err)});
         }
     }
 
-    fn scrollAt(self: *Context, output_id: host.types.OutputId, x: f64, delta: f64) !void {
-        if (delta == 0) return;
+    fn outputForShell(self: *const Context, shell: host.types.ShellSurfaceId) ?host.types.OutputId {
+        var iterator = self.shells.iterator();
+        while (iterator.next()) |entry| if (entry.value_ptr.*.value == shell.value) return .{ .value = entry.key_ptr.* };
+        return null;
+    }
+
+    fn currentDesktopKey(self: *Context) DesktopKey {
+        const world = self.runtime.adapter.worldView();
+        return .{
+            .manage_revision = self.runtime.adapter.revision,
+            .epoch = world.epoch(),
+            .metadata = self.runtime.adapter.objects.metadata_revision,
+            .icons = self.icons.resolvedCount(),
+            .focused_output = world.focusedOutput(),
+        };
+    }
+
+    fn refreshDesktop(self: *Context) !void {
+        const key = self.currentDesktopKey();
+        var iterator = self.shells.iterator();
+        while (iterator.next()) |entry| {
+            const shell = entry.value_ptr.*;
+            if (self.desktop_keys.get(shell.value)) |sent| if (std.meta.eql(sent, key)) continue;
+            try self.sendDesktop(.{ .value = entry.key_ptr.* }, shell);
+            try self.desktop_keys.put(self.allocator, shell.value, key);
+        }
+    }
+
+    /// The `desktop` service for one output's shell:
+    ///   tag      the active tag's ordinal (1-based)
+    ///   tags     per tag: { occupied, active }
+    ///   focused  whether this output has keyboard focus
+    ///   items    the layout's projection, in order: { kind, label, detail,
+    ///            focused, overlay, window, app_id, title, icon, action, args }
+    fn sendDesktop(self: *Context, output_id: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         const world = self.runtime.adapter.worldView();
         const wm_output = try self.runtime.adapter.objects.wmOutputId(output_id);
         const output = world.getOutput(wm_output) orelse return error.UnknownOutput;
-        const current = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
-        const workspace_width = self.workspaceWidth(world, current);
-        if (x >= @as(f64, @floatFromInt(workspace_width))) {
-            const viewport = self.itemViewport(try self.presentationWidth(output_id), workspace_width);
-            if (x >= @as(f64, @floatFromInt(workspace_width + viewport))) return;
-            const flow = try self.buildItemFlow(wm_output);
-            const state = try self.flowState(output_id);
-            const amount: i32 = if (delta > 0) 96 else if (delta < 0) -96 else 0;
-            state.offset = item_flow.scroll(state.offset, amount, viewport, flow.content_width);
-            return;
-        }
-        const next = delta > 0;
-        const target = if (next) @min(@as(usize, 8), current + 1) else if (current == 0) 0 else current - 1;
-        if (target == current) return;
-        try self.runtime.queueIntent(.{ .set_active_tag = .{ .output = wm_output, .tag = world.tagAt(target) orelse return } });
-    }
+        const active = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
 
-    fn buildItemFlow(self: *Context, output: wm.OutputId) !item_flow.Flow {
-        var projection = try self.runtime.layoutProjection(self.allocator, output);
+        const tag_count = world.liveTagCount();
+        const tags = try arena.alloc(Value, tag_count);
+        for (tags, 0..) |*tag, index| tag.* = .{ .object = try arena.dupe(Value.Field, &.{
+            .{ .key = "occupied", .value = .{ .boolean = self.tagOccupied(world, world.tagAt(index)) } },
+            .{ .key = "active", .value = .{ .boolean = index == active } },
+        }) };
+
+        var projection = try self.runtime.layoutProjection(self.allocator, wm_output);
         defer if (projection) |*value| value.deinit();
-        return if (projection) |*value| item_flow.fromProjection(value) else .{};
-    }
-
-    pub fn updateShellServices(raw: ?*anyopaque, output_id: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
-        const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-        const world = self.runtime.adapter.worldView();
-        const wm_output = try self.runtime.adapter.objects.wmOutputId(output_id);
-        const output = world.getOutput(wm_output) orelse
-            return error.UnknownOutput;
-        const ordinal = world.tagOrdinal(output.active_tag) orelse return error.UnknownTag;
-        var occupied_storage: [9]script.program_loader.Value = undefined;
-        for (&occupied_storage, 0..) |*item, index| item.* = .{ .boolean = self.tagOccupied(world, world.tagAt(index)) };
-
-        const flow = try self.buildItemFlow(wm_output);
-
-        const workspace_width = self.workspaceWidth(world, ordinal);
-        const viewport = self.itemViewport(try self.presentationWidth(output_id), workspace_width);
-        const flow_state = try self.flowState(output_id);
-        const focused_x = if (flow.focused_index) |index| flow.items[index].x else null;
-        if (flow_state.focused_x != focused_x or flow_state.viewport_width != viewport) {
-            flow_state.offset = item_flow.ensureVisible(flow_state.offset, viewport, &flow);
-            flow_state.focused_x = focused_x;
-            flow_state.viewport_width = viewport;
-        } else {
-            flow_state.offset = item_flow.scroll(flow_state.offset, 0, viewport, flow.content_width);
-        }
-
-        var item_storage: [item_flow.max_items][10]script.program_loader.Value = undefined;
-        var items: [item_flow.max_items]script.program_loader.Value = undefined;
-        for (flow.slice(), 0..) |*item, index| {
+        const projected = if (projection) |*value| value.items.items else &.{};
+        const items = try arena.alloc(Value, projected.len);
+        for (projected, items) |*item, *destination| {
             var app_id: []const u8 = "";
             var title: []const u8 = "";
-            var icon_source: []const u8 = "";
+            var icon: []const u8 = "";
             if (item.window) |window| if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
                 const record = try self.runtime.adapter.objects.windowRecord(live_window);
-                app_id = record.app_id;
-                title = record.title;
-                icon_source = try self.icons.pathFor(app_id);
+                app_id = try arena.dupe(u8, record.app_id);
+                title = try arena.dupe(u8, record.title);
+                icon = try arena.dupe(u8, try self.icons.pathFor(record.app_id));
             };
-            writeDisplayItem(item, app_id, title, icon_source, &item_storage[index]);
-            items[index] = .{ .array = &item_storage[index] };
+            const args = try arena.alloc(Value, item.arg_count);
+            for (item.args[0..item.arg_count], args) |*arg, *value| value.* = .{ .string = try arena.dupe(u8, arg.slice()) };
+            destination.* = .{ .object = try arena.dupe(Value.Field, &.{
+                .{ .key = "kind", .value = .{ .string = try arena.dupe(u8, item.style.slice()) } },
+                .{ .key = "label", .value = .{ .string = try arena.dupe(u8, item.text.slice()) } },
+                .{ .key = "detail", .value = .{ .string = try arena.dupe(u8, item.detail.slice()) } },
+                .{ .key = "focused", .value = .{ .boolean = item.focused } },
+                .{ .key = "overlay", .value = .{ .boolean = item.overlay } },
+                .{ .key = "window", .value = if (item.window) |window| .{ .number = @floatFromInt(window.raw()) } else .nil },
+                .{ .key = "app_id", .value = .{ .string = app_id } },
+                .{ .key = "title", .value = .{ .string = title } },
+                .{ .key = "icon", .value = .{ .string = icon } },
+                .{ .key = "action", .value = .{ .string = try arena.dupe(u8, item.action.slice()) } },
+                .{ .key = "args", .value = .{ .array = args } },
+            }) };
         }
 
-        const clipping = item_flow.edgeClipping(flow_state.offset, viewport, flow.content_width, 24);
-        const values = [_]script.program_loader.Value{
-            .{ .number = @floatFromInt(ordinal + 1) },
-            .{ .array = &occupied_storage },
-            .{ .array = items[0..flow.len] },
-            .{ .number = @floatFromInt(flow_state.offset) },
-            .{ .number = @floatFromInt(flow.content_width) },
-            .{ .number = @floatFromInt(clipping.leading) },
-            .{ .number = @floatFromInt(clipping.trailing) },
-            .{ .boolean = world.focusedOutput() == wm_output },
+        const fields = [_]Value.Field{
+            .{ .key = "tag", .value = .{ .number = @floatFromInt(active + 1) } },
+            .{ .key = "tags", .value = .{ .array = tags } },
+            .{ .key = "focused", .value = .{ .boolean = world.focusedOutput() == wm_output } },
+            .{ .key = "items", .value = .{ .array = items } },
         };
-        try self.graphics.update(.{ .shell = shell_id }, .{
-            .service = "desktop",
-            .values = &values,
-        });
+        const values = [_]Value{.{ .object = &fields }};
+        try self.graphics.update(.{ .shell = shell_id }, .{ .service = "desktop", .values = &values });
     }
 
-    fn writeDisplayItem(
-        item: *const item_flow.Item,
-        app_id: []const u8,
-        title: []const u8,
-        icon_source: []const u8,
-        target: *[10]script.program_loader.Value,
-    ) void {
-        target.* = .{
-            .{ .string = item.style.slice() },
-            .{ .string = item.text.slice() },
-            .{ .string = app_id },
-            .{ .string = title },
-            .{ .boolean = item.focused },
-            .{ .number = @floatFromInt(item.width) },
-            .{ .string = icon_source },
-            .{ .string = item.detail.slice() },
-            .{ .number = @floatFromInt(item.x) },
-            .{ .boolean = item.overlay },
-        };
-    }
-
-    pub fn updateStatusServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
-        const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-        var status_values: status_app.StatusValues(script.program_loader.Value) = .{};
-        const values = status_values.build(&self.status);
-        try self.graphics.update(.{ .shell = shell_id }, .{ .service = "status", .values = values });
+    /// Send each source that changed (or every source, to a new shell) to
+    /// every shell, as a frame-class sample.
+    fn refreshSources(self: *Context, status: *status_app.Service) !void {
+        const everything = self.sources_sent_for != self.shells_created;
+        self.sources_sent_for = self.shells_created;
+        for (0..status.sourceCount()) |index| {
+            if (!everything and status.revision(index) == self.source_revisions[index]) continue;
+            var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena_state.deinit();
+            const encoded = try status.encode(Value, arena_state.allocator(), index);
+            self.source_revisions[index] = encoded.revision;
+            const values = [_]Value{encoded.value};
+            var iterator = self.shells.valueIterator();
+            while (iterator.next()) |shell| {
+                self.graphics.deliver(.{ .shell = shell.* }, .{ .service = status.sourceName(index), .values = &values }, .sample) catch |err|
+                    std.log.warn("source '{s}' not delivered: {s}", .{ status.sourceName(index), @errorName(err) });
+            }
+        }
     }
 
     pub fn updateFrameServices(raw: ?*anyopaque, _: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
@@ -418,24 +487,20 @@ pub const Context = struct {
         try self.graphics.requestFrame(.{ .shell = shell_id }, self.frame_ms);
     }
 
+    /// The `decoration` service: `{ title, app_id, focused }`.
     pub fn updateDecorationServices(raw: ?*anyopaque, window_id: host.types.WindowId, decoration_id: host.types.DecorationId) !void {
         const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         const record = try self.runtime.adapter.objects.windowRecord(window_id);
         const wm_window = record.wm_id orelse return;
         const world = self.runtime.adapter.worldView();
         _ = world.getWindow(wm_window) orelse return error.UnknownWindow;
-        const is_focused = world.focusedWindow() == wm_window;
-        const values = [_]script.program_loader.Value{
-            .{ .string = record.title },
-            .{ .boolean = is_focused },
-            .{ .string = record.app_id },
-            .{ .array = &.{} },
-            .{ .number = 0 },
+        const fields = [_]Value.Field{
+            .{ .key = "title", .value = .{ .string = record.title } },
+            .{ .key = "app_id", .value = .{ .string = record.app_id } },
+            .{ .key = "focused", .value = .{ .boolean = world.focusedWindow() == wm_window } },
         };
-        try self.graphics.update(.{ .decoration = decoration_id }, .{
-            .service = "decoration",
-            .values = &values,
-        });
+        const values = [_]Value{.{ .object = &fields }};
+        try self.graphics.update(.{ .decoration = decoration_id }, .{ .service = "decoration", .values = &values });
     }
 
     fn tagOccupied(self: *const Context, world: *const wm.World, maybe_tag: ?wm.TagId) bool {
@@ -447,32 +512,6 @@ pub const Context = struct {
             if (window.tag == wanted and window.lifecycle == .managed) return true;
         }
         return false;
-    }
-
-    fn workspaceWidth(self: *const Context, world: *const wm.World, selected: usize) u32 {
-        var width: u32 = workspace_padding_right + workspace_gap * 8;
-        for (0..9) |index| {
-            const visible = index == selected or self.tagOccupied(world, world.tagAt(index));
-            width += if (visible) workspace_visible_width else workspace_hidden_width;
-        }
-        return width;
-    }
-
-    fn itemViewport(self: *const Context, output_width: u32, workspace_width: u32) u32 {
-        const right_width: u32 = if (self.status.battery_present) right_width_with_battery else right_width_without_battery;
-        return @max(1, output_width -| workspace_width -| right_width);
-    }
-
-    fn presentationWidth(self: *const Context, output: host.types.OutputId) !u32 {
-        const size = (try self.roles.adapter.objects.outputSize(output)) orelse return error.OutputGeometryUnavailable;
-        if (size.width <= 0) return error.InvalidExtent;
-        return @intCast(size.width);
-    }
-
-    fn flowState(self: *Context, output: host.types.OutputId) !*FlowState {
-        const entry = try self.flow_states.getOrPut(self.allocator, output.value);
-        if (!entry.found_existing) entry.value_ptr.* = .{};
-        return entry.value_ptr;
     }
 
     fn extent(width: i32, height: i32) !river_presenter_runtime.Extent {
@@ -512,6 +551,8 @@ fn onShellCreated(raw: ?*anyopaque, output: host.types.OutputId, shell: *wayland
     const shell_id = try self.roles.adapter.objects.shellSurfaceId(shell);
     const role_extent = try self.shellExtent(output);
     try self.graphics.createRole(.{ .shell = shell_id }, surface, role_extent);
+    try self.shells.put(self.allocator, output.value, shell_id);
+    self.shells_created +%= 1;
     const bar_height = @min(self.graphics.surface.height, role_extent.height);
     const input_region = try self.roles.compositor.createRegion();
     defer input_region.destroy();
@@ -522,7 +563,8 @@ fn onShellCreated(raw: ?*anyopaque, output: host.types.OutputId, shell: *wayland
 
 fn onShellRetire(raw: ?*anyopaque, output: host.types.OutputId, shell: host.types.ShellSurfaceId) !river_role_lifecycle.RetirementStatus {
     const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-    _ = self.flow_states.remove(output.value);
+    _ = self.shells.remove(output.value);
+    _ = self.desktop_keys.remove(shell.value);
     return retire(self, .{ .shell = shell });
 }
 
@@ -543,56 +585,4 @@ fn retire(self: *Context, role: host.river_coordinator.SurfaceRole) !river_role_
         .pending_release => .pending_release,
         .release_safe => .release_safe,
     };
-}
-
-test "display updates preserve distinct retained item labels and window metadata" {
-    var flow: item_flow.Flow = .{ .len = 3 };
-    flow.items[0] = .{
-        .x = 0,
-        .width = 3,
-        .style = try script.layout_projection.Label.init("group-open"),
-        .text = try script.layout_projection.Label.init("h"),
-        .overlay = true,
-    };
-    flow.items[1] = .{
-        .x = 52,
-        .width = 148,
-        .style = try script.layout_projection.Label.init("window"),
-    };
-    flow.items[2] = .{
-        .x = 204,
-        .width = 3,
-        .style = try script.layout_projection.Label.init("insertion"),
-        .overlay = true,
-    };
-
-    var storage: [3][10]script.program_loader.Value = undefined;
-    var items: [3]script.program_loader.Value = undefined;
-    for (flow.slice(), 0..) |*item, index| {
-        Context.writeDisplayItem(
-            item,
-            if (index == 1) "foot" else "",
-            if (index == 1) "shell" else "",
-            if (index == 1) "/icon/foot.svg" else "",
-            &storage[index],
-        );
-        items[index] = .{ .array = &storage[index] };
-    }
-    const values = [_]script.program_loader.Value{.{ .array = &items }};
-    var owned = try script.program_loader.OwnedUpdate.clone(std.testing.allocator, .{
-        .service = "desktop",
-        .values = &values,
-    });
-    defer owned.deinit();
-
-    const encoded = owned.value.values[0].array;
-    try std.testing.expectEqualStrings("group-open", encoded[0].array[0].string);
-    try std.testing.expectEqualStrings("h", encoded[0].array[1].string);
-    try std.testing.expect(encoded[0].array[9].boolean);
-    try std.testing.expectEqualStrings("window", encoded[1].array[0].string);
-    try std.testing.expectEqualStrings("foot", encoded[1].array[2].string);
-    try std.testing.expectEqualStrings("shell", encoded[1].array[3].string);
-    try std.testing.expectEqualStrings("insertion", encoded[2].array[0].string);
-    try std.testing.expectEqual(@as(f64, 204), encoded[2].array[8].number);
-    try std.testing.expect(encoded[2].array[9].boolean);
 }

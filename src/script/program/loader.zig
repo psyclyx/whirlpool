@@ -64,6 +64,14 @@ pub const OwnedUpdate = struct {
                     destination.* = try cloneValue(allocator, item);
                 break :blk .{ .array = items };
             },
+            .object => |value| blk: {
+                const fields = try allocator.alloc(Value.Field, value.len);
+                for (value, fields) |field, *destination| destination.* = .{
+                    .key = try allocator.dupe(u8, field.key),
+                    .value = try cloneValue(allocator, field.value),
+                };
+                break :blk .{ .object = fields };
+            },
         };
     }
 
@@ -87,6 +95,17 @@ pub const OwnedUpdate = struct {
                     if (value.len != other.len) break :blk false;
                     for (value, other) |item, other_item|
                         if (!eqlValue(item, other_item)) break :blk false;
+                    break :blk true;
+                },
+                else => false,
+            },
+            .object => |value| switch (right) {
+                .object => |other| blk: {
+                    if (value.len != other.len) break :blk false;
+                    for (value, other) |field, other_field| {
+                        if (!std.mem.eql(u8, field.key, other_field.key)) break :blk false;
+                        if (!eqlValue(field.value, other_field.value)) break :blk false;
+                    }
                     break :blk true;
                 },
                 else => false,

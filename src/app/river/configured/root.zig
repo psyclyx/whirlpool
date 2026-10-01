@@ -250,6 +250,17 @@ pub const Services = struct {
         if (keybindings.hasPendingModeChange()) host.requestManage();
     }
 
+    /// The configured measurement sources, borrowed from the owned config.
+    pub fn sources(self: *const Services) []const script.config.SourceSpec {
+        const config = if (self.config) |*value| value else return &.{};
+        return config.sources;
+    }
+
+    /// Start a program the way key bindings do.
+    pub fn spawner(self: *Services) Spawner {
+        return .{ .context = @ptrCast(self), .run = spawn };
+    }
+
     /// Return one configured surface borrowed from the owned config.
     pub fn surface(self: *const Services, placement: []const u8, role: []const u8) ?*const script.config.SurfaceSpec {
         std.debug.assert(placement.len > 0);
@@ -290,6 +301,11 @@ pub const Services = struct {
             return;
         };
     }
+};
+
+pub const Spawner = struct {
+    context: ?*anyopaque,
+    run: *const fn (?*anyopaque, []const []const u8) anyerror!void,
 };
 
 const SpawnRequest = struct {

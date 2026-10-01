@@ -16,6 +16,7 @@ pub const render_delta = @import("render_delta.zig");
 pub const skia_scene = @import("skia_scene.zig");
 pub const lua_composition = @import("lua/composition.zig");
 pub const surface_composition = @import("surface_composition.zig");
+pub const values = @import("values.zig");
 pub const river_coordinator = @import("river_coordinator.zig");
 
 test {

@@ -136,7 +136,8 @@ pub const Presenter = struct {
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     thread: ?std.Thread = null,
-    pending: ?OwnedUpdate = null,
+    /// Service updates not yet rendered, at most one per service.
+    pending: std.ArrayList(OwnedUpdate) = .empty,
     frame_ms: ?f64 = null,
     render_requested: bool = false,
     worker_active: bool = false,
@@ -226,8 +227,17 @@ pub const Presenter = struct {
             request.deinit();
             return error.PresenterClosing;
         }
-        replaced = self.pending;
-        self.pending = request;
+        for (self.pending.items) |*existing| {
+            if (std.mem.eql(u8, existing.value.service, request.value.service)) {
+                replaced = existing.*;
+                existing.* = request;
+                break;
+            }
+        } else self.pending.append(self.allocator, request) catch |err| {
+            self.unlock();
+            request.deinit();
+            return err;
+        };
         self.render_requested = true;
         self.changed.signal(self.io);
         self.unlock();
@@ -285,10 +295,11 @@ pub const Presenter = struct {
         }
         self.closing = true;
         var pending = self.pending;
-        self.pending = null;
+        self.pending = .empty;
         self.changed.broadcast(self.io);
         self.unlock();
-        if (pending) |*request| request.deinit();
+        for (pending.items) |*request| request.deinit();
+        pending.deinit(self.allocator);
         if (self.thread) |thread| thread.join();
         self.destroy(false);
     }
@@ -297,10 +308,11 @@ pub const Presenter = struct {
         self.lock();
         self.closing = true;
         var pending = self.pending;
-        self.pending = null;
+        self.pending = .empty;
         self.changed.broadcast(self.io);
         self.unlock();
-        if (pending) |*request| request.deinit();
+        for (pending.items) |*request| request.deinit();
+        pending.deinit(self.allocator);
         if (self.thread) |thread| thread.join();
         self.destroy(true);
     }
@@ -312,6 +324,7 @@ pub const Presenter = struct {
         };
         defer renderer.deinit();
         self.composition.setTextMetrics(renderer.textMetrics());
+        self.composition.setViewport(.{ .width = self.width, .height = self.height });
         while (true) {
             self.lock();
             while (!self.closing and !self.canRender())
@@ -320,8 +333,8 @@ pub const Presenter = struct {
                 self.unlock();
                 return;
             }
-            var request = self.pending;
-            self.pending = null;
+            var requests = self.pending;
+            self.pending = .empty;
             const frame_ms = self.frame_ms;
             self.frame_ms = null;
             self.render_requested = false;
@@ -330,8 +343,9 @@ pub const Presenter = struct {
             self.worker_active = true;
             self.unlock();
 
-            const rendered = self.render(&renderer, index, if (request) |*owned| owned.value else null, frame_ms);
-            if (request) |*owned| owned.deinit();
+            const rendered = self.render(&renderer, index, requests.items, frame_ms);
+            for (requests.items) |*owned| owned.deinit();
+            requests.deinit(self.allocator);
 
             self.lock();
             self.worker_active = false;
@@ -357,12 +371,13 @@ pub const Presenter = struct {
         self: *Presenter,
         renderer: *graphics.skia.GpuRenderer,
         index: usize,
-        update_value: ?script.program_loader.Update,
+        requests: []const OwnedUpdate,
         frame_ms: ?f64,
     ) !void {
-        if (update_value) |service_update| try self.composition.update(service_update);
+        for (requests) |*request| try self.composition.update(request.value);
         if (frame_ms) |now| {
-            const values = [_]script.program_loader.Value{.{ .number = now }};
+            const fields = [_]script.program_loader.Value.Field{.{ .key = "now", .value = .{ .number = now } }};
+            const values = [_]script.program_loader.Value{.{ .object = &fields }};
             try self.composition.update(.{ .service = "frame", .values = &values });
         }
         var frame = try self.composition.lower(.{

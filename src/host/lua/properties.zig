@@ -115,9 +115,14 @@ fn polygon(value: lua_program.Value) !ui.Polygon {
     if (values.len > ui.properties.max_polygon_points) return error.InvalidProperty;
     var result = ui.Polygon{ .len = @intCast(values.len) };
     for (values, 0..) |item, index| {
+        // { x, y } or { x, y, dx, dy }.
         const coordinates = array(item, 2) orelse return error.InvalidProperty;
-        if (coordinates.len != 2) return error.InvalidProperty;
+        if (coordinates.len != 2 and coordinates.len != 4) return error.InvalidProperty;
         result.points[index] = .{ .x = try number(coordinates[0]), .y = try number(coordinates[1]) };
+        if (coordinates.len == 4) {
+            result.points[index].dx = try number(coordinates[2]);
+            result.points[index].dy = try number(coordinates[3]);
+        }
     }
     return result;
 }

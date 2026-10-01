@@ -25,6 +25,8 @@ pub const Service = struct {
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
     queue: std.ArrayList([]const u8) = .empty,
     wake: ?Wake = null,
+    /// How many icons have been looked up so far; changes as lookups finish.
+    resolved: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !*Service {
         const self = try allocator.create(Service);
@@ -101,10 +103,17 @@ pub const Service = struct {
             };
             entry.path = path;
             entry.ready = true;
+            self.resolved +%= 1;
             const wake = self.wake;
             self.unlock();
             if (wake) |callback| callback.run(callback.context);
         }
+    }
+
+    pub fn resolvedCount(self: *Service) u64 {
+        self.lock();
+        defer self.unlock();
+        return self.resolved;
     }
 
     fn lock(self: *Service) void {

@@ -69,6 +69,8 @@ pub fn Execution(comptime Program: type) type {
             self.api.set_global(state, "whirlpool_native_update_value");
             self.api.push_nil(state);
             self.api.set_global(state, "whirlpool_native_bounds");
+            self.api.push_nil(state);
+            self.api.set_global(state, "whirlpool_native_act");
             self.api.set_top(state, 0);
             self.scratch.deinit();
             self.* = undefined;
@@ -91,6 +93,7 @@ pub fn Execution(comptime Program: type) type {
             try self.installFunction("whirlpool_native_update_count", nativeUpdateCountCallback);
             try self.installFunction("whirlpool_native_update_value", nativeUpdateValueCallback);
             try self.installFunction("whirlpool_native_bounds", nativeBoundsCallback);
+            try self.installFunction("whirlpool_native_act", nativeActCallback);
             self.api.set_top(state, 0);
             if (self.api.load_buffer(state, bootstrap_source.ptr, bootstrap_source.len, "=whirlpool.bootstrap", null) != 0)
                 return self.callbackFailed("bootstrap load");
@@ -201,11 +204,20 @@ pub fn Execution(comptime Program: type) type {
                     _ = self.api.push_lstring(state, item.ptr, item.len);
                 },
                 .array => |items| {
-                    if (items.len > self.program.limits.max_property_items) return error.PropertyItemLimitExceeded;
+                    if (items.len > self.program.limits.max_update_items) return error.PropertyItemLimitExceeded;
                     self.api.create_table(state, @intCast(items.len), 0);
                     for (items, 0..) |item, index| {
                         try self.pushValue(item);
                         self.api.raw_set_i(state, -2, @intCast(index + 1));
+                    }
+                },
+                .object => |fields| {
+                    if (fields.len > self.program.limits.max_update_items) return error.PropertyItemLimitExceeded;
+                    self.api.create_table(state, 0, @intCast(fields.len));
+                    for (fields) |field| {
+                        _ = self.api.push_lstring(state, field.key.ptr, field.key.len);
+                        try self.pushValue(field.value);
+                        self.api.raw_set(state, -3);
                     }
                 },
             }
@@ -242,6 +254,20 @@ pub fn Execution(comptime Program: type) type {
             const value = self.valueAt(3, 0) catch |err| return self.raise(@errorName(err));
             self.countOperation() catch |err| return self.raise(@errorName(err));
             self.sink.set(self.sink.context, @intCast(raw_id), key, value) catch |err| return self.raise(@errorName(err));
+            return 0;
+        }
+
+        fn nativeAct(self: *Bridge) c_int {
+            const state = self.api.state;
+            const name = self.stringAt(1) catch return self.raise("action name must be a string");
+            const count: usize = @intCast(@max(0, self.api.get_top(state) - 1));
+            if (count > 8) return self.raise("too many action arguments");
+            var args: [8][]const u8 = undefined;
+            for (0..count) |index| {
+                args[index] = self.stringAt(@intCast(index + 2)) catch return self.raise("action arguments must be strings");
+            }
+            const handler = self.sink.act orelse return 0;
+            handler(self.sink.context, name, args[0..count]) catch |err| return self.raise(@errorName(err));
             return 0;
         }
 
@@ -378,6 +404,10 @@ pub fn Execution(comptime Program: type) type {
 
         fn nativeBoundsCallback(state: *LuaState) callconv(.c) c_int {
             return (bridgeFromState(state) orelse return 0).nativeBounds();
+        }
+
+        fn nativeActCallback(state: *LuaState) callconv(.c) c_int {
+            return (bridgeFromState(state) orelse return 0).nativeAct();
         }
     };
 }

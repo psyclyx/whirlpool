@@ -15,6 +15,7 @@ local whirlpool = {}
 local registry = {
   bindings = {}, binding_order = {}, binding_listed = {},
   surfaces = {}, surface_order = {}, surface_listed = {},
+  sources = {}, source_order = {}, source_listed = {},
   layout = nil,
 }
 
@@ -87,6 +88,39 @@ function whirlpool.surface(name, spec)
   registry.surfaces[name] = spec
 end
 
+-- Sources ------------------------------------------------------------------
+
+-- Services every surface already receives; a source cannot take their names.
+local reserved_services = { desktop = true, frame = true, ["surface-role"] = true, decoration = true, pointer = true }
+local source_kinds = { cpu = true, memory = true, network = true, disks = true, audio = true, battery = true, command = true }
+
+-- Measure something periodically under `name`; surfaces receive it as the
+-- service of that name (`whirlpool.surface.on(name, fn)`), as timestamped
+-- series. `spec`:
+--   kind     cpu, memory, network, disks, audio, battery, or command
+--            (default: the name)
+--   every    milliseconds between samples (default 1000)
+--   keep     milliseconds of history to keep (default 30000)
+--   command  for kind = "command": the program and its arguments; its trimmed
+--            output arrives as `text`
+-- A nil spec stops the source.
+function whirlpool.source(name, spec)
+  assert(type(name) == "string" and name ~= "", "source name must be a string")
+  assert(not reserved_services[name], "source name " .. name .. " is a built-in service")
+  if spec ~= nil then
+    assert(type(spec) == "table", "source spec must be a table")
+    local kind = spec.kind or name
+    assert(source_kinds[kind], "unknown source kind: " .. tostring(kind))
+    assert(kind ~= "command" or type(spec.command) == "table", "a command source needs a command list")
+    spec = { kind = kind, every = spec.every or 1000, keep = spec.keep or 30000, command = spec.command or {} }
+  end
+  if not registry.source_listed[name] then
+    registry.source_listed[name] = true
+    registry.source_order[#registry.source_order + 1] = name
+  end
+  registry.sources[name] = spec
+end
+
 -- Layout -------------------------------------------------------------------
 
 -- Use the layout module `module` (e.g. "lib.scrolling"). A module returning a
@@ -143,10 +177,18 @@ function whirlpool._build()
       surfaces[#surfaces + 1] = entry
     end
   end
+  local sources = {}
+  for _, name in ipairs(registry.source_order) do
+    local spec = registry.sources[name]
+    if spec then
+      sources[#sources + 1] = { name = name, kind = spec.kind, every = spec.every, keep = spec.keep, command = spec.command }
+    end
+  end
   local layout = registry.layout
   return {
     bindings = bindings,
     surfaces = surfaces,
+    sources = sources,
     layout = layout and {
       module = layout.module,
       options = whirlpool.serialize(layout.options, "layout options"),

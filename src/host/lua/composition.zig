@@ -44,6 +44,22 @@ pub const Frame = struct {
     }
 };
 
+/// A request from the program to its host (`whirlpool.surface.act`).
+pub const Action = struct {
+    name: []u8,
+    args: [][]u8,
+
+    pub fn deinit(self: *Action, allocator: Allocator) void {
+        for (self.args) |arg| allocator.free(arg);
+        allocator.free(self.args);
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+/// More than this many pending actions means a runaway program.
+const max_pending_actions = 64;
+
 pub const Composition = struct {
     allocator: Allocator,
     options: Options,
@@ -57,6 +73,8 @@ pub const Composition = struct {
     measurer: ui.Measurer = ui.Measurer.estimate,
     /// The surface size last drawn, which geometry queries are answered for.
     viewport: ?skia_scene.Viewport = null,
+    /// Actions the program asked for, waiting for the host to take them.
+    actions: std.ArrayList(Action) = .empty,
 
     /// Allocate a scene, mount the program once, and apply its initial
     /// property batch. The VM remains owned by the caller.
@@ -105,6 +123,8 @@ pub const Composition = struct {
     }
 
     pub fn deinit(self: *Composition) void {
+        for (self.actions.items) |*action| action.deinit(self.allocator);
+        self.actions.deinit(self.allocator);
         self.delta.deinit();
         self.nodes.deinit(self.allocator);
         self.mount_context.deinit();
@@ -133,6 +153,7 @@ pub const Composition = struct {
             .set = sinkSet,
             .finish = sinkFinish,
             .bounds = sinkBounds,
+            .act = sinkAct,
         };
     }
 
@@ -223,6 +244,29 @@ pub const Composition = struct {
     fn sinkSet(context: ?*anyopaque, id: lua_program.NodeId, key: []const u8, value: lua_program.Value) anyerror!void {
         const self = fromContext(context);
         return property_decoder.apply(self, id, key, value);
+    }
+
+    /// The actions requested since the last call; the caller owns them.
+    pub fn takeActions(self: *Composition) ![]Action {
+        return self.actions.toOwnedSlice(self.allocator);
+    }
+
+    fn sinkAct(context: ?*anyopaque, name: []const u8, args: []const []const u8) anyerror!void {
+        const self = fromContext(context);
+        if (self.actions.items.len >= max_pending_actions) return error.TooManyActions;
+        const owned_args = try self.allocator.alloc([]u8, args.len);
+        var copied: usize = 0;
+        errdefer {
+            for (owned_args[0..copied]) |arg| self.allocator.free(arg);
+            self.allocator.free(owned_args);
+        }
+        for (args, owned_args) |arg, *destination| {
+            destination.* = try self.allocator.dupe(u8, arg);
+            copied += 1;
+        }
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        try self.actions.append(self.allocator, .{ .name = owned_name, .args = owned_args });
     }
 
     fn sinkBounds(context: ?*anyopaque, id: lua_program.NodeId) anyerror!?[4]f32 {

@@ -21,6 +21,7 @@ pub const MaxSurfaces: usize = 64;
 pub const MaxSurfaceSourceBytes: usize = 256 * 1024;
 pub const MaxLayoutSourceBytes: usize = 256 * 1024;
 pub const MaxOptionsBytes: usize = 64 * 1024;
+pub const MaxSources: usize = 32;
 
 pub const SurfaceSpec = struct {
     name: []u8,
@@ -47,6 +48,23 @@ pub const SurfaceSpec = struct {
     }
 };
 
+/// A periodically sampled measurement; see `whirlpool.source`.
+pub const SourceSpec = struct {
+    name: []u8,
+    kind: []u8,
+    every_ms: u32,
+    keep_ms: u32,
+    argv: [][]u8,
+
+    pub fn deinit(self: *SourceSpec, allocator: std.mem.Allocator) void {
+        for (self.argv) |arg| allocator.free(arg);
+        allocator.free(self.argv);
+        allocator.free(self.kind);
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
 pub const Action = binding_config.Action;
 pub const Binding = binding_config.Binding;
 
@@ -54,6 +72,7 @@ pub const Config = struct {
     allocator: std.mem.Allocator,
     bindings: []Binding,
     surfaces: []SurfaceSpec,
+    sources: []SourceSpec,
     /// Lua source producing the layout controller.
     layout_source: []u8,
     modules: modules.Set,
@@ -63,6 +82,8 @@ pub const Config = struct {
         self.allocator.free(self.bindings);
         for (self.surfaces) |*descriptor| descriptor.deinit(self.allocator);
         self.allocator.free(self.surfaces);
+        for (self.sources) |*source| source.deinit(self.allocator);
+        self.allocator.free(self.sources);
         self.allocator.free(self.layout_source);
         self.modules.deinit();
         self.* = undefined;
@@ -87,6 +108,7 @@ pub const Error = std.mem.Allocator.Error || lua_vm.Error || binding_config.Erro
     DuplicateSurface,
     TooManySurfaces,
     InvalidContent,
+    InvalidSources,
 };
 
 pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!Config {
@@ -127,6 +149,14 @@ pub fn loadSource(allocator: std.mem.Allocator, source: []const u8, set: modules
     for (surfaces) |*surface| surface.modules = set.modules;
     vm.setTop(1);
 
+    vm.getField(-1, "sources");
+    const sources = try parseSources(allocator, &vm);
+    errdefer {
+        for (sources) |*item| item.deinit(allocator);
+        allocator.free(sources);
+    }
+    vm.setTop(1);
+
     vm.getField(-1, "bindings");
     const bindings = try binding_config.parse(allocator, &vm);
     vm.setTop(0);
@@ -134,6 +164,7 @@ pub fn loadSource(allocator: std.mem.Allocator, source: []const u8, set: modules
         .allocator = allocator,
         .bindings = bindings,
         .surfaces = surfaces,
+        .sources = sources,
         .layout_source = layout_source,
         .modules = set,
     };
@@ -163,7 +194,7 @@ fn layoutEntry(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error![]u8 {
 /// The surface state's entry: mount the content module with its options and
 /// route service updates to it (a returned controller's `update`, and the
 /// handlers it registered with `whirlpool.surface`).
-fn surfaceEntry(allocator: std.mem.Allocator, module: []const u8, options: []const u8) Error![]u8 {
+pub fn surfaceEntry(allocator: std.mem.Allocator, module: []const u8, options: []const u8) Error![]u8 {
     if (!validModuleName(module)) return error.InvalidContent;
     if (options.len > MaxOptionsBytes) return error.InvalidContent;
     return std.fmt.allocPrint(allocator,
@@ -187,6 +218,56 @@ fn validModuleName(name: []const u8) bool {
         else => return false,
     };
     return true;
+}
+
+fn parseSources(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error![]SourceSpec {
+    if (vm.luaType(-1) != .table) return error.InvalidSources;
+    const count = vm.rawLength(-1);
+    if (count > MaxSources) return error.InvalidSources;
+    const sources = try allocator.alloc(SourceSpec, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (sources[0..initialized]) |*source| source.deinit(allocator);
+        allocator.free(sources);
+    }
+    while (initialized < count) : (initialized += 1) {
+        vm.rawGetInteger(-1, @intCast(initialized + 1));
+        if (vm.luaType(-1) != .table) return error.InvalidSources;
+        const base: c_int = @intCast(vm.stackDepth());
+        const name = try dupeField(allocator, vm, base, "name", error.InvalidSources);
+        errdefer allocator.free(name);
+        const kind = try dupeField(allocator, vm, base, "kind", error.InvalidSources);
+        errdefer allocator.free(kind);
+        const every_ms = optionalU32Field(vm, base, "every") catch return error.InvalidSources;
+        const keep_ms = optionalU32Field(vm, base, "keep") catch return error.InvalidSources;
+        vm.getField(-1, "command");
+        const argv = try stringList(allocator, vm);
+        vm.setTop(base);
+        sources[initialized] = .{ .name = name, .kind = kind, .every_ms = every_ms, .keep_ms = keep_ms, .argv = argv };
+        vm.setTop(2);
+    }
+    return sources;
+}
+
+/// A list of strings at the top of the stack (nil is empty).
+fn stringList(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error![][]u8 {
+    if (vm.luaType(-1) == .nil) return allocator.alloc([]u8, 0);
+    if (vm.luaType(-1) != .table) return error.InvalidSources;
+    const count = vm.rawLength(-1);
+    if (count > MaxArguments) return error.InvalidSources;
+    const list = try allocator.alloc([]u8, count);
+    var filled: usize = 0;
+    errdefer {
+        for (list[0..filled]) |item| allocator.free(item);
+        allocator.free(list);
+    }
+    while (filled < count) : (filled += 1) {
+        vm.rawGetInteger(-1, @intCast(filled + 1));
+        const item = vm.string(-1) orelse return error.InvalidSources;
+        list[filled] = try allocator.dupe(u8, item);
+        vm.setTop(-2);
+    }
+    return list;
 }
 
 fn parseSurfaces(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error![]SurfaceSpec {

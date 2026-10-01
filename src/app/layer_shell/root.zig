@@ -34,8 +34,18 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
     var session: wayland_runtime.Session = undefined;
     try session.init(client);
     defer session.deinit();
-    const status = try status_app.Service.init(allocator, io);
+    const clock_origin = std.Io.Clock.awake.now(io);
+    var specs = std.ArrayList(status_app.Spec).empty;
+    defer specs.deinit(allocator);
+    for (config.sources) |source| {
+        const kind = std.meta.stringToEnum(status_app.Kind, source.kind) orelse continue;
+        try specs.append(allocator, .{ .name = source.name, .kind = kind, .every_ms = source.every_ms, .keep_ms = source.keep_ms, .argv = source.argv });
+    }
+    const status = try status_app.Service.init(allocator, io, clock_origin, specs.items);
     defer status.deinit();
+    const revisions = try allocator.alloc(u64, status.sourceCount());
+    defer allocator.free(revisions);
+    @memset(revisions, std.math.maxInt(u64));
     var layer_live = true;
     // This CLI owns the whole client connection. On any process-exit path,
     // stop its worker and drop local proxies before wl_display disconnects.
@@ -48,8 +58,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8) !
         .runtime = &layer,
         .session = &session,
         .status = status,
+        .revisions = revisions,
+        .allocator = allocator,
         .io = io,
-        .clock_origin = std.Io.Clock.awake.now(io),
+        .clock_origin = clock_origin,
     };
     session.setAfterDispatch(.{ .context = @ptrCast(&after_dispatch), .run = AfterDispatch.run });
     std.log.info("Portable layer-shell host connected", .{});
@@ -72,18 +84,22 @@ const AfterDispatch = struct {
     runtime: *layer_shell_runtime.Runtime,
     session: *wayland_runtime.Session,
     status: *status_app.Service,
+    revisions: []u64,
+    allocator: std.mem.Allocator,
     io: std.Io,
     clock_origin: std.Io.Timestamp,
-    status_revision: u64 = 0,
     last_frame_ms: ?f64 = null,
 
     fn run(raw: ?*anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
-        if (self.status.latestAfter(self.status_revision)) |latest| {
-            self.status_revision = latest.revision;
-            var status_values: status_app.StatusValues(script.program_loader.Value) = .{};
-            const values = status_values.build(&latest.value);
-            try self.runtime.update(.{ .service = "status", .values = values });
+        for (self.revisions, 0..) |*seen, index| {
+            if (self.status.revision(index) == seen.*) continue;
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const encoded = try self.status.encode(script.program_loader.Value, arena.allocator(), index);
+            seen.* = encoded.revision;
+            const values = [_]script.program_loader.Value{encoded.value};
+            try self.runtime.update(.{ .service = self.status.sourceName(index), .values = &values });
         }
         const elapsed = self.clock_origin.durationTo(std.Io.Clock.awake.now(self.io)).nanoseconds;
         const now_ms = @as(f64, @floatFromInt(@max(elapsed, 0))) / 1_000_000.0;

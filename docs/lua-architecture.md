@@ -5,8 +5,12 @@ separate concerns.
 
 ## Lua policy
 
-Lua owns user configuration: bindings, rules, layouts, and retained shell
-composition. Configuration is loaded once into typed Zig values. Wayland
+Lua owns user configuration: bindings, rules, layouts, data sources, and
+retained surface composition. A configuration registers each piece by key
+through `require("whirlpool")` (`bind`, `layout`, `surface`, `source`):
+registering under an existing key replaces it and registering nil removes it, so
+there is no all-in-one program table and one configuration can build on
+another. The registry is read once into typed Zig values. Wayland
 proxies, Vulkan handles, pointers, and file descriptors never cross the Lua
 boundary.
 
@@ -71,31 +75,48 @@ relative to the content origin. This lets the controller keep border geometry
 fixed while partially off-screen chrome shrinks through clipping and finally
 disappears.
 
-Workspace actions are likewise an ordinary Lua convention.
-`whirlpool.workspace` constructs semantic action values without exposing
-compositor objects. The sample shell consumes the generic `desktop` service
-for workspace occupancy, focused-window metadata, and its layout minimap.
+Three layers of Lua meet here, and they are kept apart:
 
-Widget policy remains in Lua. `whirlpool.shell` composes the retained bar and
-OSD, `whirlpool.decorator` owns title/tab presentation, `whirlpool.status`
-polls portable operating-system status sources, and `whirlpool.theme` is the
-shared color vocabulary. None of those modules owns a Wayland proxy or River
-transaction. The retained vocabulary includes a generic filled polygon whose
-vertices are normalized to its layout box. Lua composes that primitive with
-stacks and clipping to define the sample's angled motif; Whirlpool has no
-slant, powerline section, or bar-specific drawing policy.
+- The runtime (Zig) supplies mechanisms: the retained UI tree and its layout
+  engine (rows, columns, stacks, flex, alignment, measured text, hidden nodes),
+  node geometry queries (`node:bounds()`), pointer events, surface actions,
+  and measurement sources.
+- The standard library (`lua/whirlpool`, embedded in the binary) is what any
+  configuration would otherwise rewrite, with no opinion about appearance:
+  the registration API, `whirlpool.surface` (service handlers by name, and
+  `act` for host actions), `whirlpool.series` (rates and windows over
+  timestamped samples), `whirlpool.pointer` (hit regions, hover, click,
+  scroll), `whirlpool.scroll` (a scroll view that can reveal a child), and
+  `whirlpool.format` (number formatting).
+- The configuration composes them. The example's `config/lib` holds its
+  opinions (the angled panels, plots, theme, bar, title bars, the scrolling
+  layout, mark bindings) and `config/whirlpool.lua` is a short leaf that
+  registers them. Modules beside the configuration are named by path
+  (`lib/bar.lua` is `lib.bar`) and are available to every Lua state.
 
-Surface roles receive a monotonic `frame` service independently from status
-acquisition. Status producers retain raw sampled measurements at their own
-cadence, while Lua chooses interpolation, normalization, zoom, and graph
-geometry on frame updates. In particular, the sample's network history is raw
-bytes per second; the paired center-out graph and its smooth scrolling are
-ordinary Lua drawing policy.
+Layouts and surfaces run in their own Lua states, so a configuration names
+them by module and passes options as plain data.
+
+Every service a surface receives is an object of named fields, delivered to the
+handler registered for its name: `desktop` (tags and the layout's projected
+items with window metadata), `decoration`, `frame` (`now`), `pointer` (one
+event per value), and one service per registered source. A surface answers with
+actions (`surface.act("layout", ...)`, `surface.act("spawn", ...)`); the host
+knows nothing about what a surface draws, where its buttons are, or how it
+scrolls.
+
+Sources are measured by host tasks at their own period and delivered as
+timestamped series on the same clock as frame ticks: `t` plus one array per
+field, with counters (network and disk bytes) left cumulative. Rates,
+smoothing, zoom, and plot geometry are drawing policy, computed per frame from
+sample times, so irregular or late samples land where they belong. Source
+updates and pointer events are frame-class: they never wait for or cause a
+River transaction. Only desktop state is presented atomically with River.
 
 ## Surfaces
 
-The program declares generic surface descriptors containing a provider, role,
-placement, edge, height, exclusive zone, and retained Lua content. The sample
+A surface registration names a provider, role, placement, edge, height,
+exclusive zone, and the content module that builds its retained tree. The sample
 reuses the exact same shell source for two adapters:
 
 - `river` + `shell` creates River-owned integrated UI synchronized with River

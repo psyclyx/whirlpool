@@ -18,6 +18,15 @@ wp.layout("lib.scrolling", {
   widths = { 0.25, 1 / 3, 0.5, 2 / 3, 0.75, 1 },
 })
 
+-- What the bar measures. Plots cover 12 s of history; `keep = 0` keeps only
+-- the latest sample.
+wp.source("cpu", { every = 500, keep = 16000 })
+wp.source("network", { every = 500, keep = 20000 })
+wp.source("disks", { every = 1000, keep = 8000 })
+wp.source("memory", { every = 2000, keep = 0 })
+wp.source("audio", { every = 500, keep = 0 })
+wp.source("battery", { every = 10000, keep = 0 })
+
 wp.surface("bar", {
   provider = "river", role = "shell", placement = "all-outputs",
   edge = "bottom", height = 38, exclusive_zone = 38,

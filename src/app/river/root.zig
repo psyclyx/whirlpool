@@ -42,6 +42,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8, s
         &host_runtime,
         services.surface("river", "shell"),
         services.surface("river", "decoration"),
+        services.sources(),
+        .{ .context = services.spawner().context, .run = services.spawner().run },
     );
     var presentation_live = true;
     defer if (presentation_live) presentation.deinit() catch |err| std.log.err("River graphics cleanup failed: {s}", .{@errorName(err)});
@@ -55,7 +57,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8, s
     defer session.deinit();
     presentation.setWake(.{ .context = @ptrCast(&session), .run = wakeSession });
     defer presentation.clearWake();
-    session.setPollInterval(16);
     var after_dispatch = AfterDispatch{
         .client = client,
         .runtime = &host_runtime,

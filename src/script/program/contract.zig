@@ -8,6 +8,8 @@ pub const Limits = struct {
     max_property_bytes: usize = 4096,
     max_property_items: usize = 64,
     max_property_depth: usize = 4,
+    /// Items in one array or object of a host-to-program update.
+    max_update_items: usize = 4096,
 };
 
 pub const Module = struct {
@@ -21,6 +23,10 @@ pub const Value = union(enum) {
     number: f64,
     string: []const u8,
     array: []const Value,
+    /// A table with string keys, in Lua.
+    object: []const Field,
+
+    pub const Field = struct { key: []const u8, value: Value };
 };
 
 pub const NodeKind = enum {
@@ -51,4 +57,7 @@ pub const Sink = struct {
     /// Where a node is on the surface: x, y, width, height. Null when the
     /// host cannot say (no surface size yet, or the node is hidden).
     bounds: ?*const fn (?*anyopaque, NodeId) anyerror!?[4]f32 = null,
+    /// The program asks its host to perform a named action (strings only); the
+    /// host decides what names mean and may ignore any.
+    act: ?*const fn (?*anyopaque, []const u8, []const []const u8) anyerror!void = null,
 };

@@ -46,37 +46,64 @@ pub const Wake = struct {
 };
 
 const OwnedUpdate = script.program_loader.OwnedUpdate;
-const max_update_services = 8;
+const max_update_services = 32;
+
+/// How a service update reaches a surface program.
+pub const Delivery = enum {
+    /// Persistent state (what the desktop looks like): a newer value replaces
+    /// an older one, and it is committed atomically with River's transaction.
+    state,
+    /// Measurements: a newer value replaces an older one, but drawing it never
+    /// waits for (or manufactures) a River transaction.
+    sample,
+    /// Discrete events such as pointer input: values are appended, never
+    /// coalesced away, and never wait for River.
+    events,
+};
 
 const UpdateSet = struct {
-    items: [max_update_services]?OwnedUpdate = [_]?OwnedUpdate{null} ** max_update_services,
+    items: [max_update_services]?Entry = [_]?Entry{null} ** max_update_services,
 
-    fn equivalent(self: *const UpdateSet, source: script.program_loader.Update) bool {
-        for (&self.items) |*item| if (item.*) |*update|
-            if (std.mem.eql(u8, update.value.service, source.service)) return update.eql(source);
-        return false;
-    }
+    const Entry = struct { update: OwnedUpdate, delivery: Delivery };
 
-    fn canPut(self: *const UpdateSet, service: []const u8) bool {
-        for (&self.items) |*item| if (item.*) |*update| {
-            if (std.mem.eql(u8, update.value.service, service)) return true;
-        } else return true;
-        return false;
-    }
-
-    fn put(self: *UpdateSet, update: OwnedUpdate) ?OwnedUpdate {
-        var free: ?usize = null;
-        for (&self.items, 0..) |*item, index| {
-            if (item.*) |*current| {
-                if (std.mem.eql(u8, current.value.service, update.value.service)) {
-                    const replaced = item.*;
-                    item.* = update;
-                    return replaced;
-                }
-            } else if (free == null) free = index;
-        }
-        self.items[free orelse unreachable] = update;
+    fn find(self: *UpdateSet, service: []const u8) ?*Entry {
+        for (&self.items) |*item| if (item.*) |*entry|
+            if (std.mem.eql(u8, entry.update.value.service, service)) return entry;
         return null;
+    }
+
+    fn equivalent(self: *UpdateSet, source: script.program_loader.Update) bool {
+        const entry = self.find(source.service) orelse return false;
+        return entry.update.eql(source);
+    }
+
+    fn canPut(self: *UpdateSet, service: []const u8) bool {
+        if (self.find(service) != null) return true;
+        for (self.items) |item| if (item == null) return true;
+        return false;
+    }
+
+    /// Store `update`, returning whatever it displaced for the caller to free.
+    /// Events are appended to any not yet delivered.
+    fn put(self: *UpdateSet, allocator: std.mem.Allocator, update: OwnedUpdate, delivery: Delivery) !?OwnedUpdate {
+        if (self.find(update.value.service)) |entry| {
+            var replacement = update;
+            if (delivery == .events) {
+                const joined = try std.mem.concat(allocator, script.program_loader.Value, &.{ entry.update.value.values, update.value.values });
+                defer allocator.free(joined);
+                replacement = try OwnedUpdate.clone(allocator, .{ .service = update.value.service, .values = joined });
+                var consumed = update;
+                consumed.deinit();
+            }
+            const replaced = entry.update;
+            entry.* = .{ .update = replacement, .delivery = delivery };
+            return replaced;
+        }
+        for (&self.items) |*item| if (item.* == null) {
+            item.* = .{ .update = update, .delivery = delivery };
+            return null;
+        };
+        unreachable;
     }
 
     fn take(self: *UpdateSet) UpdateSet {
@@ -90,13 +117,19 @@ const UpdateSet = struct {
         return true;
     }
 
+    /// Whether any update must reach the screen in step with River.
+    fn requiresSync(self: *const UpdateSet) bool {
+        for (self.items) |item| if (item) |entry| if (entry.delivery == .state) return true;
+        return false;
+    }
+
     fn apply(self: *UpdateSet, composition: *host.surface_composition.Composition) !void {
-        for (&self.items) |*item| if (item.*) |*update|
-            try composition.update(update.value);
+        for (&self.items) |*item| if (item.*) |*entry|
+            try composition.update(entry.update.value);
     }
 
     fn deinit(self: *UpdateSet) void {
-        for (&self.items) |*item| if (item.*) |*update| update.deinit();
+        for (&self.items) |*item| if (item.*) |*entry| entry.update.deinit();
         self.* = .{};
     }
 };
@@ -150,6 +183,8 @@ const RolePresenter = struct {
     detached: bool = false,
     surface_inert: bool = false,
     status: Registry.PresenterState = .waiting_for_buffer,
+    /// Actions the surface program requested, for the main thread to perform.
+    outbox: std.ArrayList(host.surface_composition.Action) = .empty,
     ready_slot: ?usize = null,
     ready_requires_sync: bool = false,
     generation: u64 = 0,
@@ -160,8 +195,9 @@ const RolePresenter = struct {
             .shell => "shell",
             .decoration => "decoration",
         };
-        const values = [_]script.program_loader.Value{.{ .string = role_name }};
-        try self.enqueue(.{ .service = "surface-role", .values = &values });
+        const fields = [_]script.program_loader.Value.Field{.{ .key = "role", .value = .{ .string = role_name } }};
+        const values = [_]script.program_loader.Value{.{ .object = &fields }};
+        try self.enqueue(.{ .service = "surface-role", .values = &values }, .state);
         errdefer {
             self.pending.deinit();
             self.desired.deinit();
@@ -201,42 +237,48 @@ const RolePresenter = struct {
         );
     }
 
-    fn enqueue(self: *RolePresenter, source: script.program_loader.Update) !void {
-        self.lock();
-        if (self.desired.equivalent(source)) {
+    fn enqueue(self: *RolePresenter, source: script.program_loader.Update, delivery: Delivery) !void {
+        // Events are never redundant; state and samples are when unchanged.
+        if (delivery != .events) {
+            self.lock();
+            const unchanged = self.desired.equivalent(source);
             self.unlock();
-            return;
+            if (unchanged) return;
         }
-        self.unlock();
 
-        var request = try OwnedUpdate.clone(self.owner.allocator, source);
-        var desired = OwnedUpdate.clone(self.owner.allocator, source) catch |err| {
+        const allocator = self.owner.allocator;
+        var request = try OwnedUpdate.clone(allocator, source);
+        var desired: ?OwnedUpdate = if (delivery == .events) null else OwnedUpdate.clone(allocator, source) catch |err| {
             request.deinit();
             return err;
         };
         var replaced: ?OwnedUpdate = null;
         var replaced_desired: ?OwnedUpdate = null;
         self.lock();
-        if (self.closing or self.retiring) {
+        if (self.closing or self.retiring or !self.pending.canPut(source.service) or !self.desired.canPut(source.service)) {
+            const retiring = self.closing or self.retiring;
             self.unlock();
             request.deinit();
-            desired.deinit();
-            return error.SurfaceRoleRetiring;
+            if (desired) |*value| value.deinit();
+            return if (retiring) error.SurfaceRoleRetiring else error.SurfaceServiceLimitExceeded;
         }
-        if (!self.pending.canPut(source.service) or !self.desired.canPut(source.service)) {
+        replaced = self.pending.put(allocator, request, delivery) catch |err| {
             self.unlock();
-            request.deinit();
-            desired.deinit();
-            return error.SurfaceServiceLimitExceeded;
+            if (desired) |*value| value.deinit();
+            return err;
+        };
+        if (desired) |value| replaced_desired = self.desired.put(allocator, value, delivery) catch unreachable;
+        // A frame rendered for older state is stale; one that merely lacks the
+        // newest samples or events is not, and is still worth presenting.
+        if (delivery == .state) {
+            self.desired_revision +%= 1;
+            if (self.desired_revision == 0) self.desired_revision = 1;
         }
-        replaced = self.pending.put(request);
-        replaced_desired = self.desired.put(desired);
-        self.desired_revision +%= 1;
-        if (self.desired_revision == 0) self.desired_revision = 1;
-        // A completed but unclaimed frame represents the previous revision.
-        // Recycle it immediately so fresh policy state never queues behind a
-        // status-only frame waiting for a River transaction.
-        if (self.status == .ready) {
+        // A completed but unclaimed frame shows the previous desktop state.
+        // Recycle it so fresh state never queues behind a frame waiting for a
+        // River transaction. Samples and events just join the next frame:
+        // recycling for each of them could starve presentation entirely.
+        if (delivery == .state and self.status == .ready) {
             if (self.ready_slot) |index| {
                 self.slots[index].state = .free;
                 self.ready_slot = null;
@@ -277,6 +319,7 @@ const RolePresenter = struct {
             return;
         };
         if (self.composition) |*composition| composition.setTextMetrics(renderer.textMetrics());
+        if (self.composition) |*composition| composition.setViewport(.{ .width = self.extent.width, .height = self.extent.height });
         self.owner.gpu_mutex.unlock(self.owner.io);
         // Tearing down a Skia context flushes and waits on the Vulkan queue
         // every role shares, and queue access must not race another role's
@@ -296,7 +339,7 @@ const RolePresenter = struct {
                 return;
             }
             var requests = self.pending.take();
-            const requires_sync = !requests.isEmpty();
+            const requires_sync = requests.requiresSync();
             const frame_ms = self.frame_ms;
             self.frame_ms = null;
             const revision = self.desired_revision;
@@ -307,6 +350,7 @@ const RolePresenter = struct {
 
             const rendered = self.render(&renderer, slot_index, &requests, frame_ms);
             requests.deinit();
+            self.collectActions();
 
             self.lock();
             self.worker_active = false;
@@ -337,6 +381,22 @@ const RolePresenter = struct {
             if (idle_tick) std.Io.sleep(self.owner.io, .fromMilliseconds(idle_tick_ms), .awake) catch {};
             self.owner.notifyWake();
         }
+    }
+
+    /// Move the program's requested actions to the outbox (worker thread).
+    fn collectActions(self: *RolePresenter) void {
+        const composition = &(self.composition orelse return);
+        const actions = composition.takeActions() catch return;
+        defer self.owner.allocator.free(actions);
+        if (actions.len == 0) return;
+        self.lock();
+        self.outbox.appendSlice(self.owner.allocator, actions) catch {
+            self.unlock();
+            for (actions) |*action| action.deinit(self.owner.allocator);
+            return;
+        };
+        self.unlock();
+        self.owner.notifyWake();
     }
 
     fn allocateSlots(self: *RolePresenter) !void {
@@ -393,7 +453,8 @@ const RolePresenter = struct {
         const frame_only = updates.isEmpty();
         try updates.apply(composition);
         if (frame_ms) |now| {
-            const values = [_]script.program_loader.Value{.{ .number = now }};
+            const fields = [_]script.program_loader.Value.Field{.{ .key = "now", .value = .{ .number = now } }};
+            const values = [_]script.program_loader.Value{.{ .object = &fields }};
             try composition.update(.{ .service = "frame", .values = &values });
         }
         // A clock tick that changed nothing draws nothing: no lowering, no GPU
@@ -604,6 +665,8 @@ const RolePresenter = struct {
             self.initialized_slots -= 1;
             self.slots[self.initialized_slots].deinit(owner.abandoning);
         }
+        for (self.outbox.items) |*action| action.deinit(owner.allocator);
+        self.outbox.deinit(owner.allocator);
         if (self.composition) |*composition| composition.deinit();
         self.status = .destroyed;
         owner.allocator.destroy(self);
@@ -791,9 +854,31 @@ pub const Runtime = struct {
         return self.registry.pollReleases();
     }
 
+    /// Persistent state for a surface program, presented with River's next
+    /// transaction.
     pub fn update(self: *Runtime, role: SurfaceRole, value: script.program_loader.Update) !void {
+        return self.deliver(role, value, .state);
+    }
+
+    pub fn deliver(self: *Runtime, role: SurfaceRole, value: script.program_loader.Update, delivery: Delivery) !void {
         const record = self.findRole(role) orelse return error.SurfaceRoleNotBound;
-        try record.product.enqueue(value);
+        try record.product.enqueue(value, delivery);
+    }
+
+    /// Hand every action surface programs requested to `visit` (main thread).
+    pub fn drainActions(self: *Runtime, context: anytype, comptime visit: fn (@TypeOf(context), SurfaceRole, host.surface_composition.Action) void) void {
+        for (self.roles.items) |record| {
+            const product = record.product;
+            product.lock();
+            var taken = product.outbox;
+            product.outbox = .empty;
+            product.unlock();
+            defer taken.deinit(self.allocator);
+            for (taken.items) |*action| {
+                visit(context, record.role, action.*);
+                action.deinit(self.allocator);
+            }
+        }
     }
 
     /// Coalesce animation time separately from persistent service state. A
@@ -810,10 +895,10 @@ pub const Runtime = struct {
         }
         // The compositor callback starts exactly one frame. Do not let later
         // dispatches get ahead while that frame is rendering or waiting to be
-        // committed; its completion will install the next callback.
+        // committed; its completion will install the next callback. Pending
+        // service updates do not hold it back: they render with this tick.
         if (product.worker_active or product.ready_slot != null or
-            product.status == .prepared or product.status == .armed or
-            !product.pending.isEmpty())
+            product.status == .prepared or product.status == .armed)
         {
             product.unlock();
             return;

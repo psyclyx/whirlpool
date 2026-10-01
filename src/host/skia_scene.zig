@@ -93,8 +93,8 @@ const Lowerer = struct {
             .polygon => if (box.width > 0 and box.height > 0 and p.points.len >= 3) {
                 var polygon = graphics.skia.Polygon{ .len = p.points.len };
                 for (p.points.slice(), 0..) |point, index| polygon.points[index] = .{
-                    .x = box.x + point.x * box.width,
-                    .y = box.y + point.y * box.height,
+                    .x = box.x + point.x * box.width + point.dx,
+                    .y = box.y + point.y * box.height + point.dy,
                 };
                 try self.emit(.{ .polygon = .{ .points = polygon, .color = colorWithOpacity(p.fill, opacity) } });
             },

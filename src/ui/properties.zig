@@ -20,15 +20,19 @@ pub const NodeKind = enum {
 };
 
 pub const max_polygon_points = 16;
-pub const max_polygon_coordinate: f32 = 4096;
+pub const max_polygon_coordinate: f32 = 65536;
 
 pub const Point = struct {
     x: f32 = 0,
     y: f32 = 0,
+    /// Pixels added after scaling, so a vertex can sit a fixed distance from a
+    /// box edge whatever the box's size (a slanted edge, say).
+    dx: f32 = 0,
+    dy: f32 = 0,
 };
 
-/// Box-relative vertices for a filled polygon. Coordinates are normalized
-/// independently against width and height, and may extend outside 0...1 so
+/// Box-relative vertices for a filled polygon: each is at (x * width + dx,
+/// y * height + dy) from the box origin. Points may lie outside the box, so
 /// adjacent shapes can share an edge without changing layout geometry.
 pub const Polygon = struct {
     points: [max_polygon_points]Point = [_]Point{.{}} ** max_polygon_points,
@@ -201,7 +205,7 @@ pub fn validate(kind: NodeKind, value: Value) Error!void {
         .points => |polygon| {
             if (polygon.len < 3 or polygon.len > max_polygon_points) return error.InvalidValue;
             for (polygon.slice()) |point| {
-                if (!validCoordinate(point.x) or !validCoordinate(point.y)) return error.InvalidValue;
+                if (!validCoordinate(point.x) or !validCoordinate(point.y) or !validCoordinate(point.dx) or !validCoordinate(point.dy)) return error.InvalidValue;
             }
         },
         .opacity => |opacity| if (!std.math.isFinite(opacity) or opacity < 0 or opacity > 1) return error.InvalidValue,
@@ -284,7 +288,7 @@ pub fn matches(current: anytype, value: Value) bool {
 fn samePoints(a: Polygon, b: Polygon) bool {
     if (a.len != b.len) return false;
     for (a.slice(), b.slice()) |left, right| {
-        if (left.x != right.x or left.y != right.y) return false;
+        if (left.x != right.x or left.y != right.y or left.dx != right.dx or left.dy != right.dy) return false;
     }
     return true;
 }
