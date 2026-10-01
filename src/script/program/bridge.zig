@@ -111,19 +111,26 @@ pub fn Execution(comptime Program: type) type {
             else
                 module_name;
             for (self.program.modules) |module| {
-                if (!std.mem.eql(u8, module.name, requested_name)) continue;
-                const state = self.api.state;
-                const prefix = "local require = whirlpool_native_require\n";
-                const wrapped = self.scratch.allocator().alloc(u8, prefix.len + module.source.len) catch
-                    return self.raise("module source allocation failed");
-                @memcpy(wrapped[0..prefix.len], prefix);
-                @memcpy(wrapped[prefix.len..], module.source);
-                if (self.api.load_buffer(state, wrapped.ptr, wrapped.len, module.name.ptr, null) != 0)
-                    return self.api.lua_error(state);
-                if (self.api.protectedCall(self.vm, 0, 1) != 0) return self.api.lua_error(state);
-                return 1;
+                if (std.mem.eql(u8, module.name, requested_name)) return self.runModule(module.name, module.source);
+            }
+            for (self.program.shared) |module| {
+                if (std.mem.eql(u8, module.name, requested_name)) return self.runModule(module.name, module.source);
             }
             return self.raise("module not found");
+        }
+
+        fn runModule(self: *Bridge, name: []const u8, source: []const u8) c_int {
+            const state = self.api.state;
+            const prefix = "local require = whirlpool_require\n";
+            const scratch = self.scratch.allocator();
+            const wrapped = std.mem.concat(scratch, u8, &.{ prefix, source }) catch
+                return self.raise("module source allocation failed");
+            const chunk_name = std.fmt.allocPrintSentinel(scratch, "@{s}", .{name}, 0) catch
+                return self.raise("module source allocation failed");
+            if (self.api.load_buffer(state, wrapped.ptr, wrapped.len, chunk_name.ptr, null) != 0)
+                return self.api.lua_error(state);
+            if (self.api.protectedCall(self.vm, 0, 1) != 0) return self.api.lua_error(state);
+            return 1;
         }
 
         /// Execute the configured entry module once.
@@ -393,6 +400,16 @@ const update_source =
     "end\n";
 
 const bootstrap_source =
+    "whirlpool_loaded_modules = whirlpool_loaded_modules or {}\n" ++
+    "function whirlpool_require(name)\n" ++
+    "  local value = whirlpool_loaded_modules[name]\n" ++
+    "  if value == nil then\n" ++
+    "    value = whirlpool_native_require(name)\n" ++
+    "    if value == nil then value = true end\n" ++
+    "    whirlpool_loaded_modules[name] = value\n" ++
+    "  end\n" ++
+    "  return value\n" ++
+    "end\n" ++
     "local function emit(kind, parent, properties)\n" ++
     "  local id = whirlpool_native_create(kind, parent)\n" ++
     "  local node = { __id = id }\n" ++

@@ -1,4 +1,4 @@
-local theme = require("whirlpool.theme")
+local theme = require("lib.theme")
 
 return function(parent)
   local root = parent:stack()

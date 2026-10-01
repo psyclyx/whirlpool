@@ -54,8 +54,8 @@ stdenv.mkDerivation (finalAttrs: {
     install -Dm644 scripts/smoke-common.sh $out/share/whirlpool/scripts/smoke-common.sh
     install -Dm644 scripts/smoke-common.sh $out/bin/smoke-common.sh
     install -Dm644 docs/operational-smoke.md $out/share/doc/whirlpool/operational-smoke.md
-    install -Dm644 config/whirlpool.lua $out/share/whirlpool/config/whirlpool.lua
-    install -Dm644 config/lib/scrolling.lua $out/share/whirlpool/config/lib/scrolling.lua
+    mkdir -p $out/share/whirlpool
+    cp -r config $out/share/whirlpool/config
   '';
 
   deps = callPackage ../../build.zig.zon.nix { };

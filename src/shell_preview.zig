@@ -35,6 +35,8 @@ const scenarios = [_]Scenario{
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
+    var example_modules = try script.modules.collect(allocator, init.io, "config");
+    defer example_modules.deinit();
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next();
@@ -43,8 +45,8 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |flag| if (std.mem.eql(u8, flag, "--live")) return renderLive(allocator, init.io, directory);
 
     for (scenarios) |scenario| {
-        var shell = try host.surface_composition.Composition.init(allocator,
-            \\return require("whirlpool.shell")
+        var shell = try host.surface_composition.Composition.init(allocator, example_modules.modules,
+            \\return require("lib.bar")
         );
         defer shell.deinit();
         try populate(&shell, scenario);
@@ -64,6 +66,8 @@ pub fn main(init: std.process.Init) !void {
 
 /// Render the bar from this machine's real status collectors.
 fn renderLive(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !void {
+    var example_modules = try script.modules.collect(allocator, io, "config");
+    defer example_modules.deinit();
     const service = try status.Service.init(allocator, io);
     defer service.deinit();
     try std.Io.sleep(io, .fromSeconds(4), .awake);
@@ -73,8 +77,8 @@ fn renderLive(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !
     for (snapshot.disks[0..snapshot.disk_count]) |disk| std.debug.print("disk {s} total {d} used {d} avail {d} r {d:.0} w {d:.0}\n", .{ disk.labelSlice(), disk.total, disk.used, disk.avail, disk.read_rate, disk.write_rate });
     std.debug.print("net rx {d:.0} tx {d:.0}; cpu cores {d}\n", .{ snapshot.network_rx, snapshot.network_tx, snapshot.cpu_core_count });
 
-    var shell = try host.surface_composition.Composition.init(allocator,
-        \\return require("whirlpool.shell")
+    var shell = try host.surface_composition.Composition.init(allocator, example_modules.modules,
+        \\return require("lib.bar")
     );
     defer shell.deinit();
     var storage: status.StatusValues(Value) = .{};

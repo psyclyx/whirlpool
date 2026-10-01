@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    script.addImport("whirlpool-lua-stdlib", lua_stdlib);
     const host = b.addModule("whirlpool-host", .{
         .root_source_file = b.path("src/host/root.zig"),
         .target = target,

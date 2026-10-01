@@ -17,10 +17,16 @@ pub const Runtime = struct {
     instructions: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8, limits: Limits) !Runtime {
+        return initWithModules(allocator, &.{}, source, limits);
+    }
+
+    /// `source` is the provider chunk; it may `require` any of `modules`.
+    pub fn initWithModules(allocator: std.mem.Allocator, modules: []const script.modules.Module, source: []const u8, limits: Limits) !Runtime {
         if (source.len == 0 or source.len > script.config.MaxLayoutSourceBytes) return error.InvalidLayoutSource;
-        const vm = try script.lua_vm.Vm.init(true);
+        var vm = try script.lua_vm.Vm.init(true);
+        errdefer vm.deinit();
+        try script.modules.install(&vm, modules);
         var self: Runtime = .{ .allocator = allocator, .vm = vm, .limits = limits };
-        errdefer self.vm.deinit();
         var chunk = std.ArrayList(u8).empty;
         defer chunk.deinit(allocator);
         try chunk.appendSlice(allocator, "local provider = (function()\n");

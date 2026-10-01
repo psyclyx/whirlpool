@@ -359,6 +359,11 @@ pub const Vm = struct {
         self.api.set_global(self.state, name.ptr);
     }
 
+    /// Pop the top value into global `name`.
+    pub fn setGlobal(self: *Vm, name: [:0]const u8) void {
+        self.api.set_global(self.state, name.ptr);
+    }
+
     pub fn setField(self: *Vm, index: c_int, name: [:0]const u8) void {
         self.api.set_field(self.state, index, name.ptr);
     }

@@ -11,8 +11,10 @@ const viewport_height = 600;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
-    var shell = try host.surface_composition.Composition.init(allocator,
-        \\return require("whirlpool.shell")
+    var example_modules = try script.modules.collect(allocator, init.io, "config");
+    defer example_modules.deinit();
+    var shell = try host.surface_composition.Composition.init(allocator, example_modules.modules,
+        \\return require("lib.bar")
     );
     defer shell.deinit();
     try populate(&shell);

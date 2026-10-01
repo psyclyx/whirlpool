@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const script = @import("whirlpool-script");
-const lua_stdlib = @import("whirlpool-lua-stdlib");
 const lua_composition = @import("lua/composition.zig");
 
 pub const Composition = struct {
@@ -14,7 +13,10 @@ pub const Composition = struct {
     program: script.program_loader.Program,
     retained: lua_composition.Composition,
 
-    pub fn init(allocator: std.mem.Allocator, source: []const u8) !Composition {
+    /// `source` mounts the surface (see `script.config.SurfaceSpec.content`);
+    /// it may `require` any of `modules`, which are borrowed for the
+    /// composition's lifetime.
+    pub fn init(allocator: std.mem.Allocator, modules: []const script.modules.Module, source: []const u8) !Composition {
         var vm = try script.program_loader.Vm.init(true);
         errdefer vm.deinit();
         // Surface programs are policy callbacks, not data providers. Removing
@@ -24,17 +26,7 @@ pub const Composition = struct {
         vm.removeGlobal("os");
 
         const loader = script.program_loader.Loader.init(allocator, .{});
-        const modules = [_]script.program_loader.Module{
-            .{ .name = "surface", .source = source },
-            .{ .name = "whirlpool.workspace", .source = lua_stdlib.workspace },
-            .{ .name = "whirlpool.angled", .source = lua_stdlib.angled },
-            .{ .name = "whirlpool.graph", .source = lua_stdlib.graph },
-            .{ .name = "whirlpool.theme", .source = lua_stdlib.theme },
-            .{ .name = "whirlpool.status", .source = lua_stdlib.status },
-            .{ .name = "whirlpool.shell", .source = lua_stdlib.shell },
-            .{ .name = "whirlpool.decorator", .source = lua_stdlib.decorator },
-        };
-        var program = try loader.load("surface", &modules);
+        var program = try loader.loadShared("surface", &.{.{ .name = "surface", .source = source }}, modules);
         errdefer program.deinit();
 
         const retained = try lua_composition.Composition.mount(allocator, &vm, &program, .{});
@@ -71,7 +63,7 @@ pub const Composition = struct {
 };
 
 test "surface composition mounts retained Lua source" {
-    var composition = try Composition.init(std.testing.allocator,
+    var composition = try Composition.init(std.testing.allocator, testModules(),
         \\return function(root)
         \\  local label = root:text({ text = 'surface' })
         \\  return { update = function() label:set('text', 'updated') end }
@@ -85,7 +77,7 @@ test "surface composition mounts retained Lua source" {
 }
 
 test "surface composition cannot perform file or process I/O" {
-    var composition = try Composition.init(std.testing.allocator,
+    var composition = try Composition.init(std.testing.allocator, testModules(),
         \\assert(io == nil)
         \\assert(os == nil)
         \\return function(root)
@@ -96,29 +88,8 @@ test "surface composition cannot perform file or process I/O" {
     defer composition.deinit();
 }
 
-test "surface composition exposes the workspace stdlib module" {
-    var composition = try Composition.init(std.testing.allocator,
-        \\return function(root)
-        \\  local Workspace = require('whirlpool.workspace')
-        \\  local workspaces = Workspace.new({ count = 3 })
-        \\  local label = root:text({ text = table.concat(workspaces:labels(), ' ') })
-        \\  return { update = function(_, service, values)
-        \\    if workspaces:update(service, values) then
-        \\      label:set('text', table.concat(workspaces:labels(), ' '))
-        \\    end
-        \\  end }
-        \\end
-    );
-    defer composition.deinit();
-
-    try composition.update(.{ .service = "workspaces", .values = &.{.{ .number = 2 }} });
-    var frame = try composition.lower(.{ .width = 100, .height = 20 });
-    defer frame.deinit();
-    try std.testing.expectEqual(@as(usize, 2), frame.node_count);
-}
-
 test "surface controllers can retain nodes created during later updates" {
-    var composition = try Composition.init(std.testing.allocator,
+    var composition = try Composition.init(std.testing.allocator, testModules(),
         \\return function(root)
         \\  local child
         \\  return { update = function()
@@ -136,8 +107,8 @@ test "surface controllers can retain nodes created during later updates" {
 }
 
 test "sample shell and decoration modules mount as distinct compositions" {
-    var shell = try Composition.init(std.testing.allocator,
-        \\return require("whirlpool.shell")
+    var shell = try Composition.init(std.testing.allocator, testModules(),
+        \\return require("lib.bar")
     );
     defer shell.deinit();
     var shell_frame = try shell.lower(.{ .width = 800, .height = 600 });
@@ -328,8 +299,8 @@ test "sample shell and decoration modules mount as distinct compositions" {
     try std.testing.expect(rx_rises_from_center);
     try std.testing.expect(tx_falls_from_center);
 
-    var decoration = try Composition.init(std.testing.allocator,
-        \\return require("whirlpool.decorator")
+    var decoration = try Composition.init(std.testing.allocator, testModules(),
+        \\return require("lib.decorator")
     );
     defer decoration.deinit();
     try decoration.update(.{
@@ -379,8 +350,8 @@ test "the shell shows the active tag differently on an unfocused monitor" {
         }
     };
 
-    var shell = try Composition.init(std.testing.allocator,
-        \\return require("whirlpool.shell")
+    var shell = try Composition.init(std.testing.allocator, testModules(),
+        \\return require("lib.bar")
     );
     defer shell.deinit();
 
@@ -451,8 +422,8 @@ fn panelCenterAt(panel: [4]@import("whirlpool-graphics").skia.Point, y: f32) f32
 }
 
 fn barShell(desktop_windows: []const script.program_loader.Value) !Composition {
-    var shell = try Composition.init(std.testing.allocator,
-        \\return require("whirlpool.shell")
+    var shell = try Composition.init(std.testing.allocator, testModules(),
+        \\return require("lib.bar")
     );
     errdefer shell.deinit();
     try shell.update(.{
@@ -999,4 +970,13 @@ test "every history style stays inside its slanted cell and draws its samples" {
     };
     // columns + ticks, each with a bar per visible sample.
     try std.testing.expect(small_plot_polygons >= 2 * 20);
+}
+
+/// The example configuration's modules, shared by every test here (and so
+/// allocated once, outside the leak-checked testing allocator).
+var test_modules_cache: ?script.modules.Set = null;
+fn testModules() []const script.modules.Module {
+    if (test_modules_cache == null)
+        test_modules_cache = script.modules.collect(std.heap.page_allocator, std.testing.io, "config") catch @panic("example configuration modules");
+    return test_modules_cache.?.modules;
 }

@@ -9,6 +9,7 @@ pub const wm_bridge = @import("wm_bridge.zig");
 pub const layout_projection = @import("layout_projection.zig");
 pub const program_loader = @import("program/loader.zig");
 pub const config = @import("config.zig");
+pub const modules = @import("modules.zig");
 
 pub const SafePoint = enum { idle, wm_policy, shell_callback };
 pub const CallbackBudget = struct { max_steps: u64 = 100_000, max_allocations: u32 = 4096 };
@@ -68,4 +69,5 @@ test {
     _ = layout_projection;
     _ = program_loader;
     _ = config;
+    _ = modules;
 }

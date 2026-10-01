@@ -11,10 +11,10 @@
 -- and zfs do); network throughput is bits per second (Mb/s, the unit link
 -- speeds and speed tests use); disk throughput is bytes per second (MB/s).
 
-local theme = require("whirlpool.theme")
-local Status = require("whirlpool.status")
-local Angled = require("whirlpool.angled")
-local Graph = require("whirlpool.graph")
+local theme = require("lib.theme")
+local Status = require("whirlpool.format")
+local Angled = require("lib.angled")
+local Graph = require("lib.graph")
 
 local BAR_HEIGHT = 38
 local CPU_HISTORY_COUNT = 24

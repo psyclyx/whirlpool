@@ -260,6 +260,7 @@ const RolePresenter = struct {
         };
         self.composition = host.surface_composition.Composition.init(
             self.owner.allocator,
+            descriptor.modules,
             descriptor.content,
         ) catch |err| {
             self.failWorker(err);

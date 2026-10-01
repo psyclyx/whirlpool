@@ -1,15 +1,157 @@
--- Public program vocabulary. Native bindings install the constructors and
--- host-owned callbacks; this module intentionally contains no River-shaped API.
+-- Whirlpool's configuration vocabulary.
+--
+-- A configuration is ordinary Lua that registers what it wants, one keyed entry
+-- at a time: key bindings, the layout policy, surfaces. Registering under a key
+-- that already exists replaces that entry, and registering nil removes it, so a
+-- configuration can build on another (require it, then override pieces) with no
+-- all-in-one program table. Nothing here is River-shaped.
+--
+-- Layouts and surfaces run in their own Lua states, so they are named by module
+-- (`lib.bar` is `lib/bar.lua` beside the configuration) and receive their
+-- options as plain data: tables, strings, numbers and booleans.
+
 local whirlpool = {}
 
-function whirlpool.program(spec)
-  assert(type(spec) == "table", "program specification must be a table")
-  assert(spec.api_version == 1, "unsupported whirlpool API version")
-  local allowed = { api_version = true, layout = true, bindings = true, surfaces = true }
-  for key in pairs(spec) do
-    assert(allowed[key], "unsupported whirlpool program field: " .. tostring(key))
+local registry = {
+  bindings = {}, binding_order = {}, binding_listed = {},
+  surfaces = {}, surface_order = {}, surface_listed = {},
+  layout = nil,
+}
+
+-- Actions ------------------------------------------------------------------
+
+-- An action the host performs. `whirlpool.spawn` and friends cover the
+-- built-in ones; layout actions are opaque names the layout module handles.
+function whirlpool.action(name, ...)
+  return { name = name, args = { ... } }
+end
+
+function whirlpool.spawn(...) return whirlpool.action("spawn", ...) end
+function whirlpool.enter_mode(mode) return whirlpool.action("enter-mode", mode) end
+function whirlpool.layout_action(name, ...) return whirlpool.action("layout", name, ...) end
+
+-- Bindings -----------------------------------------------------------------
+
+local function binding_key(mode, modifiers, key)
+  local sorted = {}
+  for index, modifier in ipairs(modifiers) do sorted[index] = string.lower(modifier) end
+  table.sort(sorted)
+  return mode .. "\0" .. table.concat(sorted, "+") .. "\0" .. key
+end
+
+-- Bind `key` (with `modifiers`, in `mode`) to `action`, replacing whatever that
+-- chord did before. A nil action unbinds it.
+--   whirlpool.bind({ "super" }, "Return", whirlpool.spawn("foot"))
+--   whirlpool.bind({ "super" }, "Return", nil, { mode = "default" })
+function whirlpool.bind(modifiers, key, action, options)
+  assert(type(modifiers) == "table", "binding modifiers must be a list")
+  assert(type(key) == "string" and key ~= "", "binding key must be a key name")
+  assert(action == nil or (type(action) == "table" and type(action.name) == "string"),
+    "binding action must come from whirlpool.action or a helper")
+  local mode = options and options.mode or "default"
+  local id = binding_key(mode, modifiers, key)
+  if not registry.binding_listed[id] then
+    registry.binding_listed[id] = true
+    registry.binding_order[#registry.binding_order + 1] = id
   end
-  return spec
+  registry.bindings[id] = action and { mode = mode, modifiers = modifiers, key = key, action = action } or nil
+end
+
+-- Surfaces -----------------------------------------------------------------
+
+local surface_fields = {
+  provider = "string", role = "string", placement = "string", content = "string",
+  edge = "string", height = "number", exclusive_zone = "number", options = "table",
+}
+
+-- Register a surface under `name`, replacing any surface of that name. `spec`:
+--   provider, role, placement   where and how it is shown (host-defined)
+--   edge, height, exclusive_zone
+--   content                     module name, e.g. "lib.bar"
+--   options                     plain data handed to the content module
+-- A nil spec removes the surface.
+function whirlpool.surface(name, spec)
+  assert(type(name) == "string" and name ~= "", "surface name must be a string")
+  if spec ~= nil then
+    assert(type(spec) == "table", "surface spec must be a table")
+    for field, value in pairs(spec) do
+      local wanted = surface_fields[field]
+      assert(wanted, "unknown surface field: " .. tostring(field))
+      assert(type(value) == wanted, "surface field " .. field .. " must be a " .. wanted)
+    end
+  end
+  if not registry.surface_listed[name] then
+    registry.surface_listed[name] = true
+    registry.surface_order[#registry.surface_order + 1] = name
+  end
+  registry.surfaces[name] = spec
+end
+
+-- Layout -------------------------------------------------------------------
+
+-- Use the layout module `module` (e.g. "lib.scrolling"). A module returning a
+-- table with `new` is constructed with `options`.
+function whirlpool.layout(module, options)
+  assert(type(module) == "string" and module ~= "", "layout must be a module name")
+  registry.layout = { module = module, options = options or {} }
+end
+
+-- Plain data across Lua states -----------------------------------------------
+
+-- Lua source for a constructor of `value`, which must be plain data.
+function whirlpool.serialize(value, path)
+  path = path or "options"
+  local kind = type(value)
+  if kind == "string" then return string.format("%q", value) end
+  if kind == "boolean" then return tostring(value) end
+  if kind == "number" then
+    assert(value == value and value ~= math.huge and value ~= -math.huge, path .. " is not a finite number")
+    if math.type and math.type(value) == "integer" then return tostring(value) end
+    return string.format("%.17g", value)
+  end
+  assert(kind == "table", path .. " is a " .. kind .. ", which cannot be passed on")
+  local keys = {}
+  for key in pairs(value) do
+    assert(type(key) == "string" or type(key) == "number", path .. " has a " .. type(key) .. " key")
+    keys[#keys + 1] = key
+  end
+  table.sort(keys, function(a, b)
+    if type(a) == type(b) then return a < b end
+    return type(a) == "number"
+  end)
+  local parts = {}
+  for _, key in ipairs(keys) do
+    local child = whirlpool.serialize(value[key], path .. "." .. tostring(key))
+    parts[#parts + 1] = "[" .. whirlpool.serialize(key, path) .. "]=" .. child
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+-- The registered configuration as the host reads it.
+function whirlpool._build()
+  local bindings = {}
+  for _, id in ipairs(registry.binding_order) do
+    if registry.bindings[id] then bindings[#bindings + 1] = registry.bindings[id] end
+  end
+  local surfaces = {}
+  for _, name in ipairs(registry.surface_order) do
+    local spec = registry.surfaces[name]
+    if spec then
+      local entry = { name = name }
+      for field, value in pairs(spec) do entry[field] = value end
+      entry.options = whirlpool.serialize(spec.options or {}, "surface " .. name .. " options")
+      surfaces[#surfaces + 1] = entry
+    end
+  end
+  local layout = registry.layout
+  return {
+    bindings = bindings,
+    surfaces = surfaces,
+    layout = layout and {
+      module = layout.module,
+      options = whirlpool.serialize(layout.options, "layout options"),
+    } or nil,
+  }
 end
 
 return whirlpool

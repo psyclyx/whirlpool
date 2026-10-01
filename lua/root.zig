@@ -1,9 +1,11 @@
-//! Lua standard-library sources embedded for sandboxed retained programs.
+//! Whirlpool's Lua standard library, embedded so every Lua state (the
+//! configuration, the layout, each surface) resolves it identically and no
+//! search path is involved.
 
-pub const workspace = @embedFile("whirlpool/workspace.lua");
-pub const angled = @embedFile("whirlpool/angled.lua");
-pub const graph = @embedFile("whirlpool/graph.lua");
-pub const theme = @embedFile("whirlpool/theme.lua");
-pub const status = @embedFile("whirlpool/status.lua");
-pub const shell = @embedFile("whirlpool/shell.lua");
-pub const decorator = @embedFile("whirlpool/decorator.lua");
+pub const Module = struct { name: []const u8, source: []const u8 };
+
+pub const modules = [_]Module{
+    .{ .name = "whirlpool", .source = @embedFile("whirlpool/init.lua") },
+    .{ .name = "whirlpool.surface", .source = @embedFile("whirlpool/surface.lua") },
+    .{ .name = "whirlpool.format", .source = @embedFile("whirlpool/format.lua") },
+};

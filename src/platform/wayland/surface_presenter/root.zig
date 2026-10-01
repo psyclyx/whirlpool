@@ -154,7 +154,7 @@ pub const Presenter = struct {
     ) !*Presenter {
         const self = try allocator.create(Presenter);
         errdefer allocator.destroy(self);
-        var composition = try host.surface_composition.Composition.init(allocator, descriptor.content);
+        var composition = try host.surface_composition.Composition.init(allocator, descriptor.modules, descriptor.content);
         errdefer composition.deinit();
         self.* = .{
             .allocator = allocator,

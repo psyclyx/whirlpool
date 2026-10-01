@@ -5,7 +5,8 @@
 local peek, inner_gap, outer_gap = 16, 8, 4
 local border_width, decoration_height = 4, 28
 local min_root_width, max_root_width = 0.05, 4
--- Column widths, as fractions of the viewport, that width actions step through.
+-- Column widths, as fractions of the viewport, that width actions step through
+-- (`options.widths`).
 local widths = { 0.25, 1 / 3, 0.5, 2 / 3, 0.75, 1 }
 local animation_duration_ms = 180
 local main_axis, main_reverse, cross_reverse = "horizontal", false, false
@@ -1598,8 +1599,20 @@ local function project(snapshot)
   return items
 end
 
-return {
+local controller = {
   layout = layout, action = action, project = project,
   begin_actions = begin_actions, finish_actions = finish_actions,
   save = save, restore = restore,
 }
+
+-- `whirlpool.layout("lib.scrolling", options)` constructs the controller.
+function controller.new(options)
+  options = options or {}
+  if options.widths then
+    assert(#options.widths > 0, "widths must list at least one width")
+    widths = options.widths
+  end
+  return controller
+end
+
+return controller
