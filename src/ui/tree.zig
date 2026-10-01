@@ -271,13 +271,8 @@ pub const Scene = struct {
         const stored = self.lookupNodeMut(handle) orelse return error.StaleNode;
         try properties.validate(stored.kind, value);
         switch (value) {
-            .text => |requested| {
-                if (owned_bytes == null and !std.mem.eql(u8, stored.properties.fields.text, requested)) {
-                    return error.InvalidValue;
-                }
-            },
-            .icon_source => |requested| {
-                if (owned_bytes == null and !std.mem.eql(u8, stored.properties.fields.icon_source, requested)) {
+            inline .text, .icon_source, .font_family => |requested, tag| {
+                if (owned_bytes == null and !std.mem.eql(u8, @field(stored.properties.fields, @tagName(tag)), requested)) {
                     return error.InvalidValue;
                 }
             },
@@ -451,14 +446,11 @@ pub const Scene = struct {
             .properties = stored.properties.snapshot(),
             .dirty = stored.dirty,
         };
-        if (stored.properties.fields.text.len != 0) {
-            const text = try allocator.dupe(u8, stored.properties.fields.text);
-            snapshot.properties.text = text;
-        }
-        errdefer if (snapshot.properties.text.len != 0) allocator.free(snapshot.properties.text);
-        if (stored.properties.fields.icon_source.len != 0) {
-            const source = try allocator.dupe(u8, stored.properties.fields.icon_source);
-            snapshot.properties.icon_source = source;
+        inline for (properties.string_fields) |name| @field(snapshot.properties, name) = &.{};
+        errdefer freeSnapshotBytes(allocator, snapshot);
+        inline for (properties.string_fields) |name| {
+            const stored_bytes = @field(stored.properties.fields, name);
+            if (stored_bytes.len != 0) @field(snapshot.properties, name) = try allocator.dupe(u8, stored_bytes);
         }
         return snapshot;
     }
@@ -699,8 +691,10 @@ fn isDirty(flags: DirtyFlags) bool {
 }
 
 fn freeSnapshotBytes(allocator: Allocator, snapshot: NodeSnapshot) void {
-    if (snapshot.properties.text.len != 0) allocator.free(snapshot.properties.text);
-    if (snapshot.properties.icon_source.len != 0) allocator.free(snapshot.properties.icon_source);
+    inline for (properties.string_fields) |name| {
+        const bytes = @field(snapshot.properties, name);
+        if (bytes.len != 0) allocator.free(bytes);
+    }
 }
 
 fn removeOwnedNode(mount: *Mount, target: NodeHandle) void {

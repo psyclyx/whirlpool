@@ -112,11 +112,16 @@ fn Fields(comptime Bytes: type) type {
         icon_source: Bytes = &.{},
         text_color: Color = Color.white,
         font_size: u16 = 16,
+        /// A font family name; empty for the renderer's default.
+        font_family: Bytes = &.{},
         text_align: TextAlign = .start,
         text_valign: TextVAlign = .top,
         text_overflow: TextOverflow = .clip,
     };
 }
+
+/// The properties holding strings, which a node owns copies of.
+pub const string_fields = .{ "text", "icon_source", "font_family" };
 
 pub const Snapshot = Fields([]const u8);
 /// The same fields as a node stores them, owning their bytes.
@@ -148,6 +153,7 @@ pub const Value = union(enum) {
     icon_source: []const u8,
     text_color: Color,
     font_size: u16,
+    font_family: []const u8,
     text_align: TextAlign,
     text_valign: TextVAlign,
     text_overflow: TextOverflow,
@@ -186,6 +192,7 @@ pub fn metadata(value: Value) Metadata {
         .points => .{ .supported_by = .polygon, .dirty = paint },
         .text => .{ .supported_by = .text, .dirty = layout_and_paint, .owns_bytes = true },
         .font_size => .{ .supported_by = .text, .dirty = layout_and_paint },
+        .font_family => .{ .supported_by = .text, .dirty = layout_and_paint, .owns_bytes = true },
         .icon_source => .{ .supported_by = .icon, .dirty = paint, .owns_bytes = true },
         .text_color, .text_align, .text_valign, .text_overflow => .{ .supported_by = .text, .dirty = paint },
     };
@@ -234,13 +241,14 @@ pub fn cloneValue(allocator: Allocator, value: Value) !Value {
     return switch (value) {
         .text => |bytes| .{ .text = try allocator.dupe(u8, bytes) },
         .icon_source => |bytes| .{ .icon_source = try allocator.dupe(u8, bytes) },
+        .font_family => |bytes| .{ .font_family = try allocator.dupe(u8, bytes) },
         else => value,
     };
 }
 
 pub fn freeValue(allocator: Allocator, value: Value) void {
     switch (value) {
-        .text, .icon_source => |bytes| if (bytes.len != 0) allocator.free(bytes),
+        .text, .icon_source, .font_family => |bytes| if (bytes.len != 0) allocator.free(bytes),
         else => {},
     }
 }
@@ -257,7 +265,7 @@ pub const Owned = struct {
 
     pub fn commit(self: *Owned, allocator: Allocator, value: Value, owned_bytes: ?[]u8) void {
         switch (value) {
-            inline .text, .icon_source => |requested, tag| {
+            inline .text, .icon_source, .font_family => |requested, tag| {
                 const slot = &@field(self.fields, @tagName(tag));
                 const replacement = owned_bytes orelse {
                     std.debug.assert(std.mem.eql(u8, slot.*, requested));
@@ -271,10 +279,11 @@ pub const Owned = struct {
     }
 
     pub fn freeBytes(self: *Owned, allocator: Allocator) void {
-        if (self.fields.text.len != 0) allocator.free(self.fields.text);
-        if (self.fields.icon_source.len != 0) allocator.free(self.fields.icon_source);
-        self.fields.text = &.{};
-        self.fields.icon_source = &.{};
+        inline for (string_fields) |name| {
+            const bytes = @field(self.fields, name);
+            if (bytes.len != 0) allocator.free(bytes);
+            @field(self.fields, name) = &.{};
+        }
     }
 };
 
@@ -284,7 +293,7 @@ pub const Owned = struct {
 /// `current` is a node's fields, stored or snapshotted, by value or pointer.
 pub fn matches(current: anytype, value: Value) bool {
     return switch (value) {
-        inline .text, .icon_source => |item, tag| std.mem.eql(u8, @field(current, @tagName(tag)), item),
+        inline .text, .icon_source, .font_family => |item, tag| std.mem.eql(u8, @field(current, @tagName(tag)), item),
         inline .points, .clip_shape => |item, tag| samePoints(@field(current, @tagName(tag)), item),
         inline else => |item, tag| std.meta.eql(@field(current, @tagName(tag)), item),
     };

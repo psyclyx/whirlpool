@@ -15,7 +15,7 @@ extern fn whirlpool_skia_begin(renderer: *Native, width: u32, height: u32) c_int
 extern fn whirlpool_skia_clear(renderer: *Native, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_rect(renderer: *Native, x: f32, y: f32, width: f32, height: f32, radius: f32, r: f32, g: f32, b: f32, a: f32) void;
 extern fn whirlpool_skia_draw_polygon(renderer: *Native, points: [*]const f32, point_count: usize, r: f32, g: f32, b: f32, a: f32) void;
-extern fn whirlpool_skia_draw_text(renderer: *Native, text: [*]const u8, length: usize, x: f32, y: f32, size: f32, r: f32, g: f32, b: f32, a: f32, anchor: c_int, middle: c_int) void;
+extern fn whirlpool_skia_draw_text(renderer: *Native, family: [*]const u8, family_length: usize, text: [*]const u8, length: usize, x: f32, y: f32, size: f32, r: f32, g: f32, b: f32, a: f32, anchor: c_int, middle: c_int) void;
 extern fn whirlpool_skia_draw_icon(renderer: *Native, source: [*]const u8, length: usize, x: f32, y: f32, width: f32, height: f32, opacity: f32) void;
 extern fn whirlpool_skia_push_clip(renderer: *Native, x: f32, y: f32, width: f32, height: f32) void;
 extern fn whirlpool_skia_push_clip_polygon(renderer: *Native, points: [*]const f32, point_count: usize) void;
@@ -23,24 +23,25 @@ extern fn whirlpool_skia_pop_clip(renderer: *Native) void;
 extern fn whirlpool_skia_end(renderer: *Native, row_bytes: *usize) ?[*]const u8;
 extern fn whirlpool_skia_begin_vulkan(renderer: *Native, width: u32, height: u32, image: *anyopaque, memory: *anyopaque, memory_size: u64, format: u32, layout: u32, queue_family: u32) c_int;
 extern fn whirlpool_skia_end_vulkan(renderer: *Native, final_layout: u32, final_queue_family: u32) c_int;
-extern fn whirlpool_skia_measure_text(renderer: *Native, text: [*]const u8, length: usize, size: f32) f32;
-extern fn whirlpool_skia_fit_text(renderer: *Native, text: [*]const u8, length: usize, size: f32, max_width: f32) usize;
+extern fn whirlpool_skia_measure_text(renderer: *Native, family: [*]const u8, family_length: usize, text: [*]const u8, length: usize, size: f32) f32;
+extern fn whirlpool_skia_fit_text(renderer: *Native, family: [*]const u8, family_length: usize, text: [*]const u8, length: usize, size: f32, max_width: f32) usize;
 
 /// Widths of text as a renderer draws it (its fonts, fallback included).
 /// Borrowed from, and only valid as long as, that renderer.
 pub const TextMetrics = struct {
     native: *Native,
 
-    pub fn width(self: TextMetrics, text: []const u8, size: f32) f32 {
+    /// `family` is a font family name; empty for the default.
+    pub fn width(self: TextMetrics, family: []const u8, text: []const u8, size: f32) f32 {
         if (text.len == 0) return 0;
-        return whirlpool_skia_measure_text(self.native, text.ptr, text.len, size);
+        return whirlpool_skia_measure_text(self.native, family.ptr, family.len, text.ptr, text.len, size);
     }
 
     /// Bytes of the longest prefix of `text` (whole characters) at most
     /// `max_width` wide.
-    pub fn fit(self: TextMetrics, text: []const u8, size: f32, max_width: f32) usize {
+    pub fn fit(self: TextMetrics, family: []const u8, text: []const u8, size: f32, max_width: f32) usize {
         if (text.len == 0) return 0;
-        return @min(text.len, whirlpool_skia_fit_text(self.native, text.ptr, text.len, size, max_width));
+        return @min(text.len, whirlpool_skia_fit_text(self.native, family.ptr, family.len, text.ptr, text.len, size, max_width));
     }
 };
 
@@ -87,7 +88,7 @@ pub const Renderer = struct {
     }
 
     pub fn drawText(self: *Renderer, text: []const u8, x: f32, baseline: f32, size: f32, color: Color) void {
-        whirlpool_skia_draw_text(self.native, text.ptr, text.len, x, baseline, size, color.r, color.g, color.b, color.a, 0, 0);
+        whirlpool_skia_draw_text(self.native, "", 0, text.ptr, text.len, x, baseline, size, color.r, color.g, color.b, color.a, 0, 0);
     }
 
     pub fn drawTextItem(self: *Renderer, item: anytype) void {
@@ -242,6 +243,8 @@ pub const DrawOp = union(enum) {
     },
     text: struct {
         text: []const u8,
+        /// Font family name; empty for the renderer's default.
+        family: []const u8 = "",
         x: f32,
         baseline: f32,
         size: f32,
@@ -321,6 +324,8 @@ pub const TextVertical = enum(u8) { baseline, middle };
 fn drawTextNative(native: *Native, item: anytype) void {
     whirlpool_skia_draw_text(
         native,
+        item.family.ptr,
+        item.family.len,
         item.text.ptr,
         item.text.len,
         item.x,

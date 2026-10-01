@@ -71,6 +71,12 @@ local function with_alpha(color, alpha)
   return { color[1], color[2], color[3], alpha }
 end
 
+-- A text node in the theme's font (unless `spec` names another).
+local function label(parent, spec)
+  spec.font_family = spec.font_family or theme.font
+  return parent:text(spec)
+end
+
 -- Secondary text on the coloured panels: theme.muted is too dark against them.
 local DIM = with_alpha(theme.text, 0.62)
 
@@ -84,7 +90,7 @@ local function lines(parent, specs, options)
   local column = parent:column({ gap = 1, justify = "center", width = options.width })
   local nodes = {}
   for index, line in ipairs(specs) do
-    nodes[index] = column:text({
+    nodes[index] = label(column, {
       text = line.text or "", font_size = line.size, height = line.size + 1,
       text_color = line.color, text_valign = "middle", text_overflow = "ellipsis",
       text_align = options.align or "start",
@@ -99,13 +105,13 @@ end
 local function readout(parent, spec)
   local row = parent:row({ height = spec.size + 1, gap = 1 })
   if spec.label then
-    row:text({ text = spec.label, width = spec.label_width or 10, font_size = spec.size, text_color = spec.color, text_valign = "middle" })
+    label(row, { text = spec.label, width = spec.label_width or 10, font_size = spec.size, text_color = spec.color, text_valign = "middle" })
   end
-  local number = row:text({
-    text = "0", width = spec.number_width, font_size = spec.size, text_color = spec.color,
+  local number = label(row, {
+    text = "0", width = spec.number_width, font_family = theme.font_mono, font_size = spec.size, text_color = spec.color,
     text_align = "end", text_valign = "middle",
   })
-  local unit = spec.unit_width and row:text({
+  local unit = spec.unit_width and label(row, {
     text = "", width = spec.unit_width, font_size = spec.size, text_color = spec.color, text_valign = "middle",
   })
   local shown, shown_ms
@@ -201,15 +207,15 @@ end
 local function swap_color(used, total)
   if total <= 0 or used <= 0 then return DIM end
   local fraction = used / total
-  if fraction >= 0.75 then return theme.red end
-  if fraction >= 0.25 then return theme.orange end
-  return theme.yellow
+  if fraction >= 0.75 then return theme.ink.red end
+  if fraction >= 0.25 then return theme.ink.orange end
+  return theme.ink.yellow
 end
 
 local function fullness_color(fraction)
-  if fraction >= 0.9 then return theme.red end
-  if fraction >= 0.75 then return theme.yellow end
-  return theme.orange
+  if fraction >= 0.9 then return theme.ink.red end
+  if fraction >= 0.75 then return theme.ink.yellow end
+  return theme.ink.orange
 end
 
 return function(root, options)
@@ -249,7 +255,7 @@ return function(root, options)
   local function tag_node(index)
     if tags[index] then return tags[index] end
     local panel = Angled.panel(tags_row, { height = HEIGHT, top = 11, pad = 4, fill = CLEAR })
-    local label = panel.row:text({
+    local label = label(panel.row, {
       text = tostring(index), font_size = 16, min_width = 10, text_color = theme.text,
       text_align = "center", text_valign = "middle",
     })
@@ -308,14 +314,14 @@ return function(root, options)
   local function item_view(index)
     if item_views[index] then return item_views[index] end
     local panel = Angled.panel(strip, { height = HEIGHT, top = 4, pad = 6, gap = 8 })
-    local mark = panel.row:text({ text = "", font_size = 11, text_color = theme.accent, text_valign = "middle", visible = false })
+    local mark = label(panel.row, { text = "", font_size = 11, text_color = theme.ink.blue, text_valign = "middle", visible = false })
     local icon = panel.row:icon({ icon_source = "", width = 20, height = 20 })
     local labels = panel.row:column({ gap = 1, justify = "center", max_width = 150 })
-    local app = labels:text({ text = "", height = 12, font_size = 11, text_color = theme.text, text_valign = "middle", text_overflow = "ellipsis" })
-    local title = labels:text({ text = "", height = 10, font_size = 9, text_color = theme.muted, text_valign = "middle", text_overflow = "ellipsis" })
+    local app = label(labels, { text = "", height = 12, font_size = 11, text_color = theme.text, text_valign = "middle", text_overflow = "ellipsis" })
+    local title = label(labels, { text = "", height = 10, font_size = 9, text_color = theme.muted, text_valign = "middle", text_overflow = "ellipsis" })
     -- Group boundaries and the insertion point are thin slanted bars.
     local marker = strip:stack({ width = 4, height = 34, visible = false })
-    local marker_line = marker:polygon({ fill = theme.blue, points = Angled.points(34, nil, 0) })
+    local marker_line = marker:polygon({ fill = theme.ink.blue, points = Angled.points(34, nil, 0) })
     local entry = { panel = panel, mark = mark, icon = icon, app = app, title = title, marker = marker, marker_line = marker_line }
     item_views[index] = entry
     pointer:region(panel.frame, {
@@ -335,7 +341,7 @@ return function(root, options)
     end,
   })
 
-  local group_colors = { float = theme.purple, full = theme.orange, scratch = theme.cyan, t = theme.purple, v = theme.cyan }
+  local group_colors = { float = theme.ink.purple, full = theme.ink.orange, scratch = theme.ink.cyan, t = theme.ink.purple, v = theme.ink.cyan }
 
   local function show_items(list)
     items = list
@@ -363,10 +369,10 @@ return function(root, options)
         entry.marker:set("height", tall)
         entry.marker_line:set("points", Angled.points(tall, nil, 0))
         entry.marker_line:set("fill", insertion and theme.accent
-          or item.detail ~= "" and theme.purple
+          or item.detail ~= "" and theme.ink.purple
           or item.focused and theme.bright
           or group_colors[item.label]
-          or item.kind == "group-open" and theme.blue
+          or item.kind == "group-open" and theme.ink.blue
           or theme.muted)
       end
     end
@@ -414,10 +420,10 @@ return function(root, options)
   -- CPU: history in busy cores on a logarithmic scale, so one saturated core
   -- on a many-core machine is still visible; the hottest cores as a heat
   -- field (one bright cell is single-thread load, a lit field is parallel).
-  local cpu_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.yellow), gap = 4, pad = 2, flush = true })
+  local cpu_panel = Angled.panel(status, { height = HEIGHT, fill = theme.panel.yellow, gap = 4, pad = 2, flush = true })
   local cpu_canvas = Angled.canvas(cpu_panel.row, { width = 96, height = HEIGHT })
   local cpu_plot = Graph.new(cpu_canvas, {
-    span = o.plot.span, delay = o.plot.delay, style = "area", fill = theme.blend(theme.yellow, 220),
+    span = o.plot.span, delay = o.plot.delay, style = "area", fill = theme.yellow,
   })
   local cores_canvas = Angled.canvas(cpu_panel.row, { width = 40, height = HEIGHT })
   local cores_optional = optional_node(cores_canvas.node)
@@ -425,12 +431,12 @@ return function(root, options)
   for index = 1, o.cpu.cores do
     local column, row = (index - 1) % 8, (index - 1) // 8
     cores[index] = {
-      node = cores_canvas:polygon({ fill = theme.yellow, points = Angled.rectangle(column * 5, 10 + row * 10, 3, 8) }),
+      node = cores_canvas:polygon({ fill = theme.ink.yellow, points = Angled.rectangle(column * 5, 10 + row * 10, 3, 8) }),
       level = 0, target = 0, shade = -1,
     }
   end
   local cpu_text = lines(cpu_panel.row, {
-    { text = "0.0/1", size = 12, color = theme.yellow },
+    { text = "0.0/1", size = 12, color = theme.ink.yellow },
     { text = "peak 0%", size = 9, color = DIM },
   }, { width = 56 })
   local cpu_count = 1
@@ -462,9 +468,9 @@ return function(root, options)
 
   -- Network: receive (top) and send (bottom) as heat strips on a shared,
   -- smoothly adapting square-root scale, with steady readouts.
-  local net_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.cyan), gap = 4, pad = 2, flush = true })
+  local net_panel = Angled.panel(status, { height = HEIGHT, fill = theme.panel.cyan, gap = 4, pad = 2, flush = true })
   local net_canvas = Angled.canvas(net_panel.row, { width = 96, height = HEIGHT })
-  local net_base = theme.blend(theme.cyan)
+  local net_base = theme.panel.cyan
   local rx_plot = Graph.new(net_canvas, {
     span = o.plot.span, delay = o.plot.delay, style = "heat", region = { 0, HEIGHT / 2 },
     fill = o.network.rx.fill, base = net_base, hot = o.network.rx.peak,
@@ -474,8 +480,8 @@ return function(root, options)
     fill = o.network.tx.fill, base = net_base, hot = o.network.tx.peak,
   })
   local net_column = net_panel.row:column({ gap = 1, justify = "center" })
-  local rx_readout = readout(net_column, { label = "↓", size = 12, color = theme.green, number_width = 26, unit_width = 34, parts = format.bit_rate_parts })
-  local tx_readout = readout(net_column, { label = "↑", size = 12, color = theme.cyan, number_width = 26, unit_width = 34, parts = format.bit_rate_parts })
+  local rx_readout = readout(net_column, { label = "↓", size = 12, color = theme.ink.green, number_width = 26, unit_width = 34, parts = format.bit_rate_parts })
+  local tx_readout = readout(net_column, { label = "↑", size = 12, color = theme.ink.cyan, number_width = 26, unit_width = 34, parts = format.bit_rate_parts })
   local network = { rx = {}, tx = {}, t = {} }
   local network_scale = Scale.new(o.network.scale)
   local function network_level(value) return network_scale:level(value) end
@@ -499,11 +505,11 @@ return function(root, options)
   end
 
   -- Audio: a level meter and a speaker; changes also show the OSD.
-  local audio_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.purple), gap = 2, pad = 2, flush = true })
+  local audio_panel = Angled.panel(status, { height = HEIGHT, fill = theme.panel.purple, gap = 2, pad = 2, flush = true })
   local audio_meter_canvas = Angled.canvas(audio_panel.row, { width = 8, height = HEIGHT })
-  local audio_meter = meter(audio_meter_canvas, 0, 8, theme.purple)
+  local audio_meter = meter(audio_meter_canvas, 0, 8, theme.ink.purple)
   local speaker_canvas = Angled.canvas(audio_panel.row, { width = 22, height = HEIGHT })
-  local show_speaker = speaker(speaker_canvas, 4, 12, theme.purple)
+  local show_speaker = speaker(speaker_canvas, 4, 12, theme.ink.purple)
   audio_panel:set_visible(false)
 
   local osd = { until_ms = 0 }
@@ -513,18 +519,18 @@ return function(root, options)
   local osd_box = osd_row:stack({ width = 320, height = 120 })
   osd_box:shape({ fill = theme.bg, radius = 12 })
   local osd_content = osd_box:column({ padding = 20, gap = 10 })
-  osd_content:text({ text = "Volume", font_size = 14, text_color = theme.text })
+  label(osd_content, { text = "Volume", font_size = 14, text_color = theme.text })
   local osd_track = osd_content:stack({ width = 280, height = 8 })
   osd_track:shape({ fill = theme.surface, radius = 4 })
   local osd_fill = osd_track:shape({ width = 2, fill = theme.accent, radius = 4 })
-  local osd_value = osd_content:text({ text = "0%", font_size = 22, text_color = theme.bright })
+  local osd_value = label(osd_content, { text = "0%", font_size = 22, text_color = theme.bright })
   local last_audio
 
   surface.on("audio", function(audio)
     local percent, muted = series.last(audio.percent), series.last(audio.muted, 0) == 1
     if not percent then return end
     audio_panel:set_visible(true)
-    local color = muted and theme.red or (percent >= 100 and theme.yellow or theme.purple)
+    local color = muted and theme.ink.red or (percent >= 100 and theme.ink.yellow or theme.ink.purple)
     audio_meter({ { percent / 100, color } })
     show_speaker(percent, muted, color)
     local key = percent .. (muted and "m" or "")
@@ -539,16 +545,16 @@ return function(root, options)
 
   -- Memory: what programs hold, the ZFS ARC, and page cache, out of the
   -- total; swap beside it once there is any.
-  local memory_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.green), gap = 4, pad = 2, flush = true })
+  local memory_panel = Angled.panel(status, { height = HEIGHT, fill = theme.panel.green, gap = 4, pad = 2, flush = true })
   local memory_meters = Angled.canvas(memory_panel.row, { width = 14, height = HEIGHT })
-  local memory_meter = meter(memory_meters, 0, 8, theme.green, 3)
-  local swap_meter = meter(memory_meters, 10, 3, theme.orange)
+  local memory_meter = meter(memory_meters, 0, 8, theme.ink.green, 3)
+  local swap_meter = meter(memory_meters, 10, 3, theme.ink.orange)
   local chip_canvas = Angled.canvas(memory_panel.row, { width = 14, height = HEIGHT })
-  chip(chip_canvas, 1, 13, theme.green)
+  chip(chip_canvas, 1, 13, theme.ink.green)
   local memory_text = lines(memory_panel.row, {
-    { text = "0/0", size = 12, color = theme.green },
+    { text = "0/0", size = 12, color = theme.ink.green },
     -- In the cache colour, so it reads as the legend for that band.
-    { text = "0B cache", size = 9, color = theme.blue },
+    { text = "0B cache", size = 9, color = theme.ink.blue },
   }, { width = 72 })
   local swap_text, swap_column = lines(memory_panel.row, {
     { text = "", size = 12, color = DIM },
@@ -565,11 +571,11 @@ return function(root, options)
     local swap_total, swap_used = series.last(memory.swap_total, 0), series.last(memory.swap_used, 0)
     local zswap = series.last(memory.zswap_stored, 0)
     memory_meter({
-      { used / total, theme.green },
-      { arc / total, theme.cyan },
-      { cache / total, theme.blue },
+      { used / total, theme.ink.green },
+      { arc / total, theme.ink.cyan },
+      { cache / total, theme.ink.blue },
     })
-    swap_meter({ { swap_total > 0 and swap_used / swap_total or 0, theme.orange } })
+    swap_meter({ { swap_total > 0 and swap_used / swap_total or 0, theme.ink.orange } })
     memory_text[1]:set("text", format.format_ratio(used, total))
     memory_text[2]:set("text", format.format_bytes(cache + arc) .. " cache")
     if swap_total > 0 then
@@ -584,21 +590,21 @@ return function(root, options)
 
   -- Storage: one chip per pool or filesystem: how full, free space, and
   -- read/write throughput.
-  local disk_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.orange), gap = 6, pad = 2 })
+  local disk_panel = Angled.panel(status, { height = HEIGHT, fill = theme.panel.orange, gap = 6, pad = 2 })
   local drive_canvas = Angled.canvas(disk_panel.row, { width = 16, height = HEIGHT })
-  drive(drive_canvas, 1, 12, theme.orange)
+  drive(drive_canvas, 1, 12, theme.ink.orange)
   local disks, disk_data = {}, nil
   for index = 1, o.disks.max do
     local cell = disk_panel.row:row({ gap = 4, visible = false })
     local bar_canvas = Angled.canvas(cell, { width = 6, height = HEIGHT })
-    local fill_meter = meter(bar_canvas, 0, 6, theme.orange)
+    local fill_meter = meter(bar_canvas, 0, 6, theme.ink.orange)
     local column = cell:column({ gap = 1, justify = "center" })
     local head = column:row({ height = 12, gap = 4 })
-    local name = head:text({ text = "", width = 52, font_size = 11, text_color = theme.text, text_valign = "middle", text_overflow = "ellipsis" })
-    local free = head:text({ text = "", width = 34, font_size = 11, text_color = theme.bright, text_align = "end", text_valign = "middle" })
+    local name = label(head, { text = "", width = 52, font_size = 11, text_color = theme.text, text_valign = "middle", text_overflow = "ellipsis" })
+    local free = label(head, { text = "", width = 34, font_size = 11, text_color = theme.bright, text_align = "end", text_valign = "middle" })
     local io = column:row({ height = 10, gap = 4 })
-    local read = readout(io, { label = "R", label_width = 7, size = 9, number_width = 32, color = theme.green, parts = format.compact_rate_parts })
-    local write = readout(io, { label = "W", label_width = 9, size = 9, number_width = 32, color = theme.cyan, parts = format.compact_rate_parts })
+    local read = readout(io, { label = "R", label_width = 7, size = 9, number_width = 32, color = theme.ink.green, parts = format.compact_rate_parts })
+    local write = readout(io, { label = "W", label_width = 9, size = 9, number_width = 32, color = theme.ink.cyan, parts = format.compact_rate_parts })
     disks[index] = { cell = cell, optional = optional_node(cell, false), meter = fill_meter, name = name, free = free, read = read, write = write }
   end
   disk_panel:set_visible(false)
@@ -613,7 +619,7 @@ return function(root, options)
         local fraction = entry.used / math.max(1, entry.total)
         chip_view.meter({ { fraction, fullness_color(fraction) } })
         chip_view.name:set("text", entry.label)
-        chip_view.name:set("text_color", fraction >= 0.9 and theme.red or theme.text)
+        chip_view.name:set("text_color", fraction >= 0.9 and theme.ink.red or theme.text)
         chip_view.free:set("text", format.format_bytes(entry.avail))
       end
     end
@@ -631,12 +637,12 @@ return function(root, options)
   end
 
   -- Battery, when there is one; plots also slow down while discharging.
-  local battery_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.red), gap = 4, pad = 2, flush = true })
+  local battery_panel = Angled.panel(status, { height = HEIGHT, fill = theme.panel.red, gap = 4, pad = 2, flush = true })
   local battery_meter_canvas = Angled.canvas(battery_panel.row, { width = 8, height = HEIGHT })
-  local battery_meter = meter(battery_meter_canvas, 0, 8, theme.red)
+  local battery_meter = meter(battery_meter_canvas, 0, 8, theme.ink.red)
   local battery_glyph_canvas = Angled.canvas(battery_panel.row, { width = 16, height = HEIGHT })
-  local show_battery = battery_glyph(battery_glyph_canvas, 1, 12, theme.red)
-  local battery_label = battery_panel.row:text({ text = "", width = 34, font_size = 12, text_color = theme.red, text_align = "center", text_valign = "middle" })
+  local show_battery = battery_glyph(battery_glyph_canvas, 1, 12, theme.ink.red)
+  local battery_label = label(battery_panel.row, { text = "", width = 34, font_size = 12, text_color = theme.ink.red, text_align = "center", text_valign = "middle" })
   battery_panel:set_visible(false)
 
   surface.on("battery", function(battery)
@@ -646,22 +652,21 @@ return function(root, options)
     if not present then return end
     local percent = series.last(battery.percent, 0)
     local charging = series.last(battery.charging, 0) == 1
-    local color = charging and theme.green
-      or (percent < 15 and theme.red or (percent < 50 and theme.orange or theme.accent))
-    battery_panel:set_fill(theme.blend(color))
-    battery_meter({ { percent / 100, color } })
-    show_battery(percent / 100, color)
+    local hue = charging and "green" or (percent < 15 and "red" or (percent < 50 and "orange" or "blue"))
+    battery_panel:set_fill(theme.panel[hue])
+    battery_meter({ { percent / 100, theme[hue] } })
+    show_battery(percent / 100, theme[hue])
     battery_label:set("text", string.format("%d%%", percent))
-    battery_label:set("text_color", color)
+    battery_label:set("text_color", theme.ink[hue])
   end)
 
   -- Clock, read from the system clock (no service needed).
-  local clock_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.blue), top = 3, pad = 10 })
+  local clock_panel = Angled.panel(status, { height = HEIGHT, fill = theme.panel.blue, top = 3, pad = 10 })
   local clock_column = clock_panel.row:column({ gap = 1, justify = "center" })
   local clock_line = clock_column:row({ height = 18, gap = 5 })
-  local time_label = clock_line:text({ text = "--:--", font_size = 16, text_color = theme.bright, text_valign = "middle" })
-  local day_label = clock_line:text({ text = "---", font_size = 11, text_color = theme.text, text_valign = "middle" })
-  local date_label = clock_column:text({ text = "", height = 11, font_size = 11, text_color = DIM, text_valign = "middle" })
+  local time_label = label(clock_line, { text = "--:--", font_size = 16, text_color = theme.bright, text_valign = "middle" })
+  local day_label = label(clock_line, { text = "---", font_size = 11, text_color = theme.text, text_valign = "middle" })
+  local date_label = label(clock_column, { text = "", height = 11, font_size = 11, text_color = DIM, text_valign = "middle" })
   local shown_minute
 
   redraws.clock = function()

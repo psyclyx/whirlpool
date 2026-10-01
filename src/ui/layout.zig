@@ -50,18 +50,19 @@ pub const Box = struct {
 /// agree on widths.
 pub const Measurer = struct {
     context: ?*anyopaque = null,
-    /// Advance width of `text` at font size `size`.
-    width_fn: *const fn (?*anyopaque, []const u8, f32) f32,
+    /// Advance width of `text` in font `family` (empty: the default) at
+    /// font size `size`.
+    width_fn: *const fn (?*anyopaque, []const u8, []const u8, f32) f32,
     /// Length in bytes of the longest prefix of `text`, ending on a character
-    /// boundary, whose advance at `size` is at most `max_width`.
-    fit_fn: *const fn (?*anyopaque, []const u8, f32, f32) usize,
+    /// boundary, whose advance in `family` at `size` is at most `max_width`.
+    fit_fn: *const fn (?*anyopaque, []const u8, []const u8, f32, f32) usize,
 
-    pub fn width(self: Measurer, text: []const u8, size: f32) f32 {
-        return self.width_fn(self.context, text, size);
+    pub fn width(self: Measurer, family: []const u8, text: []const u8, size: f32) f32 {
+        return self.width_fn(self.context, family, text, size);
     }
 
-    pub fn fit(self: Measurer, text: []const u8, size: f32, max_width: f32) usize {
-        return self.fit_fn(self.context, text, size, max_width);
+    pub fn fit(self: Measurer, family: []const u8, text: []const u8, size: f32, max_width: f32) usize {
+        return self.fit_fn(self.context, family, text, size, max_width);
     }
 
     /// A font-free approximation for tests and headless tools: every character
@@ -70,11 +71,11 @@ pub const Measurer = struct {
 
     const estimate_advance = 0.55;
 
-    fn estimateWidth(_: ?*anyopaque, text: []const u8, size: f32) f32 {
+    fn estimateWidth(_: ?*anyopaque, _: []const u8, text: []const u8, size: f32) f32 {
         return @as(f32, @floatFromInt(codepoints(text))) * size * estimate_advance;
     }
 
-    fn estimateFit(_: ?*anyopaque, text: []const u8, size: f32, max_width: f32) usize {
+    fn estimateFit(_: ?*anyopaque, _: []const u8, text: []const u8, size: f32, max_width: f32) usize {
         const advance = size * estimate_advance;
         var used: f32 = 0;
         var index: usize = 0;
@@ -136,7 +137,7 @@ const Pass = struct {
             .text => if (p.text.len == 0)
                 0
             else if (axis == .horizontal)
-                @ceil(self.measurer.width(p.text, @floatFromInt(p.font_size)))
+                @ceil(self.measurer.width(p.font_family, p.text, @floatFromInt(p.font_size)))
             else
                 @floatFromInt(p.font_size),
             .row, .column, .stack => blk: {

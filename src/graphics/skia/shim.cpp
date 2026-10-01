@@ -232,6 +232,8 @@ struct WhirlpoolSkia {
     sk_sp<GrDirectContext> gpu_context;
     std::unordered_map<std::string, sk_sp<SkImage>> icon_cache;
     std::unordered_map<std::string, CachedText> text_cache;
+    // Typefaces by requested family name, resolved once each.
+    std::unordered_map<std::string, sk_sp<SkTypeface>> families;
 };
 
 static SkImageInfo frame_info(const WhirlpoolSkia *renderer) {
@@ -509,9 +511,24 @@ static std::vector<TextRun> split_text_runs(WhirlpoolSkia *renderer,
 // every frame, so the runs (glyph selection and font fallback included), the
 // advance width and the cap height are computed once per (text, size) and the
 // resulting blobs are redrawn from the cache.
-static const CachedText *cached_text(WhirlpoolSkia *renderer, const char *text,
-                                     size_t length, float size) {
+// The typeface for a family name (empty: the default), falling back to the
+// default when the font manager knows no such family.
+static const sk_sp<SkTypeface>& family_typeface(WhirlpoolSkia *renderer, const char *family,
+                                                size_t family_length) {
+    if (!family || family_length == 0 || !renderer->font_manager) return renderer->default_typeface;
+    std::string name(family, family_length);
+    auto found = renderer->families.find(name);
+    if (found != renderer->families.end()) return found->second;
+    sk_sp<SkTypeface> typeface = renderer->font_manager->matchFamilyStyle(name.c_str(), SkFontStyle());
+    if (!typeface) typeface = renderer->default_typeface;
+    return renderer->families.emplace(std::move(name), std::move(typeface)).first->second;
+}
+
+static const CachedText *cached_text(WhirlpoolSkia *renderer, const char *family, size_t family_length,
+                                     const char *text, size_t length, float size) {
     std::string key(reinterpret_cast<const char *>(&size), sizeof(size));
+    key.append(family ? family : "", family ? family_length : 0);
+    key.push_back('\0');
     key.append(text, length);
     auto found = renderer->text_cache.find(key);
     if (found != renderer->text_cache.end()) return &found->second;
@@ -519,7 +536,7 @@ static const CachedText *cached_text(WhirlpoolSkia *renderer, const char *text,
     // without limit.
     if (renderer->text_cache.size() > 1024) renderer->text_cache.clear();
 
-    const auto& typeface = renderer->default_typeface;
+    const auto& typeface = family_typeface(renderer, family, family_length);
     CachedText entry;
     float cursor = 0;
     for (const auto& run : split_text_runs(renderer, typeface, text, length)) {
@@ -538,18 +555,21 @@ static const CachedText *cached_text(WhirlpoolSkia *renderer, const char *text,
 }
 
 // The advance width `whirlpool_skia_draw_text` gives `text` at `size`.
-extern "C" float whirlpool_skia_measure_text(WhirlpoolSkia *renderer, const char *text,
+extern "C" float whirlpool_skia_measure_text(WhirlpoolSkia *renderer, const char *family,
+                                             size_t family_length, const char *text,
                                              size_t length, float size) {
     if (!renderer || !text || length == 0 || size <= 0 || !renderer->default_typeface) return 0;
-    return cached_text(renderer, text, length, size)->width;
+    return cached_text(renderer, family, family_length, text, length, size)->width;
 }
 
 // How many bytes of `text` (a whole number of characters) fit in `max_width`
 // at `size`, with the same font fallback as drawing. Prefixes are not cached:
 // layout asks only when a text's box narrows below the text.
-extern "C" size_t whirlpool_skia_fit_text(WhirlpoolSkia *renderer, const char *text,
+extern "C" size_t whirlpool_skia_fit_text(WhirlpoolSkia *renderer, const char *family,
+                                          size_t family_length, const char *text,
                                           size_t length, float size, float max_width) {
     if (!renderer || !text || length == 0 || size <= 0 || !renderer->default_typeface) return 0;
+    const auto& primary = family_typeface(renderer, family, family_length);
     const char *end = text + length;
     const char *cursor = text;
     float used = 0;
@@ -557,8 +577,8 @@ extern "C" size_t whirlpool_skia_fit_text(WhirlpoolSkia *renderer, const char *t
     while (cursor < end) {
         const char *start = cursor;
         const SkUnichar character = next_utf8(&cursor, end);
-        auto typeface = typeface_for(renderer, renderer->default_typeface, character);
-        SkFont font(typeface ? typeface : renderer->default_typeface, size);
+        auto typeface = typeface_for(renderer, primary, character);
+        SkFont font(typeface ? typeface : primary, size);
         used += font.measureText(start, static_cast<size_t>(cursor - start), SkTextEncoding::kUTF8);
         if (used > max_width) break;
         fitted = static_cast<size_t>(cursor - text);
@@ -569,13 +589,14 @@ extern "C" size_t whirlpool_skia_fit_text(WhirlpoolSkia *renderer, const char *t
 // `anchor`: 0 draws from x, 1 centres on x, 2 ends at x. `middle` treats y as
 // the vertical centre of the capital letters instead of the alphabetic
 // baseline, so text can be centred in a box without knowing its font metrics.
-extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *text,
+extern "C" void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *family,
+                                          size_t family_length, const char *text,
                                           size_t length, float x, float y, float size,
                                           float r, float g, float b, float a,
                                           int anchor, int middle) {
     if (!renderer || !renderer->canvas || !text || length == 0 || size <= 0) return;
     if (!renderer->default_typeface) return;
-    const CachedText *entry = cached_text(renderer, text, length, size);
+    const CachedText *entry = cached_text(renderer, family, family_length, text, length, size);
     SkPaint paint;
     paint.setAntiAlias(true);
     paint.setColor4f(SkColor4f{r, g, b, a}, nullptr);

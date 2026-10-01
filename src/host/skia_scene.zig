@@ -47,11 +47,11 @@ pub const OwnedDrawList = struct {
 /// Text measured by the renderer that will draw it.
 pub fn measurer(metrics: graphics.skia.TextMetrics) ui.Measurer {
     const Adapter = struct {
-        fn width(context: ?*anyopaque, text: []const u8, size: f32) f32 {
-            return metricsFrom(context).width(text, size);
+        fn width(context: ?*anyopaque, family: []const u8, text: []const u8, size: f32) f32 {
+            return metricsFrom(context).width(family, text, size);
         }
-        fn fit(context: ?*anyopaque, text: []const u8, size: f32, max_width: f32) usize {
-            return metricsFrom(context).fit(text, size, max_width);
+        fn fit(context: ?*anyopaque, family: []const u8, text: []const u8, size: f32, max_width: f32) usize {
+            return metricsFrom(context).fit(family, text, size, max_width);
         }
         fn metricsFrom(context: ?*anyopaque) graphics.skia.TextMetrics {
             return .{ .native = @ptrCast(context.?) };
@@ -121,13 +121,14 @@ const Lowerer = struct {
         var shown: []const u8 = p.text;
         if (p.text_overflow == .ellipsis) {
             const padding: f32 = @floatFromInt(p.padding.left + p.padding.right);
-            const natural = if (p.width == null) node.layout.intrinsic[0] - padding else self.measurer.width(p.text, size);
+            const natural = if (p.width == null) node.layout.intrinsic[0] - padding else self.measurer.width(p.font_family, p.text, size);
             if (natural > content.width + 0.5) shown = try self.ellipsized(handle, content.width, size);
         }
         // Alignment is relative to the padded content box; the renderer
         // anchors the run, so no glyph positions are computed here.
         try self.emit(.{ .text = .{
             .text = shown,
+            .family = p.font_family,
             .x = switch (p.text_align) {
                 .start => content.x,
                 .center => content.x + content.width / 2,
@@ -158,8 +159,8 @@ const Lowerer = struct {
         const state = self.scene.getLayoutMut(handle).?;
         const value = node.props().text;
         if (state.fit_width != width or state.fit_bytes > value.len) {
-            const room = width - self.measurer.width(ellipsis, size);
-            state.fit_bytes = if (room > 0) self.measurer.fit(value, size, room) else 0;
+            const room = width - self.measurer.width(node.props().font_family, ellipsis, size);
+            state.fit_bytes = if (room > 0) self.measurer.fit(node.props().font_family, value, size, room) else 0;
             state.fit_width = width;
         }
         return std.mem.concat(self.arena, u8, &.{ value[0..state.fit_bytes], ellipsis });
@@ -226,7 +227,7 @@ const Fixture = struct {
         for (values) |value| {
             const bytes: ?[]u8 = switch (value) {
                 .text => |item| try testing.allocator.dupe(u8, item),
-                .icon_source => |item| try testing.allocator.dupe(u8, item),
+                .icon_source, .font_family => |item| try testing.allocator.dupe(u8, item),
                 else => null,
             };
             try self.scene.applyProperty(handle, value, bytes);
@@ -312,6 +313,16 @@ test "text wider than its box is cut with an ellipsis when asked" {
     try testing.expectEqualStrings("abcd…", list.ops[0].text.text);
     try testing.expectEqualStrings("abcdefghij", list.ops[1].text.text);
     try testing.expectEqualStrings("ab", list.ops[2].text.text);
+}
+
+test "a text node's font family reaches its draw operation" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    _ = try f.add(.text, null, &.{ .{ .text = "x" }, .{ .font_family = "Iosevka" } });
+    var lowered = try f.lowered(100, 20);
+    defer lowered.deinit();
+    try testing.expectEqualStrings("Iosevka", lowered.ops[0].text.family);
 }
 
 test "aligned text is anchored to its padded box" {

@@ -71,4 +71,26 @@ function theme.blend(color, alpha)
   }
 end
 
+-- Roles for each accent hue, so a configuration asks for a purpose rather
+-- than a slot:
+--   theme.green        the accent: lines, meters, plot fills
+--   theme.light.green  the light accent: peaks and highlights
+--   theme.panel.green  a background tinted with the hue
+--   theme.ink.green    foreground in the hue (text, icons, meters) that
+--                      reads on that background or the plain one: the light
+--                      accent on a dark scheme, the accent on a light one
+theme.polarity = found and type(stylix) == "table" and stylix.polarity or "dark"
+theme.hues = { "red", "orange", "yellow", "green", "cyan", "blue", "purple" }
+theme.panel, theme.ink = {}, {}
+for _, hue in ipairs(theme.hues) do
+  theme.panel[hue] = theme.blend(theme[hue])
+  theme.ink[hue] = theme.polarity == "light" and theme[hue] or theme.light[hue] or theme[hue]
+end
+
+-- Fonts: Stylix's, else the renderer's default (empty names). `font` is for
+-- labels; `font_mono` for figures, whose digits then keep their places.
+local fonts = found and type(stylix) == "table" and stylix.fonts or {}
+theme.font = fonts.sans or ""
+theme.font_mono = fonts.monospace or ""
+
 return theme

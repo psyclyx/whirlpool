@@ -191,8 +191,7 @@ fn freeValue(allocator: Allocator, value: tree.PropertyValue) void {
 
 fn ownedBytes(value: tree.PropertyValue) ?[]const u8 {
     return switch (value) {
-        .text => |bytes| bytes,
-        .icon_source => |bytes| bytes,
+        inline .text, .icon_source, .font_family => |bytes| bytes,
         else => null,
     };
 }
