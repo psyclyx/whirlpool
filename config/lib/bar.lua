@@ -317,12 +317,12 @@ return function(root, options)
     local mark = label(panel.row, { text = "", font_size = 11, text_color = theme.ink.blue, text_valign = "middle", visible = false })
     local icon = panel.row:icon({ icon_source = "", width = 20, height = 20 })
     local labels = panel.row:column({ gap = 1, justify = "center", max_width = 150 })
-    local app = label(labels, { text = "", height = 12, font_size = 11, text_color = theme.text, text_valign = "middle", text_overflow = "ellipsis" })
-    local title = label(labels, { text = "", height = 10, font_size = 9, text_color = theme.muted, text_valign = "middle", text_overflow = "ellipsis" })
+    local primary = label(labels, { text = "", height = 12, font_size = 11, text_color = theme.text, text_valign = "middle", text_overflow = "ellipsis" })
+    local secondary = label(labels, { text = "", height = 10, font_size = 9, text_color = theme.muted, text_valign = "middle", text_overflow = "ellipsis" })
     -- Group boundaries and the insertion point are thin slanted bars.
     local marker = strip:stack({ width = 4, height = 34, visible = false })
     local marker_line = marker:polygon({ fill = theme.ink.blue, points = Angled.points(34, nil, 0) })
-    local entry = { panel = panel, mark = mark, icon = icon, app = app, title = title, marker = marker, marker_line = marker_line }
+    local entry = { panel = panel, mark = mark, icon = icon, primary = primary, secondary = secondary, marker = marker, marker_line = marker_line }
     item_views[index] = entry
     pointer:region(panel.frame, {
       click = function()
@@ -355,12 +355,16 @@ return function(root, options)
       entry.marker:set("visible", is_marker == true)
       if is_window then
         entry.icon:set("icon_source", item.icon)
-        -- The application's own name (its desktop entry's), else its id.
+        -- The window's title above the application's name (its desktop
+        -- entry's, else its id); a window without a title shows just the name.
         local name = (item.name or "") ~= "" and item.name or item.app_id
-        entry.app:set("text", name ~= "" and name or "window")
-        entry.app:set("text_color", item.focused and theme.bright or theme.text)
-        entry.title:set("text", item.title)
-        entry.title:set("text_color", item.focused and theme.text or theme.muted)
+        if name == "" then name = "window" end
+        local titled = (item.title or "") ~= ""
+        entry.primary:set("text", titled and item.title or name)
+        entry.primary:set("text_color", item.focused and theme.bright or theme.text)
+        entry.secondary:set("text", titled and name or "")
+        entry.secondary:set("visible", titled)
+        entry.secondary:set("text_color", item.focused and theme.text or theme.muted)
         entry.mark:set("text", item.detail)
         entry.mark:set("visible", item.detail ~= "")
         paint_item(index)

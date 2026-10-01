@@ -173,6 +173,8 @@ pub const Service = struct {
 const Search = struct {
     roots: []const []const u8,
     themes: []const []const u8,
+    /// The locale names are read in (see `messagesLocale`); empty for none.
+    locale: []const u8 = "",
 };
 
 fn resolve(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, pid: ?i32) !AppInfo {
@@ -182,7 +184,7 @@ fn resolve(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, pid: ?i
     var roots = std.ArrayList([]const u8).empty;
     try roots.appendSlice(arena, try dataRoots(arena));
     if (pid) |process| try appendProcessRoots(arena, io, process, &roots);
-    const search = Search{ .roots = roots.items, .themes = try themeChain(arena, io, roots.items) };
+    const search = Search{ .roots = roots.items, .themes = try themeChain(arena, io, roots.items), .locale = messagesLocale() };
     return resolveIn(allocator, io, app_id, search);
 }
 
@@ -197,7 +199,7 @@ fn resolveIn(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, searc
     var name: []const u8 = "";
     if (try findDesktopEntry(arena, io, app_id, search.roots)) |contents| {
         if (desktopKey(contents, "Icon")) |named| icon = named;
-        if (desktopKey(contents, "Name")) |named| name = named;
+        if (localizedKey(contents, "Name", search.locale)) |named| name = named;
     }
     const found = try findIconFile(arena, io, icon, search) orelse "";
     const owned_name = try allocator.dupe(u8, name);
@@ -401,6 +403,53 @@ fn desktopKey(contents: []const u8, key: []const u8) ?[]const u8 {
     return iniValue(contents, "Desktop Entry", key);
 }
 
+/// The locale desktop entries are read in, as the desktop entry spec says
+/// (it is the LC_MESSAGES category): LC_ALL, else LC_MESSAGES, else LANG,
+/// whichever is set first. Empty when none is.
+fn messagesLocale() []const u8 {
+    for ([_][*:0]const u8{ "LC_ALL", "LC_MESSAGES", "LANG" }) |name| {
+        if (environment(name)) |value| if (value.len != 0) return value;
+    }
+    return "";
+}
+
+/// `key` in the language of `locale` (`lang_COUNTRY.ENCODING@MODIFIER`, any
+/// part but lang optional): the first present of `key[lang_COUNTRY@MODIFIER]`,
+/// `key[lang_COUNTRY]`, `key[lang@MODIFIER]`, `key[lang]`, then plain `key`.
+/// The C and POSIX locales use plain `key`.
+fn localizedKey(contents: []const u8, key: []const u8, locale: []const u8) ?[]const u8 {
+    const modifier_at = std.mem.indexOfScalar(u8, locale, '@');
+    const modifier = if (modifier_at) |at| locale[at + 1 ..] else "";
+    var base = locale[0 .. modifier_at orelse locale.len];
+    if (std.mem.indexOfScalar(u8, base, '.')) |dot| base = base[0..dot];
+    if (base.len == 0 or std.mem.eql(u8, base, "C") or std.mem.eql(u8, base, "POSIX")) return desktopKey(contents, key);
+    const underscore = std.mem.indexOfScalar(u8, base, '_');
+    const lang = base[0 .. underscore orelse base.len];
+    const country = if (underscore) |at| base[at + 1 ..] else "";
+
+    var buffer: [160]u8 = undefined;
+    const candidates = [_]struct { country: bool, modifier: bool }{
+        .{ .country = true, .modifier = true },
+        .{ .country = true, .modifier = false },
+        .{ .country = false, .modifier = true },
+        .{ .country = false, .modifier = false },
+    };
+    for (candidates) |candidate| {
+        if (candidate.country and country.len == 0) continue;
+        if (candidate.modifier and modifier.len == 0) continue;
+        const localized = std.fmt.bufPrint(&buffer, "{s}[{s}{s}{s}{s}{s}]", .{
+            key,
+            lang,
+            if (candidate.country) "_" else "",
+            if (candidate.country) country else "",
+            if (candidate.modifier) "@" else "",
+            if (candidate.modifier) modifier else "",
+        }) catch continue;
+        if (desktopKey(contents, localized)) |value| return value;
+    }
+    return desktopKey(contents, key);
+}
+
 fn environment(name: [*:0]const u8) ?[]const u8 {
     const value = std.c.getenv(name) orelse return null;
     return std.mem.span(value);
@@ -495,4 +544,14 @@ test "a process's XDG_DATA_DIRS is read from its environment block" {
     const environ = "HOME=/home/a\x00XDG_DATA_DIRS_X=no\x00XDG_DATA_DIRS=/nix/store/abc-mpv/share:/usr/share\x00";
     try std.testing.expectEqualStrings("/nix/store/abc-mpv/share:/usr/share", environValue(environ, "XDG_DATA_DIRS").?);
     try std.testing.expect(environValue(environ, "PATH") == null);
+}
+
+test "names are read in the messages locale, most specific first" {
+    const entry = "[Desktop Entry]\nName=Files\nName[de]=Dateien\nName[de_AT]=Dateien (AT)\nName[sr@latin]=Datoteke\n";
+    try std.testing.expectEqualStrings("Dateien (AT)", localizedKey(entry, "Name", "de_AT.UTF-8").?);
+    try std.testing.expectEqualStrings("Dateien", localizedKey(entry, "Name", "de_CH.UTF-8").?);
+    try std.testing.expectEqualStrings("Datoteke", localizedKey(entry, "Name", "sr_RS@latin").?);
+    try std.testing.expectEqualStrings("Files", localizedKey(entry, "Name", "fr_FR.UTF-8").?);
+    try std.testing.expectEqualStrings("Files", localizedKey(entry, "Name", "C.UTF-8").?);
+    try std.testing.expectEqualStrings("Files", localizedKey(entry, "Name", "").?);
 }
