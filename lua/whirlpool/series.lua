@@ -55,4 +55,20 @@ function series.peak(t, values, since)
   return peak
 end
 
+-- The `p`th percentile (0..1) of the values taken after time `since`, from
+-- one or more series sharing the times `t`: the level that fraction of recent
+-- samples stay at or below. 0 when there are none.
+function series.percentile(p, t, since, ...)
+  local recent = {}
+  for _, values in ipairs({ ... }) do
+    for index = #t, 1, -1 do
+      if t[index] < since then break end
+      recent[#recent + 1] = values[index]
+    end
+  end
+  if #recent == 0 then return 0 end
+  table.sort(recent)
+  return recent[math.max(1, math.ceil(p * #recent))]
+end
+
 return series

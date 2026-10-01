@@ -11,8 +11,9 @@
 --   area   a filled envelope (`direction` "up" grows from the bottom)
 --   heat   one full-height cell per sample interval, shaded by level; with
 --          `base` (the opaque colour behind the plot) cells mix from base to
---          fill instead of fading in, so overlapping edges never double up
-
+--          fill instead of fading in, so overlapping edges never double up.
+--          With `hot`, levels above 1 continue on a second ramp from fill to
+--          hot (full at 2): room to single out peaks above the usual range.
 local Graph = {}
 Graph.__index = Graph
 
@@ -52,6 +53,7 @@ function Graph.new(canvas, spec)
   self.direction = spec.direction or "up"
   self.fill = spec.fill
   self.base = spec.base
+  self.hot = spec.hot
   self.t, self.values = {}, {}
   self.drawn_key = nil
   self.pool, self.shown = {}, {}
@@ -120,12 +122,20 @@ function Graph:draw_heat(now, level)
       self.canvas:set_polygon(node, {
         { x1, self.top }, { x2, self.top }, { x2, self.bottom }, { x1, self.bottom },
       })
-      local shade = math.floor(clamp01(level(values[index])) * SHADES + 0.5) / SHADES
-      if self.base then
+      local value = level(values[index])
+      local shade = math.floor(clamp01(value) * SHADES + 0.5) / SHADES
+      local heat = self.hot and math.floor(clamp01(value - 1) * SHADES + 0.5) / SHADES or 0
+      if heat > 0 then
+        local fill, hot = self.fill, self.hot
+        node:set("fill", { lerp(fill[1], hot[1], heat), lerp(fill[2], hot[2], heat), lerp(fill[3], hot[3], heat), 1 })
+        node:set("opacity", 1)
+        self.shown[used] = true
+      elseif self.base then
         local base, fill = self.base, self.fill
         node:set("fill", { lerp(base[1], fill[1], shade), lerp(base[2], fill[2], shade), lerp(base[3], fill[3], shade), 1 })
         self:show(used, true)
       else
+        node:set("fill", self.fill)
         node:set("opacity", shade)
         self.shown[used] = shade > 0
       end

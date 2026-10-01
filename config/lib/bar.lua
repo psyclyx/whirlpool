@@ -28,10 +28,17 @@ local PLOT_DELAY_MS = 500
 -- battery. Scrolling and the OSD follow every frame.
 local TICK_AC_MS = 33
 local TICK_BATTERY_MS = 125
--- The network scale follows the data: it rises fast enough to fit a burst
--- before it scrolls into view, and falls slowly so the chart does not breathe.
+-- The network scale fits typical traffic, not the peaks: it is set so that
+-- NETWORK_SCALE_PERCENTILE of the visible samples (with some headroom) fall in
+-- the normal colour ramp. Anything above continues on a brighter ramp, at
+-- full brightness NETWORK_PEAK_RANGE times above the scale, so a burst stands
+-- out instead of washing the rest of the chart out. The scale rises within
+-- about a second and falls slowly, so the chart does not breathe.
 local NETWORK_SCALE_FLOOR = 1024 * 1024
-local NETWORK_SCALE_ATTACK_MS = 125
+local NETWORK_SCALE_PERCENTILE = 0.8
+local NETWORK_SCALE_HEADROOM = 1.25
+local NETWORK_PEAK_RANGE = 20
+local NETWORK_SCALE_ATTACK_MS = 1000
 local NETWORK_SCALE_DECAY_MS = 2500
 -- Readouts average over longer than the plots, so they are steady enough to read.
 local READOUT_WINDOW_MS = 4000
@@ -446,11 +453,11 @@ return function(root)
   local net_base = theme.blend(theme.cyan)
   local rx_plot = Graph.new(net_canvas, {
     span = PLOT_SPAN_MS, delay = PLOT_DELAY_MS, style = "heat", region = { 0, HEIGHT / 2 },
-    fill = theme.blend(theme.green, 220), base = net_base,
+    fill = theme.blend(theme.green, 220), base = net_base, hot = lighten(theme.green, 0.8),
   })
   local tx_plot = Graph.new(net_canvas, {
     span = PLOT_SPAN_MS, delay = PLOT_DELAY_MS, style = "heat", region = { HEIGHT / 2, HEIGHT },
-    fill = theme.blend(theme.cyan, 220), base = net_base,
+    fill = theme.blend(theme.cyan, 220), base = net_base, hot = lighten(theme.cyan, 0.8),
   })
   local net_column = net_panel.row:column({ gap = 1, justify = "center" })
   local rx_readout = readout(net_column, { label = "↓", size = 12, color = theme.green, number_width = 26, unit_width = 34, parts = format.bit_rate_parts })
@@ -469,15 +476,21 @@ return function(root)
 
   redraws.network = function(now, elapsed)
     local since = now - PLOT_SPAN_MS - PLOT_DELAY_MS
-    local peak = math.max(series.peak(network.t, network.rx, since), series.peak(network.t, network.tx, since))
-    local target = math.max(NETWORK_SCALE_FLOOR, peak * 1.15)
+    local typical = series.percentile(NETWORK_SCALE_PERCENTILE, network.t, since, network.rx, network.tx)
+    local target = math.max(NETWORK_SCALE_FLOOR, typical * NETWORK_SCALE_HEADROOM)
     local current, wanted = math.log(network.scale), math.log(target)
     local tau = wanted > current and NETWORK_SCALE_ATTACK_MS or NETWORK_SCALE_DECAY_MS
     network.scale = math.exp(current + (wanted - current) * (1 - math.exp(-elapsed / tau)))
     -- The scale moves in 2.5% steps, so a quiet chart is not redrawn.
     local step = math.floor(math.log(network.scale) * 40)
     local scale = math.exp(step / 40)
-    local function level(value) return math.sqrt(math.max(0, value) / scale) end
+    -- 0..1: square root of the share of the scale (quiet traffic stays
+    -- visible); 1..2: a peak's height above the scale, logarithmically.
+    local function level(value)
+      local ratio = math.max(0, value) / scale
+      if ratio <= 1 then return math.sqrt(ratio) end
+      return 1 + math.min(1, math.log(ratio) / math.log(NETWORK_PEAK_RANGE))
+    end
     rx_plot:draw(now, level, step)
     tx_plot:draw(now, level, step)
     rx_readout(network.rx_now, now)
@@ -533,7 +546,8 @@ return function(root)
   chip(chip_canvas, 1, 13, theme.green)
   local memory_text = lines(memory_panel.row, {
     { text = "0/0", size = 12, color = theme.green },
-    { text = "0B cache", size = 9, color = DIM },
+    -- In the cache colour, so it reads as the legend for that band.
+    { text = "0B cache", size = 9, color = theme.blue },
   }, { width = 72 })
   local swap_text, swap_column = lines(memory_panel.row, {
     { text = "", size = 12, color = DIM },
@@ -552,7 +566,7 @@ return function(root)
     memory_meter({
       { used / total, theme.green },
       { arc / total, theme.cyan },
-      { cache / total, with_alpha(theme.green, 0.45) },
+      { cache / total, theme.blue },
     })
     swap_meter({ { swap_total > 0 and swap_used / swap_total or 0, theme.orange } })
     memory_text[1]:set("text", format.format_ratio(used, total))
