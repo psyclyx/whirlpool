@@ -125,96 +125,180 @@ pub const Service = struct {
     }
 };
 
+/// Where to look: data directories in XDG order, and icon themes to search in
+/// order (the user's GTK theme, what it inherits, then hicolor).
+const Search = struct {
+    roots: []const []const u8,
+    themes: []const []const u8,
+};
+
 fn resolve(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8) ![]u8 {
-    const desktop = try findDesktopFile(allocator, io, app_id) orelse return &.{};
-    defer allocator.free(desktop);
-    const contents = try std.Io.Dir.cwd().readFileAlloc(io, desktop, allocator, .limited(1024 * 1024));
-    defer allocator.free(contents);
-    const icon = desktopIcon(contents) orelse return &.{};
-    return try findIconFile(allocator, io, icon) orelse &.{};
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const roots = try dataRoots(arena);
+    const search = Search{ .roots = roots, .themes = try themeChain(arena, io, roots) };
+    return resolveIn(allocator, io, app_id, search);
 }
 
-fn findDesktopFile(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8) !?[]u8 {
-    const filename = if (std.mem.endsWith(u8, app_id, ".desktop"))
-        try allocator.dupe(u8, app_id)
-    else
-        try std.mem.concat(allocator, u8, &.{ app_id, ".desktop" });
-    defer allocator.free(filename);
-    if (try findDataFile(allocator, io, &.{ "applications", filename })) |path| return path;
+/// An application id to an icon file: through its desktop entry (named after
+/// the id, or claiming it as StartupWMClass) when there is one, else an icon
+/// named after the id itself.
+fn resolveIn(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, search: Search) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var icon: []const u8 = app_id;
+    if (try findDesktopEntry(arena, io, app_id, search.roots)) |contents| {
+        if (desktopKey(contents, "Icon")) |named| icon = named;
+    }
+    const found = try findIconFile(arena, io, icon, search) orelse return &.{};
+    return allocator.dupe(u8, found);
+}
 
-    const lowercase = try std.ascii.allocLowerString(allocator, filename);
-    defer allocator.free(lowercase);
-    if (!std.mem.eql(u8, lowercase, filename))
-        return try findDataFile(allocator, io, &.{ "applications", lowercase });
+/// The contents of the desktop entry for `app_id`: `<id>.desktop` (or its
+/// lowercase form), else whichever entry names it as its StartupWMClass.
+fn findDesktopEntry(arena: std.mem.Allocator, io: std.Io, app_id: []const u8, roots: []const []const u8) !?[]u8 {
+    const names = [_][]const u8{
+        try std.mem.concat(arena, u8, &.{ app_id, ".desktop" }),
+        try std.mem.concat(arena, u8, &.{ try std.ascii.allocLowerString(arena, app_id), ".desktop" }),
+    };
+    for (names) |name| for (roots) |root| {
+        const path = try std.fs.path.join(arena, &.{ root, "applications", name });
+        if (readSmall(arena, io, path)) |contents| return contents;
+    };
+    for (roots) |root| {
+        const directory = try std.fs.path.join(arena, &.{ root, "applications" });
+        var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var entries = dir.iterate();
+        while (entries.next(io) catch null) |entry| {
+            if (!std.mem.endsWith(u8, entry.name, ".desktop")) continue;
+            const contents = readSmall(arena, io, try std.fs.path.join(arena, &.{ directory, entry.name })) orelse continue;
+            const class = desktopKey(contents, "StartupWMClass") orelse continue;
+            if (std.ascii.eqlIgnoreCase(class, app_id)) return contents;
+        }
+    }
     return null;
 }
 
-fn findIconFile(allocator: std.mem.Allocator, io: std.Io, icon: []const u8) !?[]u8 {
-    if (std.fs.path.isAbsolute(icon)) return if (try existingOwned(allocator, io, icon)) |path| path else null;
+fn readSmall(arena: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256 * 1024)) catch null;
+}
 
-    const sizes = [_][]const u8{ "24x24", "22x22", "32x32", "16x16", "48x48", "64x64", "128x128", "scalable" };
-    const extensions = if (std.fs.path.extension(icon).len == 0)
-        [_][]const u8{ ".png", ".svg", ".xpm" }
-    else
-        [_][]const u8{ "", "", "" };
-    for (sizes) |size| for (extensions) |extension| {
-        if (extension.len == 0 and std.fs.path.extension(icon).len == 0) continue;
-        const filename = try std.mem.concat(allocator, u8, &.{ icon, extension });
-        defer allocator.free(filename);
-        if (try findDataFile(allocator, io, &.{ "icons", "hicolor", size, "apps", filename })) |path| return path;
+const image_extensions = [_][]const u8{ ".svg", ".png", ".xpm" };
+/// Sizes to try, best for a ~20-40px bar icon first.
+const icon_sizes = [_][]const u8{ "scalable", "32x32", "48x48", "64x64", "24x24", "128x128", "256x256", "22x22", "16x16", "512x512", "1024x1024" };
+
+/// An icon by name (or path): in each theme in order, at each size, in
+/// either directory layout (`<size>/apps` or `apps/<size>`), then pixmaps.
+/// Names are often reverse-DNS (`com.example.App`): only a real image
+/// extension counts as one.
+fn findIconFile(arena: std.mem.Allocator, io: std.Io, icon: []const u8, search: Search) !?[]const u8 {
+    if (std.fs.path.isAbsolute(icon)) return if (exists(io, icon)) icon else null;
+    const given = for (image_extensions) |extension| {
+        if (std.ascii.endsWithIgnoreCase(icon, extension)) break true;
+    } else false;
+    const extensions: []const []const u8 = if (given) &.{""} else &image_extensions;
+    for (search.themes) |theme| for (icon_sizes) |size| for (extensions) |extension| {
+        const file = try std.mem.concat(arena, u8, &.{ icon, extension });
+        for (search.roots) |root| {
+            for ([_][2][]const u8{ .{ size, "apps" }, .{ "apps", size } }) |layout| {
+                const path = try std.fs.path.join(arena, &.{ root, "icons", theme, layout[0], layout[1], file });
+                if (exists(io, path)) return path;
+            }
+        }
     };
-    if (try findDataFile(allocator, io, &.{ "pixmaps", icon })) |path| return path;
-    if (std.fs.path.extension(icon).len == 0) for (extensions) |extension| {
-        const filename = try std.mem.concat(allocator, u8, &.{ icon, extension });
-        defer allocator.free(filename);
-        if (try findDataFile(allocator, io, &.{ "pixmaps", filename })) |path| return path;
-    };
+    for (extensions) |extension| {
+        const file = try std.mem.concat(arena, u8, &.{ icon, extension });
+        for (search.roots) |root| {
+            const path = try std.fs.path.join(arena, &.{ root, "pixmaps", file });
+            if (exists(io, path)) return path;
+        }
+    }
     return null;
 }
 
-fn findDataFile(allocator: std.mem.Allocator, io: std.Io, suffix: []const []const u8) !?[]u8 {
+fn exists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// XDG data directories, most specific first.
+fn dataRoots(arena: std.mem.Allocator) ![]const []const u8 {
+    var roots = std.ArrayList([]const u8).empty;
     if (environment("XDG_DATA_HOME")) |root| {
-        if (try existingJoined(allocator, io, root, suffix)) |path| return path;
+        try roots.append(arena, root);
     } else if (environment("HOME")) |home| {
-        const root = try std.fs.path.join(allocator, &.{ home, ".local", "share" });
-        defer allocator.free(root);
-        if (try existingJoined(allocator, io, root, suffix)) |path| return path;
+        try roots.append(arena, try std.fs.path.join(arena, &.{ home, ".local", "share" }));
     }
+    var dirs = std.mem.tokenizeScalar(u8, environment("XDG_DATA_DIRS") orelse "/usr/local/share:/usr/share", ':');
+    while (dirs.next()) |root| try roots.append(arena, root);
+    return roots.items;
+}
 
-    const roots = environment("XDG_DATA_DIRS") orelse "/usr/local/share:/usr/share";
-    var iterator = std.mem.splitScalar(u8, roots, ':');
-    while (iterator.next()) |root| {
-        if (root.len == 0) continue;
-        if (try existingJoined(allocator, io, root, suffix)) |path| return path;
+/// The user's GTK icon theme, the themes it inherits (by its index.theme),
+/// and hicolor, the fallback every theme ends in.
+fn themeChain(arena: std.mem.Allocator, io: std.Io, roots: []const []const u8) ![]const []const u8 {
+    var chain = std.ArrayList([]const u8).empty;
+    var pending = std.ArrayList([]const u8).empty;
+    if (try gtkIconTheme(arena, io)) |theme| try pending.append(arena, theme);
+    while (pending.items.len > 0 and chain.items.len < 8) {
+        const theme = pending.orderedRemove(0);
+        for (chain.items) |seen| {
+            if (std.mem.eql(u8, seen, theme)) break;
+        } else {
+            try chain.append(arena, theme);
+            for (roots) |root| {
+                const index = readSmall(arena, io, try std.fs.path.join(arena, &.{ root, "icons", theme, "index.theme" })) orelse continue;
+                var parents = std.mem.tokenizeScalar(u8, iniValue(index, "Icon Theme", "Inherits") orelse "", ',');
+                while (parents.next()) |parent| try pending.append(arena, std.mem.trim(u8, parent, " "));
+                break;
+            }
+        }
+    }
+    for (chain.items) |theme| {
+        if (std.mem.eql(u8, theme, "hicolor")) break;
+    } else try chain.append(arena, "hicolor");
+    return chain.items;
+}
+
+/// `gtk-icon-theme-name` from GTK's settings.ini, as GTK applications use.
+fn gtkIconTheme(arena: std.mem.Allocator, io: std.Io) !?[]const u8 {
+    const config_home = environment("XDG_CONFIG_HOME") orelse blk: {
+        const home = environment("HOME") orelse return null;
+        break :blk try std.fs.path.join(arena, &.{ home, ".config" });
+    };
+    for ([_][]const u8{ "gtk-4.0", "gtk-3.0" }) |version| {
+        const settings = readSmall(arena, io, try std.fs.path.join(arena, &.{ config_home, version, "settings.ini" })) orelse continue;
+        if (iniValue(settings, "Settings", "gtk-icon-theme-name")) |name| return name;
     }
     return null;
 }
 
-fn existingJoined(allocator: std.mem.Allocator, io: std.Io, root: []const u8, suffix: []const []const u8) !?[]u8 {
-    var parts = std.ArrayList([]const u8).empty;
-    defer parts.deinit(allocator);
-    try parts.append(allocator, root);
-    try parts.appendSlice(allocator, suffix);
-    const path = try std.fs.path.join(allocator, parts.items);
-    return existingPath(allocator, io, path);
+/// `key`'s value in `[section]` of an ini-style file (desktop entries,
+/// index.theme, settings.ini).
+fn iniValue(contents: []const u8, section: []const u8, key: []const u8) ?[]const u8 {
+    var in_section = false;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '[') {
+            in_section = line.len >= 2 and std.mem.eql(u8, line[1 .. line.len - 1], section);
+            continue;
+        }
+        if (!in_section) continue;
+        const equals = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..equals], " \t"), key)) continue;
+        const value = std.mem.trim(u8, line[equals + 1 ..], " \t\"");
+        return if (value.len == 0) null else value;
+    }
+    return null;
 }
 
-fn existingOwned(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?[]u8 {
-    return existingPath(allocator, io, try allocator.dupe(u8, path));
-}
-
-fn existingPath(allocator: std.mem.Allocator, io: std.Io, path: []u8) !?[]u8 {
-    std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            allocator.free(path);
-            return null;
-        },
-        else => {
-            allocator.free(path);
-            return err;
-        },
-    };
-    return path;
+fn desktopKey(contents: []const u8, key: []const u8) ?[]const u8 {
+    return iniValue(contents, "Desktop Entry", key);
 }
 
 fn environment(name: [*:0]const u8) ?[]const u8 {
@@ -222,27 +306,75 @@ fn environment(name: [*:0]const u8) ?[]const u8 {
     return std.mem.span(value);
 }
 
-fn desktopIcon(contents: []const u8) ?[]const u8 {
-    var in_desktop_entry = false;
-    var lines = std.mem.splitScalar(u8, contents, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        if (line[0] == '[') {
-            in_desktop_entry = std.mem.eql(u8, line, "[Desktop Entry]");
-            continue;
-        }
-        if (in_desktop_entry and std.mem.startsWith(u8, line, "Icon=")) {
-            const value = std.mem.trim(u8, line[5..], " \t");
-            return if (value.len == 0) null else value;
-        }
-    }
-    return null;
-}
-
 test "desktop icon parser only accepts the main desktop entry" {
     const source =
         "[Desktop Action New]\nIcon=wrong\n" ++
         "[Desktop Entry]\nName=Example\nIcon=org.example.App\n";
-    try std.testing.expectEqualStrings("org.example.App", desktopIcon(source).?);
+    try std.testing.expectEqualStrings("org.example.App", desktopKey(source, "Icon").?);
+}
+
+/// A scratch XDG data directory with the given files (contents are names).
+const Fixture = struct {
+    dir: std.testing.TmpDir,
+    root: [:0]u8,
+
+    fn init(files: []const []const u8) !Fixture {
+        var dir = std.testing.tmpDir(.{});
+        errdefer dir.cleanup();
+        for (files) |file| {
+            const separator = std.mem.indexOfScalar(u8, file, '=');
+            const path = if (separator) |index| file[0..index] else file;
+            if (std.fs.path.dirname(path)) |parent| try dir.dir.createDirPath(std.testing.io, parent);
+            try dir.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = if (separator) |index| file[index + 1 ..] else "x" });
+        }
+        const root = try dir.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        return .{ .dir = dir, .root = root };
+    }
+
+    fn deinit(self: *Fixture) void {
+        std.testing.allocator.free(self.root);
+        self.dir.cleanup();
+    }
+
+    fn resolve(self: *const Fixture, app_id: []const u8, themes: []const []const u8) ![]u8 {
+        return resolveIn(std.testing.allocator, std.testing.io, app_id, .{ .roots = &.{self.root}, .themes = themes });
+    }
+};
+
+test "reverse-DNS icon names are names, not files with an extension" {
+    var fixture = try Fixture.init(&.{
+        "applications/com.mitchellh.ghostty.desktop=[Desktop Entry]\nIcon=com.mitchellh.ghostty\n",
+        "icons/hicolor/32x32/apps/com.mitchellh.ghostty.png",
+    });
+    defer fixture.deinit();
+    const path = try fixture.resolve("com.mitchellh.ghostty", &.{"hicolor"});
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "icons/hicolor/32x32/apps/com.mitchellh.ghostty.png"));
+}
+
+test "an entry claiming the app id as its window class supplies the icon" {
+    var fixture = try Fixture.init(&.{
+        "applications/signal.desktop=[Desktop Entry]\nStartupWMClass=Signal\nIcon=signal-desktop\n",
+        "icons/hicolor/48x48/apps/signal-desktop.png",
+    });
+    defer fixture.deinit();
+    const path = try fixture.resolve("signal", &.{"hicolor"});
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "signal-desktop.png"));
+}
+
+test "without an entry, an icon named after the app id is used, themes first" {
+    var fixture = try Fixture.init(&.{
+        "icons/Papirus/64x64/apps/foot.svg",
+        "icons/hicolor/scalable/apps/foot.svg",
+    });
+    defer fixture.deinit();
+    const path = try fixture.resolve("foot", &.{ "Papirus", "hicolor" });
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "icons/Papirus/64x64/apps/foot.svg"));
+}
+
+test "ini values are read from their own section" {
+    const index = "[Icon Theme]\nName=Papirus\nInherits=breeze,hicolor\n[16x16/apps]\nInherits=nope\n";
+    try std.testing.expectEqualStrings("breeze,hicolor", iniValue(index, "Icon Theme", "Inherits").?);
 }

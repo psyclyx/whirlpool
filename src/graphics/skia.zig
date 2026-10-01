@@ -300,6 +300,21 @@ test "CPU renderer rasterizes a filled polygon" {
     try std.testing.expect(painted);
 }
 
+test "CPU renderer decodes and rasterizes a PNG icon" {
+    var renderer = try Renderer.init(true);
+    defer renderer.deinit();
+    try renderer.begin(32, 32, .{ 0, 0, 0, 0 });
+    renderer.drawIcon("src/graphics/skia/testdata/icon.png", .{ .x = 4, .y = 4, .width = 24, .height = 24 }, 1);
+    const frame = try renderer.end();
+    const pixels = frame.pixels[0 .. frame.row_bytes * frame.height];
+    var painted = false;
+    for (pixels) |value| if (value != 0) {
+        painted = true;
+        break;
+    };
+    try std.testing.expect(painted);
+}
+
 test "CPU renderer decodes and rasterizes an SVG icon" {
     var renderer = try Renderer.init(true);
     defer renderer.deinit();
