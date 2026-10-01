@@ -40,6 +40,7 @@ end
 --   inset      horizontal margin between the cell edges and the plot
 --   direction  "up" grows from the region's bottom, "down" from its top
 --   fill       colour
+--   base       heat only: the opaque colour behind the plot (see `Graph:shade`)
 --   style      see the list above
 function Graph.new(cell, spec)
   local self = setmetatable({}, Graph)
@@ -52,6 +53,7 @@ function Graph.new(cell, spec)
   self.direction = spec.direction or "up"
   self.style = spec.style or "area"
   self.fill = spec.fill
+  self.base = spec.base
   self.values = {}
   self.drawn_key = nil
 
@@ -136,6 +138,26 @@ local function chunk_ranges(total, size)
   return ranges
 end
 
+-- Shade heat cell `index` for `level` (0..1) in 1/32 steps. With a `base`
+-- (the colour behind the plot) the cell is an opaque mix of base and fill;
+-- without one it falls back to fill opacity.
+local SHADES = 32
+function Graph:shade(index, level)
+  local shade = math.floor(level * SHADES + 0.5)
+  if self.pool_visible[index] == shade then return end
+  self.pool_visible[index] = shade
+  local node = self.pool[index]
+  if not self.base then
+    node:set("opacity", shade / SHADES)
+    return
+  end
+  local amount, fill, base = shade / SHADES, self.fill, self.base
+  node:set("fill", {
+    lerp(base[1], fill[1], amount), lerp(base[2], fill[2], amount), lerp(base[3], fill[3], amount), 1,
+  })
+  node:set("opacity", 1)
+end
+
 -- Redraw with the plot advanced `phase` (0..1) of a sample spacing.
 -- `level(value)` maps a sample to 0..1 and may change between calls (the
 -- caller passes a `version` that changes whenever it does, so unchanged plots
@@ -174,7 +196,9 @@ function Graph:draw(phase, level, version)
       local sample_index = index
       local u1 = position(sample_index)
       local u2 = u1 + spacing * (1 - gap)
-      if style == "heat" then u2 = u1 + spacing + 0.6 end
+      -- Heat cells run one pixel under their right neighbour, which is drawn
+      -- later and opaque, so no seam shows and nothing is blended twice.
+      if style == "heat" then u2 = u1 + spacing + (self.base and 1 or 0.6) end
       u1, u2 = math.max(0, u1), math.min(width, u2)
       if sample_index >= first_index and u2 - u1 > 0.2 then
         local l = sample_level(sample_index)
@@ -183,7 +207,7 @@ function Graph:draw(phase, level, version)
           self.cell:set_polygon(self.pool[index], {
             { x1, self.top }, { x2, self.top }, { x2, self.bottom }, { x1, self.bottom },
           })
-          show(self.pool, self.pool_visible, index, math.floor(l * 16 + 0.5) / 16)
+          self:shade(index, l)
         else
           local y = row(math.max(l, 0.04))
           self.cell:set_polygon(self.pool[index], {

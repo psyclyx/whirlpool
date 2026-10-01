@@ -23,11 +23,18 @@ local CPU_CORE_DISPLAY_COUNT = 16
 local CPU_CORE_COLUMNS = 8
 local NETWORK_SAMPLE_COUNT = 24
 local NETWORK_SAMPLE_MS = 500
--- Below this the chart stays flat instead of magnifying idle noise.
-local NETWORK_SCALE_FLOOR = 64 * 1024
+-- The chart never zooms in past this: slower traffic just reads dim instead of
+-- being magnified to full intensity.
+local NETWORK_SCALE_FLOOR = 1024 * 1024
+-- The scale is a one-pole low-pass on the log of the data's peak. The newest
+-- sample is held offscreen for a whole sample interval, so an attack of a
+-- quarter of that settles before the burst scrolls into view.
+local NETWORK_SCALE_ATTACK_MS = NETWORK_SAMPLE_MS / 4
 local NETWORK_SCALE_DECAY_MS = 2500
 local RATE_READOUT_MS = 1000
-local FRAME_TICK_MS = 100
+-- Plots advance on a shared tick; slower when running on battery.
+local FRAME_TICK_AC_MS = 50
+local FRAME_TICK_BATTERY_MS = 125
 local MAX_DISK_CHIPS = 5
 -- Alternative history plots, drawn beside the real ones so the styles can be
 -- compared on live data. Set to false once one is chosen.
@@ -244,6 +251,7 @@ local function build(parent)
     items = {},
     item_count = 0,
     frame_ms = 0,
+    frame_tick_ms = FRAME_TICK_AC_MS,
     cpu_sample_ms = 0,
     cpu_sequence = -1,
     cpu_count = 1,
@@ -385,11 +393,11 @@ local function build(parent)
       local cell = net_showcase.cells[index]
       network_plots[#network_plots + 1] = { side = "rx", graph = Graph.new(cell, {
         samples = NETWORK_SAMPLE_COUNT, fill = theme.blend(theme.green, 220), direction = "up",
-        region = { 0, middle }, style = entry.style, inset = 4,
+        region = { 0, middle }, style = entry.style, inset = 4, base = theme.blend(theme.cyan, 60),
       }) }
       network_plots[#network_plots + 1] = { side = "tx", graph = Graph.new(cell, {
         samples = NETWORK_SAMPLE_COUNT, fill = theme.blend(theme.cyan, 220), direction = "down",
-        region = { middle, BAR_HEIGHT }, style = entry.style, inset = 4,
+        region = { middle, BAR_HEIGHT }, style = entry.style, inset = 4, base = theme.blend(theme.cyan, 60),
       }) }
       cell.body:text({
         text = entry.label, font_size = 8, text_color = DIM, text_valign = "top", text_align = "start",
@@ -445,11 +453,11 @@ local function build(parent)
   local half = BAR_HEIGHT / 2
   network_plots[#network_plots + 1] = { side = "rx", graph = Graph.new(network.cells[1], {
     samples = NETWORK_SAMPLE_COUNT, fill = theme.blend(theme.green, 220),
-    direction = "up", region = { 0, half },
+    direction = "up", region = { 0, half }, style = "heat", base = theme.blend(theme.cyan),
   }) }
   network_plots[#network_plots + 1] = { side = "tx", graph = Graph.new(network.cells[1], {
     samples = NETWORK_SAMPLE_COUNT, fill = theme.blend(theme.cyan, 220),
-    direction = "down", region = { half, BAR_HEIGHT },
+    direction = "down", region = { half, BAR_HEIGHT }, style = "heat", base = theme.blend(theme.cyan),
   }) }
   local network_readout = rate_readouts(network.cells[2], {
     { label = "↓", color = theme.green, parts = Status.bit_rate_parts, unit_width = 34 },
@@ -610,14 +618,13 @@ local function build(parent)
     for _, value in ipairs(state.network_rx or {}) do peak = math.max(peak, value) end
     for _, value in ipairs(state.network_tx or {}) do peak = math.max(peak, value) end
     local target = math.max(NETWORK_SCALE_FLOOR, peak * 1.15)
-    if target >= state.network_scale then
-      state.network_scale = target
-    elseif elapsed > 0 then
-      state.network_scale = state.network_scale
-        + (target - state.network_scale) * (1 - math.exp(-elapsed / NETWORK_SCALE_DECAY_MS))
+    if elapsed > 0 then
+      local current, wanted = math.log(state.network_scale), math.log(target)
+      local tau = wanted > current and NETWORK_SCALE_ATTACK_MS or NETWORK_SCALE_DECAY_MS
+      state.network_scale = math.exp(current + (wanted - current) * (1 - math.exp(-elapsed / tau)))
     end
-    local step = math.floor(math.log(state.network_scale) * 20)
-    local scale = math.exp(step / 20)
+    local step = math.floor(math.log(state.network_scale) * 40)
+    local scale = math.exp(step / 40)
     local function level(value) return math.sqrt(math.max(0, tonumber(value) or 0) / scale) end
     local phase = math.max(0, math.min(0.99, (now_ms - state.network_sample_ms) / NETWORK_SAMPLE_MS))
     for _, plot in ipairs(network_plots) do plot.graph:draw(phase, level, step) end
@@ -625,10 +632,10 @@ local function build(parent)
 
   local function draw_frame(now_ms, force)
     now_ms = math.max(state.frame_ms, tonumber(now_ms) or 0)
-    -- Animations advance on a shared 100ms grid: every plot steps on the same
-    -- ticks, so a quiet bar is redrawn ten times a second at most rather than
+    -- Animations advance on a shared grid: every plot steps on the same
+    -- ticks, so a quiet bar is redrawn at most once per tick rather than
     -- whenever any one plot happens to cross a pixel.
-    now_ms = math.floor(now_ms / FRAME_TICK_MS) * FRAME_TICK_MS
+    now_ms = math.floor(now_ms / state.frame_tick_ms) * state.frame_tick_ms
     if not force and now_ms <= state.frame_ms and state.frame_ms > 0 then return end
     now_ms = math.max(now_ms, state.frame_ms)
     local elapsed = math.max(0, now_ms - state.frame_ms)
@@ -820,6 +827,7 @@ local function build(parent)
     local battery_present = battery_values[1] == true
     local battery_percent = tonumber(battery_values[2]) or 0
     local battery_charging = battery_values[3] == true
+    state.frame_tick_ms = battery_values[4] == false and FRAME_TICK_BATTERY_MS or FRAME_TICK_AC_MS
 
     update_cpu(type(values[4]) == "table" and values[4] or {})
     update_network(type(values[5]) == "table" and values[5] or {})

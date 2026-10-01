@@ -598,18 +598,33 @@ const Feed = struct {
         try self.shell.update(.{ .service = "frame", .values = &.{.{ .number = at_ms }} });
     }
 
-    /// How far up its half of the bar the receive plot reaches, 0..1.
-    fn receiveHeight(self: *Feed) !f32 {
+    /// How intense the receive heat cells are, 0..1: how far their colour has
+    /// moved from the panel colour towards the receive colour (judged by red).
+    fn receiveLevel(self: *Feed) !f32 {
         var frame_value = try self.shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
         defer frame_value.deinit();
-        var top: f32 = bar_height / 2;
+        const panel_red: f32 = (148.0 * 100.0 + 30.0 * 155.0) / 255.0;
+        const fill_red: f32 = (166.0 * 220.0 + 30.0 * 35.0) / 255.0;
+        const half: f32 = bar_height / 2;
+        var level: f32 = 0;
         for (frame_value.drawList().ops) |operation| switch (operation) {
-            .polygon => |polygon| if (polygon.points.len > 4 and colorNear(polygon.color, .{ 147, 200, 145 })) {
-                for (polygon.points.points[0..polygon.points.len]) |point| top = @min(top, point.y);
+            .polygon => |polygon| {
+                if (polygon.points.len != 4 or polygon.color.a < 0.99) continue;
+                // Heat cells span their whole half of the bar, the top half here.
+                var top: f32 = bar_height;
+                var bottom: f32 = 0;
+                for (polygon.points.points[0..4]) |point| {
+                    top = @min(top, point.y);
+                    bottom = @max(bottom, point.y);
+                }
+                if (bottom > half + 0.5 or bottom - top < half - 0.01) continue;
+                const red = polygon.color.r * 255;
+                if (red < panel_red - 1 or red > fill_red + 1) continue;
+                level = @max(level, (red - panel_red) / (fill_red - panel_red));
             },
             else => {},
         };
-        return (@as(f32, bar_height) / 2 - top) / (@as(f32, bar_height) / 2);
+        return level;
     }
 
     fn text(self: *Feed, wanted: []const u8) !bool {
@@ -622,50 +637,56 @@ const Feed = struct {
 test "the network chart's scale follows the data smoothly" {
     var feed = try Feed.init();
     defer feed.deinit();
-    // Sustained 1 MB/s: after settling, the plot fills most of its half.
+    // Sustained 10 MB/s: after settling, the cells are nearly at full intensity.
     var time: f64 = 0;
-    while (time <= 8000) : (time += 500) try feed.sample(time, 1_000_000);
-    const settled = try feed.receiveHeight();
-    try std.testing.expect(settled > 0.75 and settled < 1.0);
+    while (time <= 8000) : (time += 500) try feed.sample(time, 10_000_000);
+    const settled = try feed.receiveLevel();
+    try std.testing.expect(settled > 0.85 and settled < 1.0);
 
-    // Traffic drops to a tenth. The ceiling must not snap down: the plot
-    // shrinks at first, then slowly grows back to fill the chart.
+    // Traffic drops to a tenth. The ceiling must not snap down: the cells dim
+    // at first, then slowly brighten as the scale follows the data.
     time += 500;
-    try feed.sample(time, 100_000);
+    try feed.sample(time, 1_000_000);
     time += 250;
     try feed.frame(time);
-    const just_after = try feed.receiveHeight();
+    const just_after = try feed.receiveLevel();
     try std.testing.expect(just_after < 0.45);
     const stop = time + 12_000;
-    while (time <= stop) : (time += 500) try feed.sample(time, 100_000);
-    const adapted = try feed.receiveHeight();
+    while (time <= stop) : (time += 500) try feed.sample(time, 1_000_000);
+    const adapted = try feed.receiveLevel();
     try std.testing.expect(adapted > 0.75);
     // ...and it grew gradually rather than in one step.
     var midway_feed = try Feed.init();
     defer midway_feed.deinit();
     var t: f64 = 0;
-    while (t <= 8000) : (t += 500) try midway_feed.sample(t, 1_000_000);
+    while (t <= 8000) : (t += 500) try midway_feed.sample(t, 10_000_000);
     t += 500;
-    try midway_feed.sample(t, 100_000);
+    try midway_feed.sample(t, 1_000_000);
     const midpoint = t + 2000;
-    while (t <= midpoint) : (t += 500) try midway_feed.sample(t, 100_000);
-    const partway = try midway_feed.receiveHeight();
+    while (t <= midpoint) : (t += 500) try midway_feed.sample(t, 1_000_000);
+    const partway = try midway_feed.receiveLevel();
     try std.testing.expect(partway > just_after and partway < adapted);
 }
 
-test "a burst from an idle link is shown at once, unclipped" {
+test "slow traffic stays dim, and a burst is fitted within a sample interval" {
     var feed = try Feed.init();
     defer feed.deinit();
     var time: f64 = 0;
     while (time <= 6000) : (time += 500) try feed.sample(time, 20_000);
-    // Quiet traffic is visible, not flattened onto the baseline.
-    const idle = try feed.receiveHeight();
-    try std.testing.expect(idle > 0.3 and idle < 0.8);
-    // 175 MB/s (a gigabit and change) arrives: the very next frame already
-    // fits it on the chart, near the top but not cut off by it.
+    // Below the zoom floor the chart does not magnify quiet traffic.
+    const idle = try feed.receiveLevel();
+    try std.testing.expect(idle > 0.05 and idle < 0.25);
+    // 175 MB/s (a gigabit and change) arrives. It stays offscreen for a sample
+    // interval, and by then the scale has risen to (nearly) fit it, and it
+    // settles just under the top of the range rather than being clipped.
     time += 500;
     try feed.sample(time, 175_000_000);
-    const burst = try feed.receiveHeight();
+    time += 500;
+    try feed.frame(time);
+    try std.testing.expect(try feed.receiveLevel() > 0.85);
+    time += 500;
+    try feed.frame(time);
+    const burst = try feed.receiveLevel();
     try std.testing.expect(burst > 0.85 and burst < 1.0);
 }
 

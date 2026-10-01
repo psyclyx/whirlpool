@@ -79,6 +79,7 @@ pub const Snapshot = struct {
     battery_present: bool = false,
     battery_percent: u8 = 0,
     battery_charging: bool = false,
+    battery_on_ac: bool = true,
 };
 
 pub const VersionedSnapshot = struct {
@@ -396,6 +397,7 @@ pub const Service = struct {
             self.snapshot.battery_present = sample.present;
             self.snapshot.battery_percent = sample.percent;
             self.snapshot.battery_charging = sample.charging;
+            self.snapshot.battery_on_ac = sample.on_ac;
             self.publish();
             try std.Io.sleep(self.io, .fromSeconds(10), .awake);
         }
@@ -470,6 +472,7 @@ pub const Service = struct {
             .present = true,
             .percent = @intCast(@min(100, try std.fmt.parseUnsigned(u16, trimmed[0..separator], 10))),
             .charging = std.mem.startsWith(u8, trimmed[separator + 1 ..], "Charging"),
+            .on_ac = !std.mem.startsWith(u8, trimmed[separator + 1 ..], "Discharging"),
         };
     }
 
@@ -503,7 +506,7 @@ const CpuRead = struct {
 };
 const NetworkSample = struct { rx: u64, tx: u64 };
 const AudioSample = struct { percent: u8, muted: bool };
-const BatterySample = struct { present: bool = false, percent: u8 = 0, charging: bool = false };
+const BatterySample = struct { present: bool = false, percent: u8 = 0, charging: bool = false, on_ac: bool = true };
 
 fn readCpu(io: std.Io) !CpuRead {
     var buffer: [32 * 1024]u8 = undefined;
@@ -719,7 +722,7 @@ pub fn StatusValues(comptime Value: type) type {
         memory: [9]Value = undefined,
         disk_fields: [max_disks][6]Value = undefined,
         disks: [max_disks]Value = undefined,
-        battery: [3]Value = undefined,
+        battery: [4]Value = undefined,
         top: [10]Value = undefined,
 
         pub fn build(self: *@This(), snapshot: *const Snapshot) []const Value {
@@ -779,6 +782,7 @@ pub fn StatusValues(comptime Value: type) type {
                 .{ .boolean = snapshot.battery_present },
                 .{ .number = @floatFromInt(snapshot.battery_percent) },
                 .{ .boolean = snapshot.battery_charging },
+                .{ .boolean = snapshot.battery_on_ac },
             };
             self.top = .{
                 .{ .string = &snapshot.time },

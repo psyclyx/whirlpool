@@ -667,6 +667,7 @@ local function sync(snapshot)
   local state, focused = tag_state(snapshot.tag.id), snapshot.tag.focused_window
   if state.focus and state.focus_anchor ~= focused then state.focus, state.focus_anchor = nil, nil end
   if focused then
+    state.last_focused = focused
     local current = node(model.window_nodes[focused])
     while current and current.parent do
       local parent = node(current.parent)
@@ -856,8 +857,8 @@ local function resolve_tag(snapshot, ordinal)
   return type(value) == "table" and value.id or value
 end
 
--- Focus moves to `output`: to the model's remembered window for its active
--- tag, else its first window. If the monitor has no window it is focused on
+-- Focus moves to `output`: to the window last focused on its active tag (where
+-- its camera is centred), else its first window. If the monitor has no window it is focused on
 -- its own (keyboard focus clears). Only windows the compositor actually shows
 -- there qualify (a window is on whichever output shows its tag).
 local function focus_output(snapshot, output, exclude)
@@ -868,16 +869,16 @@ local function focus_output(snapshot, output, exclude)
       first = first or fact.id
     end
   end
-  local wanted
   local state = tag_state(output.active_tag)
+  local wanted = state.last_focused and visible[state.last_focused] and state.last_focused or nil
   local strips = { state.current }
   for _, strip in ipairs(state.strips) do strips[#strips + 1] = strip end
   for _, strip in ipairs(strips) do
+    if wanted then break end
     for _, slot in ipairs(strip.roots) do
       local leaf = active_leaf(slot.node)
       if leaf and leaf.window and visible[leaf.window] then wanted = leaf.window; break end
     end
-    if wanted then break end
   end
   wanted = wanted or first
   if wanted then return { { name = "focus-window", window = wanted } } end
