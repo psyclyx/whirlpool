@@ -57,11 +57,16 @@ pub const Composition = struct {
         return self.retained.isDirty();
     }
 
-    pub fn snapshotAndLower(
+    pub fn lower(
         self: *Composition,
         viewport: @import("skia_scene.zig").Viewport,
     ) !lua_composition.Frame {
-        return self.retained.snapshotAndLower(viewport);
+        return self.retained.lower(viewport);
+    }
+
+    /// Measure text with the fonts of the renderer that will draw it.
+    pub fn setTextMetrics(self: *Composition, metrics: @import("whirlpool-graphics").skia.TextMetrics) void {
+        self.retained.setMeasurer(@import("skia_scene.zig").measurer(metrics));
     }
 };
 
@@ -74,7 +79,7 @@ test "surface composition mounts retained Lua source" {
     );
     defer composition.deinit();
 
-    var frame = try composition.snapshotAndLower(.{ .width = 100, .height = 20 });
+    var frame = try composition.lower(.{ .width = 100, .height = 20 });
     defer frame.deinit();
     try std.testing.expectEqual(@as(usize, 2), frame.node_count);
 }
@@ -107,7 +112,7 @@ test "surface composition exposes the workspace stdlib module" {
     defer composition.deinit();
 
     try composition.update(.{ .service = "workspaces", .values = &.{.{ .number = 2 }} });
-    var frame = try composition.snapshotAndLower(.{ .width = 100, .height = 20 });
+    var frame = try composition.lower(.{ .width = 100, .height = 20 });
     defer frame.deinit();
     try std.testing.expectEqual(@as(usize, 2), frame.node_count);
 }
@@ -125,7 +130,7 @@ test "surface controllers can retain nodes created during later updates" {
 
     try composition.update(.{ .service = "grow", .values = &.{} });
     try composition.update(.{ .service = "grow", .values = &.{} });
-    var frame = try composition.snapshotAndLower(.{ .width = 100, .height = 20 });
+    var frame = try composition.lower(.{ .width = 100, .height = 20 });
     defer frame.deinit();
     try std.testing.expectEqual(@as(usize, 2), frame.node_count);
 }
@@ -135,7 +140,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
         \\return require("whirlpool.shell")
     );
     defer shell.deinit();
-    var shell_frame = try shell.snapshotAndLower(.{ .width = 800, .height = 600 });
+    var shell_frame = try shell.lower(.{ .width = 800, .height = 600 });
     defer shell_frame.deinit();
     try std.testing.expect(shell_frame.node_count > 100);
     var shell_background: ?@import("whirlpool-graphics").skia.Rect = null;
@@ -184,7 +189,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
             .{ .number = 0 },
         },
     });
-    var positioned = try shell.snapshotAndLower(.{ .width = 800, .height = 600 });
+    var positioned = try shell.lower(.{ .width = 800, .height = 600 });
     defer positioned.deinit();
     var title_x: ?f32 = null;
     var icon_source: ?[]const u8 = null;
@@ -227,7 +232,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
             .{ .number = 0 },
         },
     });
-    var two_windows = try shell.snapshotAndLower(.{ .width = 1200, .height = 600 });
+    var two_windows = try shell.lower(.{ .width = 1200, .height = 600 });
     defer two_windows.deinit();
     var first_app_x: ?f32 = null;
     var second_app_x: ?f32 = null;
@@ -267,7 +272,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
             .{ .number = 0 },
         },
     });
-    var with_marker = try shell.snapshotAndLower(.{ .width = 1200, .height = 600 });
+    var with_marker = try shell.lower(.{ .width = 1200, .height = 600 });
     defer with_marker.deinit();
     var marked_second_x: ?f32 = null;
     for (with_marker.drawList().ops) |operation| switch (operation) {
@@ -300,7 +305,7 @@ test "sample shell and decoration modules mount as distinct compositions" {
         },
     });
     try shell.update(.{ .service = "frame", .values = &.{.{ .number = 250 }} });
-    var network_frame = try shell.snapshotAndLower(.{ .width = 1200, .height = 600 });
+    var network_frame = try shell.lower(.{ .width = 1200, .height = 600 });
     defer network_frame.deinit();
     var rx_rises_from_center = false;
     var tx_falls_from_center = false;
@@ -331,14 +336,14 @@ test "sample shell and decoration modules mount as distinct compositions" {
         .service = "decoration",
         .values = &.{ .{ .string = "Whirlpool" }, .{ .boolean = true } },
     });
-    var frame = try decoration.snapshotAndLower(.{ .width = 800, .height = 28 });
+    var frame = try decoration.lower(.{ .width = 800, .height = 28 });
     defer frame.deinit();
     try std.testing.expect(frame.node_count < 50);
     try std.testing.expectEqual(@as(usize, 2), frame.operationCount());
 }
 
 fn countPolygonsColored(composition: *Composition, rgb: [3]u8) !usize {
-    var frame = try composition.snapshotAndLower(.{ .width = 800, .height = 600 });
+    var frame = try composition.lower(.{ .width = 800, .height = 600 });
     defer frame.deinit();
     var count: usize = 0;
     for (frame.drawList().ops) |operation| switch (operation) {
@@ -469,7 +474,7 @@ fn barShell(desktop_windows: []const script.program_loader.Value) !Composition {
 test "text placed in a tag is centred in the slanted panel, without any per-glyph nudging" {
     var shell = try barShell(&.{});
     defer shell.deinit();
-    var frame = try shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
     defer frame.deinit();
     const ops = frame.drawList().ops;
     const panel = findPanel(ops, .{ 0x89, 0xb4, 0xfa }) orelse return error.MissingActiveTag;
@@ -492,7 +497,7 @@ test "window indicators keep their icon and labels inside the slant with even ma
     const windows = [_]script.program_loader.Value{.{ .array = &window }};
     var shell = try barShell(&windows);
     defer shell.deinit();
-    var frame = try shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
     defer frame.deinit();
     const ops = frame.drawList().ops;
 
@@ -535,7 +540,7 @@ test "level bars are flush with the panel's slanted edge" {
             .{ .array = &.{} },     .{ .array = &.{} },   .{ .array = &audio },
         },
     });
-    var frame = try shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
     defer frame.deinit();
     const ops = frame.drawList().ops;
     // The purple level fill and the purple panel it sits in.
@@ -601,7 +606,7 @@ const Feed = struct {
     /// How intense the receive heat cells are, 0..1: how far their colour has
     /// moved from the panel colour towards the receive colour (judged by red).
     fn receiveLevel(self: *Feed) !f32 {
-        var frame_value = try self.shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+        var frame_value = try self.shell.lower(.{ .width = bar_width, .height = bar_height });
         defer frame_value.deinit();
         const panel_red: f32 = (148.0 * 100.0 + 30.0 * 155.0) / 255.0;
         const fill_red: f32 = (166.0 * 220.0 + 30.0 * 35.0) / 255.0;
@@ -628,7 +633,7 @@ const Feed = struct {
     }
 
     fn text(self: *Feed, wanted: []const u8) !bool {
-        var frame_value = try self.shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+        var frame_value = try self.shell.lower(.{ .width = bar_width, .height = bar_height });
         defer frame_value.deinit();
         return findText(frame_value.drawList().ops, wanted) != null;
     }
@@ -708,7 +713,7 @@ test "memory shows programs, ZFS ARC and cache as stacked bands, plus swap" {
             .{ .array = &.{} },     .{ .array = &.{} },   .{ .array = &memory },
         },
     });
-    var frame = try shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
     defer frame.deinit();
     const ops = frame.drawList().ops;
 
@@ -761,7 +766,7 @@ test "throughput readouts keep unit and digit positions fixed as values change" 
         var feed = try Feed.init();
         defer feed.deinit();
         try feed.sample(0, case.bytes);
-        var frame_value = try feed.shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+        var frame_value = try feed.shell.lower(.{ .width = bar_width, .height = bar_height });
         defer frame_value.deinit();
         const ops = frame_value.drawList().ops;
         const number = findText(ops, case.number) orelse return error.MissingNumber;
@@ -804,7 +809,7 @@ test "sparklines and core cells lean with the panel instead of being rectangular
         },
     });
     try shell.update(.{ .service = "frame", .values = &.{.{ .number = 200 }} });
-    var frame = try shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
     defer frame.deinit();
 
     // The main CPU plot sits immediately left of the core heat cells.
@@ -876,7 +881,7 @@ test "each reported filesystem is a chip with its own bar, name, free space and 
             .{ .array = &.{} },     .{ .array = &.{} },   .{ .array = &.{} },          .{ .array = &disks },
         },
     });
-    var frame = try shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
     defer frame.deinit();
     const ops = frame.drawList().ops;
 
@@ -917,7 +922,7 @@ test "memory says what its numbers are out of, and swap is quiet until used" {
                 .{ .array = &.{} },     .{ .array = &.{} },   .{ .array = &memory },
             },
         });
-        var frame = try shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+        var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
         defer frame.deinit();
         const ops = frame.drawList().ops;
         // "used/total", in the total's unit.
@@ -936,7 +941,7 @@ test "memory says what its numbers are out of, and swap is quiet until used" {
 test "adjacent panels tuck under their neighbour so no seam shows between them" {
     var shell = try barShell(&.{});
     defer shell.deinit();
-    var frame = try shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
     defer frame.deinit();
     // Section backgrounds are the tall four-point polygons. Consecutive ones in
     // the right-hand group must overlap along the shared diagonal.
@@ -979,7 +984,7 @@ test "every history style stays inside its slanted cell and draws its samples" {
         },
     });
     try shell.update(.{ .service = "frame", .values = &.{.{ .number = 100 }} });
-    var frame = try shell.snapshotAndLower(.{ .width = bar_width, .height = bar_height });
+    var frame = try shell.lower(.{ .width = bar_width, .height = bar_height });
     defer frame.deinit();
     // The showcase has one plot per style: columns and ticks draw one narrow
     // polygon per sample (small 4-point polygons of the plot colour), the rest

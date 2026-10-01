@@ -53,6 +53,10 @@ pub const Composition = struct {
     delta: ui.SceneDelta,
     in_batch: bool = false,
     stats: Stats = .{},
+    /// How text is measured for layout; the renderer's fonts once one exists.
+    measurer: ui.Measurer = ui.Measurer.estimate,
+    /// The surface size last drawn, which geometry queries are answered for.
+    viewport: ?skia_scene.Viewport = null,
 
     /// Allocate a scene, mount the program once, and apply its initial
     /// property batch. The VM remains owned by the caller.
@@ -128,53 +132,53 @@ pub const Composition = struct {
             .create = sinkCreate,
             .set = sinkSet,
             .finish = sinkFinish,
+            .bounds = sinkBounds,
         };
     }
 
-    /// Snapshot all retained nodes in tree order and lower them to a complete
-    /// renderer-neutral draw list. Dirty bits are cleared only after lowering
-    /// succeeds; a rejected frame can therefore be retried.
     /// Whether anything has changed since the last frame was lowered.
     pub fn isDirty(self: *const Composition) bool {
         return self.scene.hasDirtyNodes();
     }
 
-    pub fn snapshotAndLower(self: *Composition, viewport: skia_scene.Viewport) !Frame {
-        var snapshots = std.ArrayList(ui.NodeSnapshot).empty;
-        defer {
-            for (snapshots.items) |snapshot| {
-                if (snapshot.properties.text.len != 0) self.allocator.free(snapshot.properties.text);
-                if (snapshot.properties.icon_source.len != 0) self.allocator.free(snapshot.properties.icon_source);
+    pub fn setMeasurer(self: *Composition, measurer: ui.Measurer) void {
+        self.measurer = measurer;
+        // Widths measured with other metrics are wrong now.
+        self.scene.layout_dirty = true;
+        self.scene.layout_viewport = .{ -1, -1 };
+        for (self.nodes.items) |maybe| if (maybe) |handle| {
+            if (self.scene.getLayoutMut(handle)) |state| {
+                state.intrinsic = .{ std.math.nan(f32), std.math.nan(f32) };
+                state.fit_width = -1;
             }
-            snapshots.deinit(self.allocator);
-        }
-
-        try self.collectSnapshots(null, &snapshots);
-        const lowered = try skia_scene.lower(self.allocator, snapshots.items, viewport);
-        self.scene.clearDirty();
-        return .{ .lowered = lowered, .node_count = snapshots.items.len };
+        };
     }
 
-    fn collectSnapshots(self: *Composition, parent: ?ui.NodeHandle, output: *std.ArrayList(ui.NodeSnapshot)) !void {
-        const children = try self.scene.childrenAlloc(self.allocator, parent);
-        defer self.allocator.free(children);
-        for (children) |handle| {
-            var snapshot = self.scene.node(handle) orelse return error.StaleNode;
-            if (snapshot.properties.text.len != 0)
-                snapshot.properties.text = try self.allocator.dupe(u8, snapshot.properties.text);
-            if (snapshot.properties.icon_source.len != 0) {
-                snapshot.properties.icon_source = self.allocator.dupe(u8, snapshot.properties.icon_source) catch |err| {
-                    if (snapshot.properties.text.len != 0) self.allocator.free(snapshot.properties.text);
-                    return err;
-                };
-            }
-            output.append(self.allocator, snapshot) catch |err| {
-                if (snapshot.properties.text.len != 0) self.allocator.free(snapshot.properties.text);
-                if (snapshot.properties.icon_source.len != 0) self.allocator.free(snapshot.properties.icon_source);
-                return err;
-            };
-            try self.collectSnapshots(handle, output);
-        }
+    /// Lay out (if anything changed) and lower the retained tree to a complete
+    /// renderer-neutral draw list, which borrows from the scene until it is
+    /// next mutated. Dirty bits are cleared only after lowering succeeds; a
+    /// rejected frame can therefore be retried.
+    pub fn lower(self: *Composition, viewport: skia_scene.Viewport) !Frame {
+        self.viewport = viewport;
+        const lowered = try skia_scene.lower(self.allocator, self.scene, viewport, self.measurer);
+        self.scene.clearDirty();
+        return .{ .lowered = lowered, .node_count = self.scene.liveNodeCount() };
+    }
+
+    /// Where a node sits on the surface, laid out as of now: staged property
+    /// changes are committed first, so a program may set properties and then
+    /// ask where they put things. Null before the surface has a size, or for
+    /// an invisible node.
+    pub fn bounds(self: *Composition, id: lua_program.NodeId) !?ui.Box {
+        if (id == 0 or id >= self.nodes.items.len) return error.StaleNode;
+        const handle = self.nodes.items[id] orelse return error.StaleNode;
+        if (self.in_batch) try self.delta.apply(self.scene);
+        const viewport = self.viewport orelse return null;
+        ui.layout.update(self.scene, .{
+            .width = @floatFromInt(viewport.width),
+            .height = @floatFromInt(viewport.height),
+        }, self.measurer);
+        return ui.layout.bounds(self.scene, handle);
     }
 
     fn sinkBegin(context: ?*anyopaque) anyerror!void {
@@ -221,6 +225,11 @@ pub const Composition = struct {
         return property_decoder.apply(self, id, key, value);
     }
 
+    fn sinkBounds(context: ?*anyopaque, id: lua_program.NodeId) anyerror!?[4]f32 {
+        const box = (try fromContext(context).bounds(id)) orelse return null;
+        return .{ box.x, box.y, box.width, box.height };
+    }
+
     fn sinkFinish(context: ?*anyopaque) anyerror!void {
         const self = fromContext(context);
         if (!self.in_batch) return;
@@ -247,7 +256,7 @@ test "composition mounts an equivalent Lua retained program and lowers a complet
             .source = "return function(parent)\n" ++
                 "  local row = parent:row({ gap = 4 })\n" ++
                 "  row:text({ text = 'hello', font_size = 18 })\n" ++
-                "  row:shape({ color = { 0.2, 0.4, 0.6, 1 } })\n" ++
+                "  row:shape({ flex = 1, color = { 0.2, 0.4, 0.6, 1 } })\n" ++
                 "end",
         },
     };
@@ -259,7 +268,7 @@ test "composition mounts an equivalent Lua retained program and lowers a complet
     defer composition.deinit();
     try std.testing.expectEqual(@as(usize, 4), composition.nodeCount());
 
-    var frame = try composition.snapshotAndLower(.{ .width = 320, .height = 80 });
+    var frame = try composition.lower(.{ .width = 320, .height = 80 });
     defer frame.deinit();
     try std.testing.expectEqual(@as(usize, 4), frame.node_count);
     try std.testing.expectEqual(@as(usize, 2), frame.operationCount());
@@ -287,7 +296,7 @@ test "Lua defines arbitrary filled polygons through the retained contract" {
     var composition = try Composition.mount(std.testing.allocator, &vm, &program, .{});
     defer composition.deinit();
 
-    var frame = try composition.snapshotAndLower(.{ .width = 80, .height = 20 });
+    var frame = try composition.lower(.{ .width = 80, .height = 20 });
     defer frame.deinit();
     const polygon = frame.drawList().ops[0].polygon;
     try std.testing.expectEqual(@as(u8, 4), polygon.points.len);
@@ -319,7 +328,7 @@ test "named service updates mutate the retained Lua controller" {
         .service = "example",
         .values = &.{.{ .string = "after" }},
     });
-    var frame = try composition.snapshotAndLower(.{ .width = 320, .height = 80 });
+    var frame = try composition.lower(.{ .width = 320, .height = 80 });
     defer frame.deinit();
     try std.testing.expectEqualStrings("after", frame.drawList().ops[0].text.text);
 }
@@ -349,15 +358,56 @@ test "updates repaint the complete composed tree instead of only dirty nodes" {
     var composition = try Composition.mount(std.testing.allocator, &vm, &program, .{});
     defer composition.deinit();
 
-    var before = try composition.snapshotAndLower(.{ .width = 80, .height = 24 });
+    var before = try composition.lower(.{ .width = 80, .height = 24 });
     defer before.deinit();
     try std.testing.expectEqual(@as(usize, 2), before.operationCount());
 
     try composition.update(&vm, &program, .{ .service = "workspaces", .values = &.{} });
-    var after = try composition.snapshotAndLower(.{ .width = 80, .height = 24 });
+    var after = try composition.lower(.{ .width = 80, .height = 24 });
     defer after.deinit();
     try std.testing.expectEqual(@as(usize, 2), after.operationCount());
     try std.testing.expectEqual(@as(f32, 0.2), after.drawList().ops[0].rect.color.r);
     try std.testing.expectEqualStrings("1", after.drawList().ops[1].text.text);
     try std.testing.expectEqual(@as(f32, 0.1), after.drawList().ops[1].text.color.r);
+}
+
+test "Lua asks where a node was laid out, including changes staged in the same update" {
+    var vm = try lua_program.Vm.init(true);
+    defer vm.deinit();
+    const modules = [_]lua_program.Module{.{
+        .name = "main",
+        .source =
+        \\return function(parent)
+        \\  local row = parent:row({ gap = 5 })
+        \\  local first = row:shape({ width = 20 })
+        \\  local second = row:shape({ width = 10 })
+        \\  local report = parent:text({ text = '' })
+        \\  return { update = function(_, service)
+        \\    if service == 'widen' then first:set('width', 40) end
+        \\    local box = second:bounds()
+        \\    report:set('text', box and string.format('%d,%d,%d', box.x, box.width, box.height) or 'unknown')
+        \\  end }
+        \\end
+        ,
+    }};
+    const loader = lua_program.Loader.init(std.testing.allocator, .{});
+    var program = try loader.load("main", &modules);
+    defer program.deinit();
+    var composition = try Composition.mount(std.testing.allocator, &vm, &program, .{});
+    defer composition.deinit();
+
+    const Report = struct {
+        fn text(target: *Composition) ![]const u8 {
+            var frame = try target.lower(.{ .width = 100, .height = 30 });
+            defer frame.deinit();
+            for (frame.drawList().ops) |op| if (op == .text) return op.text.text;
+            return error.MissingReport;
+        }
+    };
+    try composition.update(&vm, &program, .{ .service = "look" });
+    try std.testing.expectEqualStrings("unknown", try Report.text(&composition));
+    try composition.update(&vm, &program, .{ .service = "look" });
+    try std.testing.expectEqualStrings("25,10,30", try Report.text(&composition));
+    try composition.update(&vm, &program, .{ .service = "widen" });
+    try std.testing.expectEqualStrings("45,10,30", try Report.text(&composition));
 }

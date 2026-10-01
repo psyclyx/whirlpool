@@ -311,6 +311,7 @@ pub const Presenter = struct {
             return;
         };
         defer renderer.deinit();
+        self.composition.setTextMetrics(renderer.textMetrics());
         while (true) {
             self.lock();
             while (!self.closing and !self.canRender())
@@ -364,7 +365,7 @@ pub const Presenter = struct {
             const values = [_]script.program_loader.Value{.{ .number = now }};
             try self.composition.update(.{ .service = "frame", .values = &values });
         }
-        var frame = try self.composition.snapshotAndLower(.{
+        var frame = try self.composition.lower(.{
             .width = self.width,
             .height = self.height,
         });

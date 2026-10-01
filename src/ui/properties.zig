@@ -1,4 +1,8 @@
 //! Retained-node property values, ownership, validation, and invalidation.
+//!
+//! Every property is one field of `Fields` and one same-named tag of `Value`;
+//! `metadata` is the single schema saying which nodes accept it and whether it
+//! changes geometry (layout) or only appearance (paint).
 
 const std = @import("std");
 
@@ -37,6 +41,14 @@ pub const Polygon = struct {
 
 pub const TextAlign = enum { start, center, end };
 pub const TextVAlign = enum { top, middle };
+/// Where children sit across a row or column (or within a stack, on both
+/// axes) when they are smaller than it. `stretch` fills the space.
+pub const Align = enum { stretch, start, center, end };
+/// How a row or column places its children along its axis when they do not
+/// fill it (nothing flexes).
+pub const Justify = enum { start, center, end, between };
+/// What a text node does with text wider than its box.
+pub const TextOverflow = enum { clip, ellipsis };
 
 pub const Edges = struct {
     top: u32 = 0,
@@ -64,32 +76,63 @@ pub const DirtyFlags = packed struct(u2) {
     paint: bool = false,
 };
 
-pub const Snapshot = struct {
-    width: ?u32 = null,
-    height: ?u32 = null,
-    gap: u32 = 0,
-    padding: Edges = .{},
-    flex: u32 = 0,
-    fill: Color = Color.transparent,
-    radius: f32 = 0,
-    points: Polygon = .{},
-    text: []const u8 = &.{},
-    icon_source: []const u8 = &.{},
-    text_color: Color = Color.white,
-    font_size: u16 = 16,
-    opacity: f32 = 1,
-    clip: bool = false,
-    offset_x: f32 = 0,
-    text_align: TextAlign = .start,
-    text_valign: TextVAlign = .top,
-};
+fn Fields(comptime Bytes: type) type {
+    return struct {
+        // Geometry.
+        visible: bool = true,
+        width: ?u32 = null,
+        height: ?u32 = null,
+        min_width: u32 = 0,
+        max_width: ?u32 = null,
+        min_height: u32 = 0,
+        max_height: ?u32 = null,
+        gap: u32 = 0,
+        padding: Edges = .{},
+        flex: u32 = 0,
+        shrink: u32 = 0,
+        @"align": Align = .stretch,
+        justify: Justify = .start,
+        // Appearance. Offsets move a node (and its subtree) after layout, so
+        // scrolling and sliding never re-run layout.
+        offset_x: f32 = 0,
+        offset_y: f32 = 0,
+        opacity: f32 = 1,
+        clip: bool = false,
+        fill: Color = Color.transparent,
+        radius: f32 = 0,
+        points: Polygon = .{},
+        text: Bytes = &.{},
+        icon_source: Bytes = &.{},
+        text_color: Color = Color.white,
+        font_size: u16 = 16,
+        text_align: TextAlign = .start,
+        text_valign: TextVAlign = .top,
+        text_overflow: TextOverflow = .clip,
+    };
+}
+
+pub const Snapshot = Fields([]const u8);
+/// The same fields as a node stores them, owning their bytes.
+pub const Stored = Fields([]u8);
 
 pub const Value = union(enum) {
+    visible: bool,
     width: ?u32,
     height: ?u32,
+    min_width: u32,
+    max_width: ?u32,
+    min_height: u32,
+    max_height: ?u32,
     gap: u32,
     padding: Edges,
     flex: u32,
+    shrink: u32,
+    @"align": Align,
+    justify: Justify,
+    offset_x: f32,
+    offset_y: f32,
+    opacity: f32,
+    clip: bool,
     fill: Color,
     radius: f32,
     points: Polygon,
@@ -97,12 +140,18 @@ pub const Value = union(enum) {
     icon_source: []const u8,
     text_color: Color,
     font_size: u16,
-    opacity: f32,
-    clip: bool,
-    offset_x: f32,
     text_align: TextAlign,
     text_valign: TextVAlign,
+    text_overflow: TextOverflow,
 };
+
+comptime {
+    // `Value` and `Fields` must name the same properties.
+    const fields = @typeInfo(Snapshot).@"struct".fields;
+    const tags = @typeInfo(Value).@"union".fields;
+    std.debug.assert(fields.len == tags.len);
+    for (tags) |tag| std.debug.assert(@hasField(Snapshot, tag.name));
+}
 
 pub const Error = error{
     PropertyNotSupported,
@@ -119,18 +168,18 @@ const layout_and_paint = DirtyFlags{ .layout = true, .paint = true };
 const paint = DirtyFlags{ .paint = true };
 
 /// The single explicit schema for applicability, invalidation, and ownership.
-/// Keeping this as ordinary Zig data makes additions visible in review and
-/// avoids reflection-driven behavior.
 pub fn metadata(value: Value) Metadata {
     return switch (value) {
-        .width, .height, .gap, .padding, .flex, .offset_x => .{ .supported_by = .every_node, .dirty = layout_and_paint },
+        .visible, .width, .height, .min_width, .max_width, .min_height, .max_height => .{ .supported_by = .every_node, .dirty = layout_and_paint },
+        .gap, .padding, .flex, .shrink, .@"align", .justify => .{ .supported_by = .every_node, .dirty = layout_and_paint },
+        .offset_x, .offset_y, .opacity, .clip => .{ .supported_by = .every_node, .dirty = paint },
         .fill => .{ .supported_by = .paint, .dirty = paint },
         .radius => .{ .supported_by = .shape, .dirty = paint },
         .points => .{ .supported_by = .polygon, .dirty = paint },
         .text => .{ .supported_by = .text, .dirty = layout_and_paint, .owns_bytes = true },
+        .font_size => .{ .supported_by = .text, .dirty = layout_and_paint },
         .icon_source => .{ .supported_by = .icon, .dirty = paint, .owns_bytes = true },
-        .text_color, .font_size, .text_align, .text_valign => .{ .supported_by = .text, .dirty = paint },
-        .opacity, .clip => .{ .supported_by = .every_node, .dirty = paint },
+        .text_color, .text_align, .text_valign, .text_overflow => .{ .supported_by = .text, .dirty = paint },
     };
 }
 
@@ -146,9 +195,9 @@ pub fn validate(kind: NodeKind, value: Value) Error!void {
     }
 
     switch (value) {
-        .fill => |color| if (!validColor(color)) return error.InvalidValue,
-        .text_color => |color| if (!validColor(color)) return error.InvalidValue,
+        .fill, .text_color => |color| if (!validColor(color)) return error.InvalidValue,
         .radius => |radius| if (!std.math.isFinite(radius) or radius < 0) return error.InvalidValue,
+        .offset_x, .offset_y => |offset| if (!std.math.isFinite(offset)) return error.InvalidValue,
         .points => |polygon| {
             if (polygon.len < 3 or polygon.len > max_polygon_points) return error.InvalidValue;
             for (polygon.slice()) |point| {
@@ -156,6 +205,7 @@ pub fn validate(kind: NodeKind, value: Value) Error!void {
             }
         },
         .opacity => |opacity| if (!std.math.isFinite(opacity) or opacity < 0 or opacity > 1) return error.InvalidValue,
+        .font_size => |size| if (size == 0) return error.InvalidValue,
         else => {},
     }
 }
@@ -187,82 +237,57 @@ pub fn freeValue(allocator: Allocator, value: Value) void {
 }
 
 pub const Owned = struct {
-    width: ?u32 = null,
-    height: ?u32 = null,
-    gap: u32 = 0,
-    padding: Edges = .{},
-    flex: u32 = 0,
-    fill: Color = Color.transparent,
-    radius: f32 = 0,
-    points: Polygon = .{},
-    text: []u8 = &.{},
-    icon_source: []u8 = &.{},
-    text_color: Color = Color.white,
-    font_size: u16 = 16,
-    opacity: f32 = 1,
-    clip: bool = false,
-    offset_x: f32 = 0,
-    text_align: TextAlign = .start,
-    text_valign: TextVAlign = .top,
+    fields: Stored = .{},
 
-    pub fn snapshot(self: Owned) Snapshot {
-        return .{
-            .width = self.width,
-            .height = self.height,
-            .gap = self.gap,
-            .padding = self.padding,
-            .flex = self.flex,
-            .fill = self.fill,
-            .radius = self.radius,
-            .points = self.points,
-            .text = self.text,
-            .icon_source = self.icon_source,
-            .text_color = self.text_color,
-            .font_size = self.font_size,
-            .opacity = self.opacity,
-            .clip = self.clip,
-            .offset_x = self.offset_x,
-            .text_align = self.text_align,
-            .text_valign = self.text_valign,
-        };
+    pub fn snapshot(self: *const Owned) Snapshot {
+        var result: Snapshot = undefined;
+        inline for (@typeInfo(Snapshot).@"struct".fields) |field|
+            @field(result, field.name) = @field(self.fields, field.name);
+        return result;
     }
 
     pub fn commit(self: *Owned, allocator: Allocator, value: Value, owned_bytes: ?[]u8) void {
         switch (value) {
-            .width => |item| self.width = item,
-            .height => |item| self.height = item,
-            .gap => |item| self.gap = item,
-            .padding => |item| self.padding = item,
-            .flex => |item| self.flex = item,
-            .fill => |item| self.fill = item,
-            .radius => |item| self.radius = item,
-            .points => |item| self.points = item,
-            .text => {
+            inline .text, .icon_source => |requested, tag| {
+                const slot = &@field(self.fields, @tagName(tag));
                 const replacement = owned_bytes orelse {
-                    std.debug.assert(std.mem.eql(u8, self.text, value.text));
+                    std.debug.assert(std.mem.eql(u8, slot.*, requested));
                     return;
                 };
-                if (self.text.len != 0) allocator.free(self.text);
-                self.text = replacement;
+                if (slot.len != 0) allocator.free(slot.*);
+                slot.* = replacement;
             },
-            .icon_source => {
-                const replacement = owned_bytes orelse {
-                    std.debug.assert(std.mem.eql(u8, self.icon_source, value.icon_source));
-                    return;
-                };
-                if (self.icon_source.len != 0) allocator.free(self.icon_source);
-                self.icon_source = replacement;
-            },
-            .text_color => |item| self.text_color = item,
-            .font_size => |item| self.font_size = item,
-            .opacity => |item| self.opacity = item,
-            .clip => |item| self.clip = item,
-            .offset_x => |item| self.offset_x = item,
-            .text_align => |item| self.text_align = item,
-            .text_valign => |item| self.text_valign = item,
+            inline else => |item, tag| @field(self.fields, @tagName(tag)) = item,
         }
     }
+
+    pub fn freeBytes(self: *Owned, allocator: Allocator) void {
+        if (self.fields.text.len != 0) allocator.free(self.fields.text);
+        if (self.fields.icon_source.len != 0) allocator.free(self.fields.icon_source);
+        self.fields.text = &.{};
+        self.fields.icon_source = &.{};
+    }
 };
+
+/// Whether setting `value` would leave the node exactly as it is. Programs set
+/// properties freely (a value recomputed each update is usually the same), so
+/// scenes skip these instead of marking the node dirty and re-rendering.
+/// `current` is a node's fields, stored or snapshotted, by value or pointer.
+pub fn matches(current: anytype, value: Value) bool {
+    return switch (value) {
+        inline .text, .icon_source => |item, tag| std.mem.eql(u8, @field(current, @tagName(tag)), item),
+        .points => |item| samePoints(current.points, item),
+        inline else => |item, tag| std.meta.eql(@field(current, @tagName(tag)), item),
+    };
+}
+
+fn samePoints(a: Polygon, b: Polygon) bool {
+    if (a.len != b.len) return false;
+    for (a.slice(), b.slice()) |left, right| {
+        if (left.x != right.x or left.y != right.y) return false;
+    }
+    return true;
+}
 
 test "property metadata is the shared applicability and invalidation schema" {
     try std.testing.expectError(error.PropertyNotSupported, validate(.text, .{ .fill = Color.white }));
@@ -271,6 +296,9 @@ test "property metadata is the shared applicability and invalidation schema" {
     try std.testing.expect(metadata(.{ .icon_source = "icon.svg" }).owns_bytes);
     try std.testing.expect(!metadata(.{ .icon_source = "icon.svg" }).dirty.layout);
     try std.testing.expect(!metadata(.{ .opacity = 1 }).dirty.layout);
+    // Moving a node is paint-only: scrolling must not re-run layout.
+    try std.testing.expect(!metadata(.{ .offset_x = 3 }).dirty.layout);
+    try std.testing.expect(metadata(.{ .visible = false }).dirty.layout);
 }
 
 test "polygon points are finite, bounded in count, and owned inline" {
@@ -286,43 +314,6 @@ test "polygon points are finite, bounded in count, and owned inline" {
     try std.testing.expectError(error.InvalidValue, validate(.polygon, .{ .points = polygon }));
 }
 
-fn sameColor(a: Color, b: Color) bool {
-    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
-}
-
-fn samePoints(a: Polygon, b: Polygon) bool {
-    if (a.len != b.len) return false;
-    for (a.slice(), b.slice()) |left, right| {
-        if (left.x != right.x or left.y != right.y) return false;
-    }
-    return true;
-}
-
-/// Whether setting `value` would leave the node exactly as it is. Programs set
-/// properties freely (a value recomputed each update is usually the same), so
-/// scenes skip these instead of marking the node dirty and re-rendering.
-pub fn matches(current: Snapshot, value: Value) bool {
-    return switch (value) {
-        .width => |item| current.width == item,
-        .height => |item| current.height == item,
-        .gap => |item| current.gap == item,
-        .padding => |item| std.meta.eql(current.padding, item),
-        .flex => |item| current.flex == item,
-        .fill => |item| sameColor(current.fill, item),
-        .radius => |item| current.radius == item,
-        .points => |item| samePoints(current.points, item),
-        .text => |item| std.mem.eql(u8, current.text, item),
-        .icon_source => |item| std.mem.eql(u8, current.icon_source, item),
-        .text_color => |item| sameColor(current.text_color, item),
-        .font_size => |item| current.font_size == item,
-        .opacity => |item| current.opacity == item,
-        .clip => |item| current.clip == item,
-        .offset_x => |item| current.offset_x == item,
-        .text_align => |item| current.text_align == item,
-        .text_valign => |item| current.text_valign == item,
-    };
-}
-
 test "setting a property to its current value is recognised as a no-op" {
     var snapshot = Snapshot{};
     try std.testing.expect(matches(snapshot, .{ .opacity = 1 }));
@@ -331,9 +322,23 @@ test "setting a property to its current value is recognised as a no-op" {
     try std.testing.expect(!matches(snapshot, .{ .fill = Color.white }));
     try std.testing.expect(matches(snapshot, .{ .width = null }));
     try std.testing.expect(!matches(snapshot, .{ .width = 10 }));
+    try std.testing.expect(matches(snapshot, .{ .visible = true }));
+    try std.testing.expect(!matches(snapshot, .{ .@"align" = .center }));
     snapshot.points = .{ .len = 3 };
     try std.testing.expect(matches(snapshot, .{ .points = .{ .len = 3 } }));
     try std.testing.expect(!matches(snapshot, .{ .points = .{ .len = 4 } }));
     try std.testing.expect(matches(snapshot, .{ .text = "" }));
     try std.testing.expect(!matches(snapshot, .{ .text = "x" }));
+}
+
+test "committing a value stores it under the same-named field" {
+    var owned = Owned{};
+    owned.commit(std.testing.allocator, .{ .justify = .between }, null);
+    owned.commit(std.testing.allocator, .{ .max_width = 120 }, null);
+    owned.commit(std.testing.allocator, .{ .text = "hi" }, try std.testing.allocator.dupe(u8, "hi"));
+    defer owned.freeBytes(std.testing.allocator);
+    const snapshot = owned.snapshot();
+    try std.testing.expectEqual(Justify.between, snapshot.justify);
+    try std.testing.expectEqual(@as(?u32, 120), snapshot.max_width);
+    try std.testing.expectEqualStrings("hi", snapshot.text);
 }

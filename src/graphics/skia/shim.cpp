@@ -534,6 +534,35 @@ static const CachedText *cached_text(WhirlpoolSkia *renderer, const char *text,
     return &renderer->text_cache.emplace(std::move(key), std::move(entry)).first->second;
 }
 
+// The advance width `whirlpool_skia_draw_text` gives `text` at `size`.
+extern "C" float whirlpool_skia_measure_text(WhirlpoolSkia *renderer, const char *text,
+                                             size_t length, float size) {
+    if (!renderer || !text || length == 0 || size <= 0 || !renderer->default_typeface) return 0;
+    return cached_text(renderer, text, length, size)->width;
+}
+
+// How many bytes of `text` (a whole number of characters) fit in `max_width`
+// at `size`, with the same font fallback as drawing. Prefixes are not cached:
+// layout asks only when a text's box narrows below the text.
+extern "C" size_t whirlpool_skia_fit_text(WhirlpoolSkia *renderer, const char *text,
+                                          size_t length, float size, float max_width) {
+    if (!renderer || !text || length == 0 || size <= 0 || !renderer->default_typeface) return 0;
+    const char *end = text + length;
+    const char *cursor = text;
+    float used = 0;
+    size_t fitted = 0;
+    while (cursor < end) {
+        const char *start = cursor;
+        const SkUnichar character = next_utf8(&cursor, end);
+        auto typeface = typeface_for(renderer, renderer->default_typeface, character);
+        SkFont font(typeface ? typeface : renderer->default_typeface, size);
+        used += font.measureText(start, static_cast<size_t>(cursor - start), SkTextEncoding::kUTF8);
+        if (used > max_width) break;
+        fitted = static_cast<size_t>(cursor - text);
+    }
+    return fitted;
+}
+
 // `anchor`: 0 draws from x, 1 centres on x, 2 ends at x. `middle` treats y as
 // the vertical centre of the capital letters instead of the alphabetic
 // baseline, so text can be centred in a box without knowing its font metrics.

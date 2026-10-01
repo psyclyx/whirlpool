@@ -1,15 +1,18 @@
-//! Layout and lowering from retained UI snapshots to scalar Skia operations.
+//! Lowering from a laid-out retained scene to scalar Skia operations.
 //!
-//! The retained tree is renderer-neutral. This host performs the small flex
-//! layout pass needed by surfaces, then emits a complete paint list in tree
-//! order. Containers affect geometry but never become renderer operations.
+//! Layout belongs to the UI module (`ui.layout`); this host walks the scene in
+//! paint order and turns each node's retained box into renderer operations.
+//! Containers affect geometry but never become operations. Offsets are applied
+//! here, not in layout, so moving a subtree costs one walk and no relayout.
+//!
+//! The draw list borrows text and icon bytes from the scene: render it before
+//! the scene is next mutated.
 
 const std = @import("std");
 const ui = @import("whirlpool-ui");
 const graphics = @import("whirlpool-graphics");
 
 const Allocator = std.mem.Allocator;
-const DrawList = graphics.skia.DrawList;
 const DrawOp = graphics.skia.DrawOp;
 
 comptime {
@@ -18,21 +21,15 @@ comptime {
 
 pub const Viewport = struct { width: u32, height: u32 };
 
-pub const LowerError = error{
-    InvalidViewport,
-    InvalidDimensions,
-    InvalidColor,
-    InvalidOpacity,
-    InvalidFontSize,
-    InvalidPolygon,
-};
+pub const LowerError = error{InvalidViewport} || Allocator.Error;
 
 pub const OwnedDrawList = struct {
     allocator: Allocator,
+    /// Holds what the scene does not: ellipsized copies of truncated text.
     arena: std.heap.ArenaAllocator,
     ops: []DrawOp,
 
-    pub fn drawList(self: *const OwnedDrawList) DrawList {
+    pub fn drawList(self: *const OwnedDrawList) graphics.skia.DrawList {
         return .{ .ops = self.ops };
     }
 
@@ -47,473 +44,263 @@ pub const OwnedDrawList = struct {
     }
 };
 
-const Box = struct { x: f32, y: f32, width: f32, height: f32 };
-const Axis = enum { horizontal, vertical };
+/// Text measured by the renderer that will draw it.
+pub fn measurer(metrics: graphics.skia.TextMetrics) ui.Measurer {
+    const Adapter = struct {
+        fn width(context: ?*anyopaque, text: []const u8, size: f32) f32 {
+            return metricsFrom(context).width(text, size);
+        }
+        fn fit(context: ?*anyopaque, text: []const u8, size: f32, max_width: f32) usize {
+            return metricsFrom(context).fit(text, size, max_width);
+        }
+        fn metricsFrom(context: ?*anyopaque) graphics.skia.TextMetrics {
+            return .{ .native = @ptrCast(context.?) };
+        }
+    };
+    return .{ .context = @ptrCast(metrics.native), .width_fn = Adapter.width, .fit_fn = Adapter.fit };
+}
+
+const ellipsis = "…";
 
 const Lowerer = struct {
     allocator: Allocator,
-    snapshots: []const ui.NodeSnapshot,
-    arena: *std.heap.ArenaAllocator,
+    scene: *ui.Scene,
+    measurer: ui.Measurer,
+    arena: std.mem.Allocator,
     ops: *std.ArrayList(DrawOp),
-    /// Children of every node, in snapshot order, as one flat array indexed by
-    /// `child_start`. Scanning every snapshot to find a node's children made
-    /// layout quadratic (and worse with nesting), which dominated frame time.
-    child_start: []usize,
-    child_items: []usize,
-    /// Preferred size of each node per axis, computed once (NaN = not yet).
-    intrinsic_cache: [][2]f32,
 
-    fn children(self: *const Lowerer, index: usize) []const usize {
-        return self.child_items[self.child_start[index]..self.child_start[index + 1]];
+    fn emit(self: *Lowerer, op: DrawOp) Allocator.Error!void {
+        try self.ops.append(self.allocator, op);
     }
 
-    fn layoutNode(self: *Lowerer, index: usize, offered: Box, inherited_opacity: f32) (LowerError || Allocator.Error)!void {
-        const snapshot = self.snapshots[index];
-        try validateSnapshot(snapshot);
-        const properties = snapshot.properties;
-        const box = Box{
-            .x = offered.x + properties.offset_x,
-            .y = offered.y,
-            .width = if (properties.width) |value| try dimension(value) else offered.width,
-            .height = if (properties.height) |value| try dimension(value) else offered.height,
-        };
-        const opacity = inherited_opacity * properties.opacity;
+    fn paint(self: *Lowerer, handle: ui.NodeHandle, dx: f32, dy: f32, inherited_opacity: f32) Allocator.Error!void {
+        const node = self.scene.get(handle) orelse return;
+        const p = node.props();
+        if (!p.visible) return;
+        const opacity = inherited_opacity * p.opacity;
         if (opacity == 0) return;
+        const x = dx + p.offset_x;
+        const y = dy + p.offset_y;
+        const box = ui.Box{ .x = node.layout.x + x, .y = node.layout.y + y, .width = node.layout.width, .height = node.layout.height };
 
-        if (properties.clip) try self.ops.append(self.allocator, .{ .push_clip = toRect(box) });
-
-        switch (snapshot.kind) {
-            .shape => if (box.width > 0 and box.height > 0) try self.ops.append(self.allocator, .{ .rect = .{
-                .rect = .{ .x = box.x, .y = box.y, .width = box.width, .height = box.height },
-                .radius = properties.radius,
-                .color = colorWithOpacity(properties.fill, opacity),
+        if (p.clip) try self.emit(.{ .push_clip = toRect(box) });
+        switch (node.kind) {
+            .shape => if (box.width > 0 and box.height > 0) try self.emit(.{ .rect = .{
+                .rect = toRect(box),
+                .radius = p.radius,
+                .color = colorWithOpacity(p.fill, opacity),
             } }),
-            .polygon => if (box.width > 0 and box.height > 0 and properties.points.len >= 3) {
-                var polygon = graphics.skia.Polygon{ .len = properties.points.len };
-                for (properties.points.slice(), 0..) |point, point_index| {
-                    polygon.points[point_index] = .{
-                        .x = box.x + point.x * box.width,
-                        .y = box.y + point.y * box.height,
-                    };
-                }
-                try self.ops.append(self.allocator, .{ .polygon = .{
-                    .points = polygon,
-                    .color = colorWithOpacity(properties.fill, opacity),
-                } });
-            },
-            .text => if (properties.text.len != 0) {
-                const size = try fontSize(properties.font_size);
-                const text = try self.arena.allocator().dupe(u8, properties.text);
-                const content = inset(box, properties.padding);
-                // Alignment is relative to the padded content box; the renderer
-                // measures the text, so no font metrics are needed here.
-                const x = switch (properties.text_align) {
-                    .start => content.x,
-                    .center => content.x + content.width / 2,
-                    .end => content.x + content.width,
+            .polygon => if (box.width > 0 and box.height > 0 and p.points.len >= 3) {
+                var polygon = graphics.skia.Polygon{ .len = p.points.len };
+                for (p.points.slice(), 0..) |point, index| polygon.points[index] = .{
+                    .x = box.x + point.x * box.width,
+                    .y = box.y + point.y * box.height,
                 };
-                const y = switch (properties.text_valign) {
-                    .top => content.y + size,
-                    .middle => content.y + content.height / 2,
-                };
-                try self.ops.append(self.allocator, .{ .text = .{
-                    .text = text,
-                    .x = x,
-                    .baseline = y,
-                    .size = size,
-                    .color = colorWithOpacity(properties.text_color, opacity),
-                    .anchor = switch (properties.text_align) {
-                        .start => .start,
-                        .center => .center,
-                        .end => .end,
-                    },
-                    .vertical = switch (properties.text_valign) {
-                        .top => .baseline,
-                        .middle => .middle,
-                    },
-                } });
+                try self.emit(.{ .polygon = .{ .points = polygon, .color = colorWithOpacity(p.fill, opacity) } });
             },
-            .icon => if (properties.icon_source.len != 0 and box.width > 0 and box.height > 0) {
-                const source = try self.arena.allocator().dupe(u8, properties.icon_source);
-                try self.ops.append(self.allocator, .{ .icon = .{
-                    .source = source,
-                    .rect = toRect(inset(box, properties.padding)),
-                    .opacity = opacity,
-                } });
+            .text => if (p.text.len != 0) try self.text(handle, box, opacity),
+            .icon => if (p.icon_source.len != 0 and box.width > 0 and box.height > 0) try self.emit(.{ .icon = .{
+                .source = p.icon_source,
+                .rect = toRect(box.inset(p.padding)),
+                .opacity = opacity,
+            } }),
+            .row, .column, .stack => {
+                var child = node.first_child;
+                while (child) |child_handle| : (child = (self.scene.get(child_handle) orelse break).next_sibling)
+                    try self.paint(child_handle, x, y, opacity);
             },
-            .row => try self.layoutFlow(index, box, .horizontal, opacity),
-            .column => try self.layoutFlow(index, box, .vertical, opacity),
-            .stack => try self.layoutStack(index, box, opacity),
             .spacer => {},
         }
-        if (properties.clip) try self.ops.append(self.allocator, .pop_clip);
+        if (p.clip) try self.emit(.pop_clip);
     }
 
-    fn layoutFlow(self: *Lowerer, parent_index: usize, box: Box, axis: Axis, opacity: f32) (LowerError || Allocator.Error)!void {
-        const properties = self.snapshots[parent_index].properties;
-        const content = inset(box, properties.padding);
-        const child_count = self.children(parent_index).len;
-        if (child_count == 0) return;
-
-        const gap: f32 = @floatFromInt(properties.gap);
-        const total_gap = gap * @as(f32, @floatFromInt(child_count - 1));
-        const available_main = @max(0, mainSize(content, axis) - total_gap);
-        var fixed: f32 = 0;
-        var flex_total: u64 = 0;
-        var auto_count: usize = 0;
-
-        for (self.children(parent_index)) |child_index| {
-            const child = self.snapshots[child_index];
-            const preferred = try self.intrinsic(child_index, axis);
-            if (child.properties.flex != 0) {
-                flex_total += child.properties.flex;
-            } else if (preferred > 0) {
-                fixed += preferred;
-            } else {
-                auto_count += 1;
-            }
+    fn text(self: *Lowerer, handle: ui.NodeHandle, box: ui.Box, opacity: f32) Allocator.Error!void {
+        const node = self.scene.get(handle).?;
+        const p = node.props();
+        const size: f32 = @floatFromInt(p.font_size);
+        const content = box.inset(p.padding);
+        var shown: []const u8 = p.text;
+        if (p.text_overflow == .ellipsis) {
+            const padding: f32 = @floatFromInt(p.padding.left + p.padding.right);
+            const natural = if (p.width == null) node.layout.intrinsic[0] - padding else self.measurer.width(p.text, size);
+            if (natural > content.width + 0.5) shown = try self.ellipsized(handle, content.width, size);
         }
-
-        const remaining = @max(0, available_main - fixed);
-        const auto_share = if (flex_total == 0 and auto_count != 0)
-            remaining / @as(f32, @floatFromInt(auto_count))
-        else
-            0;
-        var cursor = if (axis == .horizontal) content.x else content.y;
-
-        for (self.children(parent_index)) |child_index| {
-            const child = self.snapshots[child_index];
-            const preferred_main = try self.intrinsic(child_index, axis);
-            const explicit_main = if (axis == .horizontal) child.properties.width else child.properties.height;
-            const child_main = if (child_count == 1 and explicit_main == null)
-                available_main
-            else if (child.properties.flex != 0 and flex_total != 0)
-                remaining * @as(f32, @floatFromInt(child.properties.flex)) / @as(f32, @floatFromInt(flex_total))
-            else if (preferred_main > 0)
-                preferred_main
-            else
-                auto_share;
-            const cross_available = crossSize(content, axis);
-            const explicit_cross = if (axis == .horizontal) child.properties.height else child.properties.width;
-            const child_cross = if (explicit_cross) |value|
-                @min(try dimension(value), cross_available)
-            else
-                cross_available;
-            const child_box = if (axis == .horizontal)
-                Box{ .x = cursor, .y = content.y, .width = child_main, .height = child_cross }
-            else
-                Box{ .x = content.x, .y = cursor, .width = child_cross, .height = child_main };
-            try self.layoutNode(child_index, child_box, opacity);
-            cursor += child_main + gap;
-        }
-    }
-
-    fn layoutStack(self: *Lowerer, parent_index: usize, box: Box, opacity: f32) (LowerError || Allocator.Error)!void {
-        const content = inset(box, self.snapshots[parent_index].properties.padding);
-        for (self.children(parent_index)) |child_index| {
-            const child = self.snapshots[child_index];
-            var child_box = content;
-            if (child.properties.width) |width| child_box.width = try dimension(width);
-            if (child.properties.height) |height| child_box.height = try dimension(height);
-            try self.layoutNode(child_index, child_box, opacity);
-        }
-    }
-
-    fn intrinsic(self: *Lowerer, index: usize, axis: Axis) LowerError!f32 {
-        const cached = self.intrinsic_cache[index][@intFromEnum(axis)];
-        if (!std.math.isNan(cached)) return cached;
-        const value = try self.computeIntrinsic(index, axis);
-        self.intrinsic_cache[index][@intFromEnum(axis)] = value;
-        return value;
-    }
-
-    fn computeIntrinsic(self: *Lowerer, index: usize, axis: Axis) LowerError!f32 {
-        const snapshot = self.snapshots[index];
-        const properties = snapshot.properties;
-        const explicit = if (axis == .horizontal) properties.width else properties.height;
-        if (explicit) |value| return dimension(value);
-
-        const before: f32 = @floatFromInt(if (axis == .horizontal) properties.padding.left else properties.padding.top);
-        const after: f32 = @floatFromInt(if (axis == .horizontal) properties.padding.right else properties.padding.bottom);
-        return switch (snapshot.kind) {
-            .text => if (axis == .horizontal)
-                before + after + @ceil(@as(f32, @floatFromInt(properties.text.len)) * try fontSize(properties.font_size) * 0.62)
-            else
-                before + after + try fontSize(properties.font_size),
-            .icon, .shape, .polygon, .spacer => 0,
-            .row, .column, .stack => blk: {
-                var total: f32 = 0;
-                var maximum: f32 = 0;
-                const child_indices = self.children(index);
-                const count = child_indices.len;
-                for (child_indices) |child_index| {
-                    const value = try self.intrinsic(child_index, axis);
-                    total += value;
-                    maximum = @max(maximum, value);
-                }
-                const flows_on_axis = (snapshot.kind == .row and axis == .horizontal) or
-                    (snapshot.kind == .column and axis == .vertical);
-                if (flows_on_axis and count > 1)
-                    total += @as(f32, @floatFromInt(properties.gap)) * @as(f32, @floatFromInt(count - 1));
-                break :blk before + after + if (flows_on_axis) total else maximum;
+        // Alignment is relative to the padded content box; the renderer
+        // anchors the run, so no glyph positions are computed here.
+        try self.emit(.{ .text = .{
+            .text = shown,
+            .x = switch (p.text_align) {
+                .start => content.x,
+                .center => content.x + content.width / 2,
+                .end => content.x + content.width,
             },
-        };
+            .baseline = switch (p.text_valign) {
+                .top => content.y + size,
+                .middle => content.y + content.height / 2,
+            },
+            .size = size,
+            .color = colorWithOpacity(p.text_color, opacity),
+            .anchor = switch (p.text_align) {
+                .start => .start,
+                .center => .center,
+                .end => .end,
+            },
+            .vertical = switch (p.text_valign) {
+                .top => .baseline,
+                .middle => .middle,
+            },
+        } });
+    }
+
+    /// The text cut to `width` with an ellipsis. The cut point is remembered
+    /// per node until the width or text changes.
+    fn ellipsized(self: *Lowerer, handle: ui.NodeHandle, width: f32, size: f32) Allocator.Error![]const u8 {
+        const node = self.scene.get(handle).?;
+        const state = self.scene.getLayoutMut(handle).?;
+        const value = node.props().text;
+        if (state.fit_width != width or state.fit_bytes > value.len) {
+            const room = width - self.measurer.width(ellipsis, size);
+            state.fit_bytes = if (room > 0) self.measurer.fit(value, size, room) else 0;
+            state.fit_width = width;
+        }
+        return std.mem.concat(self.arena, u8, &.{ value[0..state.fit_bytes], ellipsis });
     }
 };
 
-pub fn lower(allocator: Allocator, snapshots: []const ui.NodeSnapshot, viewport: Viewport) (LowerError || Allocator.Error)!OwnedDrawList {
-    try validateViewport(viewport);
+/// Lay out `scene` for `viewport` (if anything changed) and lower it.
+pub fn lower(allocator: Allocator, scene: *ui.Scene, viewport: Viewport, text_measurer: ui.Measurer) LowerError!OwnedDrawList {
+    if (viewport.width == 0 or viewport.height == 0) return error.InvalidViewport;
+    ui.layout.update(scene, .{ .width = @floatFromInt(viewport.width), .height = @floatFromInt(viewport.height) }, text_measurer);
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     var ops = std.ArrayList(DrawOp).empty;
     errdefer ops.deinit(allocator);
-    const child_start = try allocator.alloc(usize, snapshots.len + 1);
-    defer allocator.free(child_start);
-    const child_items = try allocator.alloc(usize, snapshots.len);
-    defer allocator.free(child_items);
-    const intrinsic_cache = try allocator.alloc([2]f32, snapshots.len);
-    defer allocator.free(intrinsic_cache);
-    @memset(intrinsic_cache, .{ std.math.nan(f32), std.math.nan(f32) });
-    try indexChildren(allocator, snapshots, child_start, child_items);
     var lowerer = Lowerer{
         .allocator = allocator,
-        .snapshots = snapshots,
-        .arena = &arena,
+        .scene = scene,
+        .measurer = text_measurer,
+        .arena = arena.allocator(),
         .ops = &ops,
-        .child_start = child_start,
-        .child_items = child_items,
-        .intrinsic_cache = intrinsic_cache,
     };
-    const root_box = Box{ .x = 0, .y = 0, .width = @floatFromInt(viewport.width), .height = @floatFromInt(viewport.height) };
-    for (snapshots, 0..) |snapshot, index| if (snapshot.parent == null) {
-        try lowerer.layoutNode(index, root_box, 1);
-    };
+    var root = scene.firstRoot();
+    while (root) |handle| : (root = (scene.get(handle) orelse break).next_sibling)
+        try lowerer.paint(handle, 0, 0, 1);
     return .{ .allocator = allocator, .arena = arena, .ops = try ops.toOwnedSlice(allocator) };
 }
 
-fn isChild(candidate: ui.NodeSnapshot, parent: ui.NodeSnapshot) bool {
-    return candidate.parent != null and candidate.parent.?.eql(parent.handle);
-}
-
-/// Build the flat children index: for node `i`, its children (in snapshot
-/// order) are `child_items[child_start[i]..child_start[i + 1]]`.
-fn indexChildren(allocator: Allocator, snapshots: []const ui.NodeSnapshot, child_start: []usize, child_items: []usize) Allocator.Error!void {
-    // Handles name arena slots, so a slot -> snapshot-index table resolves
-    // parents in constant time.
-    var max_slot: usize = 0;
-    for (snapshots) |snapshot| max_slot = @max(max_slot, snapshot.handle.slot);
-    const by_slot = try allocator.alloc(usize, max_slot + 1);
-    defer allocator.free(by_slot);
-    @memset(by_slot, std.math.maxInt(usize));
-    for (snapshots, 0..) |snapshot, index| by_slot[snapshot.handle.slot] = index;
-
-    const parents = try allocator.alloc(usize, snapshots.len);
-    defer allocator.free(parents);
-    @memset(child_start, 0);
-    for (snapshots, 0..) |snapshot, index| {
-        parents[index] = std.math.maxInt(usize);
-        const parent = snapshot.parent orelse continue;
-        if (parent.slot > max_slot) continue;
-        const parent_index = by_slot[parent.slot];
-        if (parent_index == std.math.maxInt(usize) or !snapshots[parent_index].handle.eql(parent)) continue;
-        parents[index] = parent_index;
-        child_start[parent_index + 1] += 1;
-    }
-    for (1..child_start.len) |index| child_start[index] += child_start[index - 1];
-    const cursor = try allocator.alloc(usize, snapshots.len);
-    defer allocator.free(cursor);
-    @memcpy(cursor, child_start[0..snapshots.len]);
-    for (parents, 0..) |parent_index, index| {
-        if (parent_index == std.math.maxInt(usize)) continue;
-        child_items[cursor[parent_index]] = index;
-        cursor[parent_index] += 1;
-    }
-}
-
-fn inset(box: Box, edges: ui.Edges) Box {
-    const left: f32 = @floatFromInt(edges.left);
-    const right: f32 = @floatFromInt(edges.right);
-    const top: f32 = @floatFromInt(edges.top);
-    const bottom: f32 = @floatFromInt(edges.bottom);
-    return .{
-        .x = box.x + left,
-        .y = box.y + top,
-        .width = @max(0, box.width - left - right),
-        .height = @max(0, box.height - top - bottom),
-    };
-}
-
-fn toRect(box: Box) graphics.skia.Rect {
+fn toRect(box: ui.Box) graphics.skia.Rect {
     return .{ .x = box.x, .y = box.y, .width = box.width, .height = box.height };
-}
-
-fn mainSize(box: Box, axis: Axis) f32 {
-    return if (axis == .horizontal) box.width else box.height;
-}
-
-fn crossSize(box: Box, axis: Axis) f32 {
-    return if (axis == .horizontal) box.height else box.width;
-}
-
-fn validateViewport(viewport: Viewport) LowerError!void {
-    if (viewport.width == 0 or viewport.height == 0) return error.InvalidViewport;
-}
-
-fn validateSnapshot(snapshot: ui.NodeSnapshot) LowerError!void {
-    const properties = snapshot.properties;
-    if (!validColor(properties.fill) or !validColor(properties.text_color)) return error.InvalidColor;
-    if (!std.math.isFinite(properties.opacity) or properties.opacity < 0 or properties.opacity > 1) return error.InvalidOpacity;
-    if (!std.math.isFinite(properties.radius) or properties.radius < 0) return error.InvalidDimensions;
-    if (snapshot.kind == .polygon and properties.points.len != 0) {
-        ui.properties.validate(.polygon, .{ .points = properties.points }) catch return error.InvalidPolygon;
-    }
-}
-
-fn dimension(value: u32) LowerError!f32 {
-    if (value == 0) return error.InvalidDimensions;
-    return @floatFromInt(value);
-}
-
-fn fontSize(value: u16) LowerError!f32 {
-    if (value == 0) return error.InvalidFontSize;
-    return @floatFromInt(value);
-}
-
-fn validColor(color: ui.Color) bool {
-    return std.math.isFinite(color.r) and std.math.isFinite(color.g) and
-        std.math.isFinite(color.b) and std.math.isFinite(color.a) and
-        color.r >= 0 and color.r <= 1 and color.g >= 0 and color.g <= 1 and
-        color.b >= 0 and color.b <= 1 and color.a >= 0 and color.a <= 1;
 }
 
 fn colorWithOpacity(color: ui.Color, opacity: f32) graphics.skia.Color {
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a * opacity };
 }
 
-fn fixture(kind: ui.NodeKind, slot: u32, parent: ?ui.NodeHandle, properties: ui.NodeProperties) ui.NodeSnapshot {
-    return .{ .handle = .{ .slot = slot, .generation = 1 }, .kind = kind, .parent = parent, .properties = properties, .dirty = .{} };
+const testing = std.testing;
+
+const Fixture = struct {
+    scene: ui.Scene,
+    mount: ui.MountContext,
+
+    fn init(self: *Fixture) !void {
+        self.scene = ui.Scene.init(testing.allocator);
+        self.mount = try self.scene.mount();
+    }
+
+    fn deinit(self: *Fixture) void {
+        self.mount.deinit();
+        self.scene.deinit();
+    }
+
+    fn add(self: *Fixture, kind: ui.NodeKind, parent: ?ui.NodeHandle, values: []const ui.PropertyValue) !ui.NodeHandle {
+        const handle = try self.mount.create(kind, parent);
+        for (values) |value| {
+            const bytes: ?[]u8 = switch (value) {
+                .text => |item| try testing.allocator.dupe(u8, item),
+                .icon_source => |item| try testing.allocator.dupe(u8, item),
+                else => null,
+            };
+            try self.scene.applyProperty(handle, value, bytes);
+        }
+        return handle;
+    }
+
+    fn lowered(self: *Fixture, width: u32, height: u32) !OwnedDrawList {
+        return lower(testing.allocator, &self.scene, .{ .width = width, .height = height }, ui.Measurer.estimate);
+    }
+};
+
+const red = ui.Color.rgba(1, 0, 0, 1);
+
+test "shapes fill their laid-out boxes and polygons are box-relative" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const row = try f.add(.row, null, &.{.{ .padding = .{ .left = 4 } }});
+    _ = try f.add(.shape, row, &.{ .{ .width = 10 }, .{ .fill = red } });
+    _ = try f.add(.polygon, row, &.{ .{ .width = 40 }, .{ .fill = red }, .{ .points = blk: {
+        var polygon = ui.Polygon{ .len = 3 };
+        polygon.points[0] = .{ .x = 0.25, .y = 0 };
+        polygon.points[1] = .{ .x = 1.25, .y = 0 };
+        polygon.points[2] = .{ .x = 0, .y = 1 };
+        break :blk polygon;
+    } } });
+    var list = try f.lowered(100, 20);
+    defer list.deinit();
+    try testing.expectEqual(graphics.skia.Rect{ .x = 4, .y = 0, .width = 10, .height = 20 }, list.ops[0].rect.rect);
+    try testing.expectEqual(@as(f32, 24), list.ops[1].polygon.points.points[0].x);
+    try testing.expectEqual(@as(f32, 64), list.ops[1].polygon.points.points[1].x);
 }
 
-test "row layout preserves hierarchy, padding, and gap" {
-    const root = ui.NodeHandle{ .slot = 0, .generation = 1 };
-    const snapshots = [_]ui.NodeSnapshot{
-        fixture(.row, 0, null, .{ .padding = .{ .top = 3, .right = 4, .bottom = 3, .left = 4 }, .gap = 5 }),
-        fixture(.shape, 1, root, .{ .width = 20, .height = 10, .fill = ui.Color.rgba(1, 0, 0, 1) }),
-        fixture(.text, 2, root, .{ .text = "hi", .font_size = 10 }),
-    };
-    var result = try lower(std.testing.allocator, &snapshots, .{ .width = 100, .height = 30 });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 2), result.operationCount());
-    try std.testing.expectEqual(@as(f32, 4), result.ops[0].rect.rect.x);
-    try std.testing.expectEqual(@as(f32, 29), result.ops[1].text.x);
-    try std.testing.expectEqual(@as(f32, 13), result.ops[1].text.baseline);
+test "offsets and clips move and bound a subtree; invisible nodes are skipped" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const viewport = try f.add(.stack, null, &.{ .{ .width = 50 }, .{ .clip = true } });
+    const strip = try f.add(.row, viewport, &.{.{ .offset_x = -20 }});
+    _ = try f.add(.shape, strip, &.{ .{ .width = 30 }, .{ .fill = red } });
+    _ = try f.add(.shape, strip, &.{ .{ .width = 30 }, .{ .fill = red }, .{ .visible = false } });
+    _ = try f.add(.shape, strip, &.{ .{ .width = 30 }, .{ .fill = red }, .{ .opacity = 0 } });
+    var list = try f.lowered(100, 20);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 3), list.ops.len);
+    try testing.expectEqual(graphics.skia.Rect{ .x = 0, .y = 0, .width = 50, .height = 20 }, list.ops[0].push_clip);
+    try testing.expectEqual(@as(f32, -20), list.ops[1].rect.rect.x);
+    try testing.expect(list.ops[2] == .pop_clip);
 }
 
-test "stack stretches auto-sized paint nodes to its box" {
-    const root = ui.NodeHandle{ .slot = 0, .generation = 1 };
-    const snapshots = [_]ui.NodeSnapshot{
-        fixture(.stack, 0, null, .{ .width = 80, .height = 24 }),
-        fixture(.shape, 1, root, .{ .fill = ui.Color.rgba(0, 1, 0, 1) }),
-    };
-    var result = try lower(std.testing.allocator, &snapshots, .{ .width = 100, .height = 30 });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(f32, 80), result.ops[0].rect.rect.width);
-    try std.testing.expectEqual(@as(f32, 24), result.ops[0].rect.rect.height);
+test "text wider than its box is cut with an ellipsis when asked" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const row = try f.add(.row, null, &.{});
+    _ = try f.add(.text, row, &.{ .{ .text = "abcdefghij" }, .{ .font_size = 10 }, .{ .width = 30 }, .{ .text_overflow = .ellipsis } });
+    _ = try f.add(.text, row, &.{ .{ .text = "abcdefghij" }, .{ .font_size = 10 }, .{ .width = 30 } });
+    _ = try f.add(.text, row, &.{ .{ .text = "ab" }, .{ .font_size = 10 }, .{ .text_overflow = .ellipsis } });
+    var list = try f.lowered(200, 20);
+    defer list.deinit();
+    // 30px holds 5.45 characters: four plus the ellipsis.
+    try testing.expectEqualStrings("abcd…", list.ops[0].text.text);
+    try testing.expectEqualStrings("abcdefghij", list.ops[1].text.text);
+    try testing.expectEqualStrings("ab", list.ops[2].text.text);
 }
 
-test "polygon vertices are box-relative and may extend beyond layout bounds" {
-    var points = ui.Polygon{ .len = 4 };
-    points.points[0] = .{ .x = 0.25, .y = 0 };
-    points.points[1] = .{ .x = 1.25, .y = 0 };
-    points.points[2] = .{ .x = 1, .y = 1 };
-    points.points[3] = .{ .x = 0, .y = 1 };
-    const snapshot = fixture(.polygon, 0, null, .{
-        .width = 80,
-        .height = 20,
-        .fill = ui.Color.rgba(0.2, 0.4, 0.6, 1),
-        .points = points,
-    });
-    var result = try lower(std.testing.allocator, &.{snapshot}, .{ .width = 100, .height = 30 });
-    defer result.deinit();
-    const polygon = result.ops[0].polygon;
-    try std.testing.expectEqual(@as(u8, 4), polygon.points.len);
-    try std.testing.expectEqual(@as(f32, 20), polygon.points.points[0].x);
-    try std.testing.expectEqual(@as(f32, 100), polygon.points.points[1].x);
-    try std.testing.expectEqual(@as(f32, 20), polygon.points.points[3].y);
+test "aligned text is anchored to its padded box" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const column = try f.add(.column, null, &.{});
+    _ = try f.add(.text, column, &.{ .{ .text = "x" }, .{ .height = 20 }, .{ .padding = .{ .left = 2, .right = 4 } }, .{ .text_align = .end }, .{ .text_valign = .middle } });
+    var list = try f.lowered(100, 40);
+    defer list.deinit();
+    try testing.expectEqual(@as(f32, 96), list.ops[0].text.x);
+    try testing.expectEqual(@as(f32, 10), list.ops[0].text.baseline);
+    try testing.expectEqual(graphics.skia.TextAnchor.end, list.ops[0].text.anchor);
 }
 
-test "icon nodes lower to a renderer-neutral image operation" {
-    const snapshot = fixture(.icon, 0, null, .{
-        .width = 24,
-        .height = 20,
-        .padding = .{ .top = 2, .right = 3, .bottom = 2, .left = 3 },
-        .icon_source = "/icons/example.svg",
-        .opacity = 0.75,
-    });
-    var result = try lower(std.testing.allocator, &.{snapshot}, .{ .width = 100, .height = 30 });
-    defer result.deinit();
-    const icon = result.ops[0].icon;
-    try std.testing.expectEqualStrings("/icons/example.svg", icon.source);
-    try std.testing.expectEqual(@as(f32, 3), icon.rect.x);
-    try std.testing.expectEqual(@as(f32, 2), icon.rect.y);
-    try std.testing.expectEqual(@as(f32, 18), icon.rect.width);
-    try std.testing.expectEqual(@as(f32, 16), icon.rect.height);
-    try std.testing.expectEqual(@as(f32, 0.75), icon.opacity);
-}
-
-test "flows stretch auto-sized children across their box" {
-    const root = ui.NodeHandle{ .slot = 0, .generation = 1 };
-    const snapshots = [_]ui.NodeSnapshot{
-        fixture(.column, 0, null, .{}),
-        fixture(.shape, 1, root, .{ .height = 10, .fill = ui.Color.rgba(0, 1, 0, 1) }),
-    };
-    var result = try lower(std.testing.allocator, &snapshots, .{ .width = 100, .height = 30 });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(f32, 100), result.ops[0].rect.rect.width);
-    try std.testing.expectEqual(@as(f32, 10), result.ops[0].rect.rect.height);
-}
-
-test "lower rejects unusable input" {
-    try std.testing.expectError(error.InvalidViewport, lower(std.testing.allocator, &.{}, .{ .width = 0, .height = 1 }));
-    const bad = fixture(.text, 0, null, .{ .text = "x", .font_size = 0 });
-    try std.testing.expectError(error.InvalidFontSize, lower(std.testing.allocator, &.{bad}, .{ .width = 1, .height = 1 }));
-}
-
-test "clip and horizontal offset bound translated descendants" {
-    const root = ui.NodeHandle{ .slot = 0, .generation = 1 };
-    const content = ui.NodeHandle{ .slot = 1, .generation = 1 };
-    const snapshots = [_]ui.NodeSnapshot{
-        fixture(.stack, 0, null, .{ .width = 40, .height = 20, .clip = true }),
-        fixture(.row, 1, root, .{ .width = 80, .offset_x = -12.5 }),
-        fixture(.shape, 2, content, .{ .width = 20, .fill = ui.Color.white }),
-    };
-    var result = try lower(std.testing.allocator, &snapshots, .{ .width = 100, .height = 30 });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 3), result.operationCount());
-    try std.testing.expectEqual(@as(f32, 40), result.ops[0].push_clip.width);
-    try std.testing.expectEqual(@as(f32, -12.5), result.ops[1].rect.rect.x);
-    try std.testing.expect(result.ops[2] == .pop_clip);
-}
-
-test "aligned text is anchored to its padded box so the renderer can centre it" {
-    const root = ui.NodeHandle{ .slot = 0, .generation = 1 };
-    const snapshots = [_]ui.NodeSnapshot{
-        fixture(.stack, 0, null, .{ .width = 100, .height = 20, .offset_x = 10, .padding = .{ .left = 4, .right = 6 } }),
-        fixture(.text, 1, root, .{ .text = "7", .font_size = 12, .text_align = .center, .text_valign = .middle }),
-        fixture(.text, 2, root, .{ .text = "end", .font_size = 12, .text_align = .end }),
-        fixture(.text, 3, root, .{ .text = "start", .font_size = 12 }),
-    };
-    var result = try lower(std.testing.allocator, &snapshots, .{ .width = 200, .height = 40 });
-    defer result.deinit();
-    // The stack's content box is x 14..104 (offset 10, padding 4 and 6).
-    try std.testing.expectEqual(graphics.skia.TextAnchor.center, result.ops[0].text.anchor);
-    try std.testing.expectEqual(graphics.skia.TextVertical.middle, result.ops[0].text.vertical);
-    try std.testing.expectEqual(@as(f32, 59), result.ops[0].text.x);
-    try std.testing.expectEqual(@as(f32, 10), result.ops[0].text.baseline);
-    try std.testing.expectEqual(graphics.skia.TextAnchor.end, result.ops[1].text.anchor);
-    try std.testing.expectEqual(@as(f32, 104), result.ops[1].text.x);
-    // Unaligned text is unchanged: start of the box, baseline one font size down.
-    try std.testing.expectEqual(graphics.skia.TextAnchor.start, result.ops[2].text.anchor);
-    try std.testing.expectEqual(@as(f32, 14), result.ops[2].text.x);
-    try std.testing.expectEqual(@as(f32, 12), result.ops[2].text.baseline);
+test "lowering rejects an empty viewport" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try testing.expectError(error.InvalidViewport, f.lowered(0, 10));
 }

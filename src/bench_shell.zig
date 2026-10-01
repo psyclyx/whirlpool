@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
 
     var renderer = try graphics.skia.Renderer.init(true);
     defer renderer.deinit();
+    shell.setTextMetrics(renderer.textMetrics());
 
     var update_ns: i128 = 0;
     var lower_ns: i128 = 0;
@@ -33,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
             .values = &.{.{ .number = @floatFromInt(index * 16) }},
         });
         const lower_start = std.Io.Clock.awake.now(init.io);
-        var frame = try shell.snapshotAndLower(.{ .width = viewport_width, .height = viewport_height });
+        var frame = try shell.lower(.{ .width = viewport_width, .height = viewport_height });
         const draw_start = std.Io.Clock.awake.now(init.io);
         try renderer.begin(viewport_width, viewport_height, .{ 0, 0, 0, 0 });
         renderer.drawList(frame.drawList());
@@ -53,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
 
     const count: f64 = measured_iterations;
     std.debug.print(
-        "shell frame: update {d:.3} ms, snapshot/lower {d:.3} ms, CPU draw {d:.3} ms; nodes {d}, ops {d}\n",
+        "shell frame: update {d:.3} ms, layout+lower {d:.3} ms, CPU draw {d:.3} ms; nodes {d}, ops {d}\n",
         .{
             @as(f64, @floatFromInt(update_ns)) / count / std.time.ns_per_ms,
             @as(f64, @floatFromInt(lower_ns)) / count / std.time.ns_per_ms,
@@ -63,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
         },
     );
 
-    var representative = try shell.snapshotAndLower(.{ .width = viewport_width, .height = viewport_height });
+    var representative = try shell.lower(.{ .width = viewport_width, .height = viewport_height });
     defer representative.deinit();
     var rects: usize = 0;
     var polygons: usize = 0;

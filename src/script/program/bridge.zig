@@ -67,6 +67,8 @@ pub fn Execution(comptime Program: type) type {
             self.api.set_global(state, "whirlpool_native_update_count");
             self.api.push_nil(state);
             self.api.set_global(state, "whirlpool_native_update_value");
+            self.api.push_nil(state);
+            self.api.set_global(state, "whirlpool_native_bounds");
             self.api.set_top(state, 0);
             self.scratch.deinit();
             self.* = undefined;
@@ -88,6 +90,7 @@ pub fn Execution(comptime Program: type) type {
             try self.installFunction("whirlpool_native_update_service", nativeUpdateServiceCallback);
             try self.installFunction("whirlpool_native_update_count", nativeUpdateCountCallback);
             try self.installFunction("whirlpool_native_update_value", nativeUpdateValueCallback);
+            try self.installFunction("whirlpool_native_bounds", nativeBoundsCallback);
             self.api.set_top(state, 0);
             if (self.api.load_buffer(state, bootstrap_source.ptr, bootstrap_source.len, "=whirlpool.bootstrap", null) != 0)
                 return self.callbackFailed("bootstrap load");
@@ -235,6 +238,28 @@ pub fn Execution(comptime Program: type) type {
             return 0;
         }
 
+        fn nativeBounds(self: *Bridge) c_int {
+            const state = self.api.state;
+            var is_number: c_int = 0;
+            const raw_id = self.api.to_integer(state, 1, &is_number);
+            if (is_number == 0 or raw_id <= 0 or raw_id > std.math.maxInt(NodeId)) return self.raise("invalid retained node");
+            const query = self.sink.bounds orelse {
+                self.api.push_nil(state);
+                return 1;
+            };
+            const box = query(self.sink.context, @intCast(raw_id)) catch |err| return self.raise(@errorName(err));
+            const value = box orelse {
+                self.api.push_nil(state);
+                return 1;
+            };
+            self.api.create_table(state, 0, 4);
+            inline for (.{ "x", "y", "width", "height" }, 0..) |name, index| {
+                self.api.push_number(state, value[index]);
+                self.api.set_field(state, -2, name);
+            }
+            return 1;
+        }
+
         fn nativePreload(self: *Bridge) c_int {
             const module_name = self.stringAt(1) catch return self.raise("module name must be a string");
             const requested_name = if (std.mem.eql(u8, module_name, "__whirlpool_entry__"))
@@ -343,6 +368,10 @@ pub fn Execution(comptime Program: type) type {
         fn nativeUpdateValueCallback(state: *LuaState) callconv(.c) c_int {
             return (bridgeFromState(state) orelse return 0).nativeUpdateValue();
         }
+
+        fn nativeBoundsCallback(state: *LuaState) callconv(.c) c_int {
+            return (bridgeFromState(state) orelse return 0).nativeBounds();
+        }
     };
 }
 
@@ -369,6 +398,7 @@ const bootstrap_source =
     "  local node = { __id = id }\n" ++
     "  function node:set(key, value) whirlpool_native_set(self.__id, key, value); return self end\n" ++
     "  function node:set_property(key, value) return self:set(key, value) end\n" ++
+    "  function node:bounds() return whirlpool_native_bounds(self.__id) end\n" ++
     "  local function child(child_kind, child_properties) return emit(child_kind, node.__id, child_properties) end\n" ++
     "  function node:row(p) return child('row', p) end\n" ++
     "  function node:column(p) return child('column', p) end\n" ++
@@ -381,4 +411,4 @@ const bootstrap_source =
     "  if properties then for key, value in pairs(properties) do whirlpool_native_set(id, key, value) end end\n" ++
     "  return node\n" ++
     "end\n" ++
-    "function whirlpool_native_root() return emit('row', nil, nil) end\n";
+    "function whirlpool_native_root() return emit('stack', nil, nil) end\n";

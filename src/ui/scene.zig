@@ -9,11 +9,16 @@ const Allocator = std.mem.Allocator;
 pub const SceneDelta = struct {
     allocator: Allocator,
     mutations: std.ArrayList(Mutation) = .empty,
+    /// Where each node/property pair sits in `mutations`, so a batch that
+    /// sets hundreds of properties stays linear.
+    positions: std.AutoHashMapUnmanaged(Key, u32) = .empty,
 
     pub const Mutation = struct {
         node: tree.NodeHandle,
         value: tree.PropertyValue,
     };
+
+    const Key = struct { slot: u32, generation: u32, property: std.meta.Tag(tree.PropertyValue) };
 
     pub fn init(allocator: Allocator) SceneDelta {
         return .{ .allocator = allocator };
@@ -22,11 +27,13 @@ pub const SceneDelta = struct {
     pub fn deinit(self: *SceneDelta) void {
         self.clear();
         self.mutations.deinit(self.allocator);
+        self.positions.deinit(self.allocator);
     }
 
     pub fn clear(self: *SceneDelta) void {
         for (self.mutations.items) |mutation| freeValue(self.allocator, mutation.value);
         self.mutations.clearRetainingCapacity();
+        self.positions.clearRetainingCapacity();
     }
 
     /// Discard all staged changes. This is the explicit rollback operation for
@@ -44,14 +51,17 @@ pub const SceneDelta = struct {
     /// order of distinct properties.
     pub fn set(self: *SceneDelta, node: tree.NodeHandle, value: tree.PropertyValue) !void {
         const owned = try cloneValue(self.allocator, value);
-        for (self.mutations.items) |*mutation| {
-            if (mutation.node.eql(node) and sameProperty(mutation.value, owned)) {
-                freeValue(self.allocator, mutation.value);
-                mutation.value = owned;
-                return;
-            }
-        }
         errdefer freeValue(self.allocator, owned);
+        const key = Key{ .slot = node.slot, .generation = node.generation, .property = std.meta.activeTag(value) };
+        const entry = try self.positions.getOrPut(self.allocator, key);
+        if (entry.found_existing) {
+            const mutation = &self.mutations.items[entry.value_ptr.*];
+            freeValue(self.allocator, mutation.value);
+            mutation.value = owned;
+            return;
+        }
+        errdefer _ = self.positions.remove(key);
+        entry.value_ptr.* = @intCast(self.mutations.items.len);
         try self.mutations.append(self.allocator, .{ .node = node, .value = owned });
     }
 
@@ -140,8 +150,8 @@ pub const SceneDelta = struct {
 
         for (self.mutations.items, 0..) |mutation, index| {
             const requested = ownedBytes(mutation.value) orelse continue;
-            const current = scene.node(mutation.node) orelse return error.StaleNode;
-            if (std.mem.eql(u8, currentBytes(current, mutation.value), requested)) continue;
+            const current = scene.get(mutation.node) orelse return error.StaleNode;
+            if (properties.matches(current.props(), mutation.value)) continue;
             prepared[index].bytes = try scene.allocator.dupe(u8, requested);
         }
 
@@ -149,8 +159,8 @@ pub const SceneDelta = struct {
             const owns_bytes = ownedBytes(mutation.value) != null;
             // A value equal to what the node already holds changes nothing, so it
             // must not dirty the node either.
-            if (scene.node(mutation.node)) |current| {
-                if (properties.matches(current.properties, mutation.value)) continue;
+            if (scene.get(mutation.node)) |current| {
+                if (properties.matches(current.props(), mutation.value)) continue;
             }
             if (owns_bytes and prepared[index].bytes == null) continue;
             const owned_bytes = if (prepared[index].bytes) |bytes| blk: {
@@ -171,10 +181,6 @@ pub const SceneDelta = struct {
     };
 };
 
-fn sameProperty(a: tree.PropertyValue, b: tree.PropertyValue) bool {
-    return std.meta.activeTag(a) == std.meta.activeTag(b);
-}
-
 fn cloneValue(allocator: Allocator, value: tree.PropertyValue) !tree.PropertyValue {
     return properties.cloneValue(allocator, value);
 }
@@ -188,14 +194,6 @@ fn ownedBytes(value: tree.PropertyValue) ?[]const u8 {
         .text => |bytes| bytes,
         .icon_source => |bytes| bytes,
         else => null,
-    };
-}
-
-fn currentBytes(snapshot: tree.NodeSnapshot, value: tree.PropertyValue) []const u8 {
-    return switch (value) {
-        .text => snapshot.properties.text,
-        .icon_source => snapshot.properties.icon_source,
-        else => unreachable,
     };
 }
 

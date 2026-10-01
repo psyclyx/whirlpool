@@ -38,7 +38,23 @@ pub const NodeError = properties.Error || error{
     GenerationExhausted,
 };
 
-const Node = struct {
+/// Geometry the layout pass computed for a node, kept between frames.
+pub const LayoutState = struct {
+    /// Border box in surface coordinates, before any ancestor's offsets.
+    x: f32 = 0,
+    y: f32 = 0,
+    width: f32 = 0,
+    height: f32 = 0,
+    /// Content-determined size per axis (horizontal, vertical); NaN until
+    /// measured, and reset whenever anything inside the node changes.
+    intrinsic: [2]f32 = .{ std.math.nan(f32), std.math.nan(f32) },
+    /// For ellipsized text: the box width last fitted, and how many bytes of
+    /// the text fit in it (`text.len` when all of it does).
+    fit_width: f32 = -1,
+    fit_bytes: usize = 0,
+};
+
+pub const Node = struct {
     kind: NodeKind,
     owner: MountHandle,
     parent: ?NodeHandle = null,
@@ -48,6 +64,11 @@ const Node = struct {
     next_sibling: ?NodeHandle = null,
     properties: properties.Owned = .{},
     dirty: DirtyFlags = .{},
+    layout: LayoutState = .{},
+
+    pub fn props(self: *const Node) *const properties.Stored {
+        return &self.properties.fields;
+    }
 };
 
 const Mount = struct {
@@ -63,6 +84,12 @@ pub const Scene = struct {
     mounts: arena.Arena(Mount, MountHandle),
     first_root: ?NodeHandle = null,
     last_root: ?NodeHandle = null,
+    /// Whether geometry must be recomputed before the next frame or query.
+    layout_dirty: bool = true,
+    /// Whether anything visible changed since the last frame.
+    paint_dirty: bool = true,
+    /// The viewport the current layout was computed for.
+    layout_viewport: [2]f32 = .{ -1, -1 },
 
     /// Initialize an empty retained scene.
     pub fn init(allocator: Allocator) Scene {
@@ -166,19 +193,33 @@ pub const Scene = struct {
         return (self.lookupNode(handle) orelse return error.StaleNode).dirty;
     }
 
-    /// Clear dirty flags on every live node.
     /// Whether any node has changed since the last `clearDirty`.
     pub fn hasDirtyNodes(self: *const Scene) bool {
-        for (self.nodes.slots.items) |slot| {
-            if (slot.state == .alive and isDirty(slot.value.dirty)) return true;
-        }
-        return false;
+        return self.paint_dirty;
     }
 
+    /// Clear dirty flags on every live node. Layout state is kept: it is
+    /// cleared by the layout pass itself.
     pub fn clearDirty(self: *Scene) void {
         for (self.nodes.slots.items) |*slot| {
             if (slot.state == .alive) slot.value.dirty = .{};
         }
+        self.paint_dirty = false;
+    }
+
+    /// The first top-level node, then each one's `next_sibling`.
+    pub fn firstRoot(self: *const Scene) ?NodeHandle {
+        return self.first_root;
+    }
+
+    /// Read-only access to a live node, for traversal by layout and lowering.
+    pub fn get(self: *const Scene, handle: NodeHandle) ?*const Node {
+        return self.lookupNode(handle);
+    }
+
+    /// Mutable access for the layout pass, which owns `Node.layout`.
+    pub fn getLayoutMut(self: *Scene, handle: NodeHandle) ?*LayoutState {
+        return &(self.lookupNodeMut(handle) orelse return null).layout;
     }
 
     /// Return stable, caller-owned snapshots for the currently dirty nodes.
@@ -231,12 +272,12 @@ pub const Scene = struct {
         try properties.validate(stored.kind, value);
         switch (value) {
             .text => |requested| {
-                if (owned_bytes == null and !std.mem.eql(u8, stored.properties.text, requested)) {
+                if (owned_bytes == null and !std.mem.eql(u8, stored.properties.fields.text, requested)) {
                     return error.InvalidValue;
                 }
             },
             .icon_source => |requested| {
-                if (owned_bytes == null and !std.mem.eql(u8, stored.properties.icon_source, requested)) {
+                if (owned_bytes == null and !std.mem.eql(u8, stored.properties.fields.icon_source, requested)) {
                     return error.InvalidValue;
                 }
             },
@@ -257,14 +298,21 @@ pub const Scene = struct {
         const dirty = properties.metadata(value).dirty;
         stored.dirty.layout = stored.dirty.layout or dirty.layout;
         stored.dirty.paint = stored.dirty.paint or dirty.paint;
-        if (dirty.layout) self.markLayoutAncestors(stored.parent);
+        self.paint_dirty = true;
+        if (dirty.layout) self.markLayoutAncestors(handle);
     }
 
+    /// A node's geometry inputs changed: forget its measured size and that of
+    /// every ancestor (whose size may depend on it), and schedule layout.
     fn markLayoutAncestors(self: *Scene, start: ?NodeHandle) void {
+        self.layout_dirty = true;
+        self.paint_dirty = true;
         var current = start;
         while (current) |handle| {
             const stored = self.lookupNodeMut(handle) orelse break;
             stored.dirty.layout = true;
+            stored.layout.intrinsic = .{ std.math.nan(f32), std.math.nan(f32) };
+            stored.layout.fit_width = -1;
             current = stored.parent;
         }
     }
@@ -274,9 +322,7 @@ pub const Scene = struct {
     }
 
     fn releaseNodeSlot(self: *Scene, handle: NodeHandle) void {
-        const slot = &self.nodes.slots.items[handle.slot];
-        if (slot.value.properties.text.len != 0) self.allocator.free(slot.value.properties.text);
-        if (slot.value.properties.icon_source.len != 0) self.allocator.free(slot.value.properties.icon_source);
+        self.nodes.slots.items[handle.slot].value.properties.freeBytes(self.allocator);
         self.nodes.release(handle);
     }
 
@@ -333,7 +379,7 @@ pub const Scene = struct {
 
         const parent = stored.parent;
         self.detachNode(handle);
-        if (parent) |parent_handle| self.markLayoutAncestors(parent_handle);
+        self.markLayoutAncestors(parent);
         if (self.lookupMountMut(owner)) |mount_value| removeOwnedNode(mount_value, handle);
         self.releaseNodeSlot(handle);
     }
@@ -405,13 +451,13 @@ pub const Scene = struct {
             .properties = stored.properties.snapshot(),
             .dirty = stored.dirty,
         };
-        if (stored.properties.text.len != 0) {
-            const text = try allocator.dupe(u8, stored.properties.text);
+        if (stored.properties.fields.text.len != 0) {
+            const text = try allocator.dupe(u8, stored.properties.fields.text);
             snapshot.properties.text = text;
         }
         errdefer if (snapshot.properties.text.len != 0) allocator.free(snapshot.properties.text);
-        if (stored.properties.icon_source.len != 0) {
-            const source = try allocator.dupe(u8, stored.properties.icon_source);
+        if (stored.properties.fields.icon_source.len != 0) {
+            const source = try allocator.dupe(u8, stored.properties.fields.icon_source);
             snapshot.properties.icon_source = source;
         }
         return snapshot;
@@ -590,7 +636,7 @@ pub const MountContext = struct {
         try self.scene.attachNode(handle, actual_parent);
         const stored = self.scene.lookupNodeMut(handle) orelse unreachable;
         stored.dirty = .{ .layout = true, .paint = true };
-        if (actual_parent) |parent_handle| self.scene.markLayoutAncestors(parent_handle);
+        self.scene.markLayoutAncestors(handle);
         self.scene.assertValid();
         std.debug.assert(self.scene.lookupNode(handle) != null);
         return handle;
@@ -600,7 +646,7 @@ pub const MountContext = struct {
     pub fn spacer(self: *MountContext, parent: ?NodeHandle, flex: u32) !NodeHandle {
         const handle = try self.create(.spacer, parent);
         const node = self.scene.lookupNodeMut(handle) orelse unreachable;
-        node.properties.flex = flex;
+        node.properties.fields.flex = flex;
         return handle;
     }
 
@@ -609,7 +655,7 @@ pub const MountContext = struct {
         if (!properties.validColor(fill)) return error.InvalidValue;
         const handle = try self.create(.shape, parent);
         const node = self.scene.lookupNodeMut(handle) orelse unreachable;
-        node.properties.fill = fill;
+        node.properties.fields.fill = fill;
         return handle;
     }
 
@@ -625,7 +671,7 @@ pub const MountContext = struct {
         errdefer self.remove(handle) catch unreachable;
         const copy = try self.scene.allocator.dupe(u8, value);
         const node = self.scene.lookupNodeMut(handle) orelse unreachable;
-        node.properties.text = copy;
+        node.properties.fields.text = copy;
         return handle;
     }
 

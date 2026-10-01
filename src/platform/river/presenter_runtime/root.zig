@@ -275,6 +275,7 @@ const RolePresenter = struct {
             self.failWorker(err);
             return;
         };
+        if (self.composition) |*composition| composition.setTextMetrics(renderer.textMetrics());
         self.owner.gpu_mutex.unlock(self.owner.io);
         // Tearing down a Skia context flushes and waits on the Vulkan queue
         // every role shares, and queue access must not race another role's
@@ -398,7 +399,7 @@ const RolePresenter = struct {
         // work, no commit. Most ticks are like this, because plots move in
         // whole-pixel steps and unchanged properties do not dirty their nodes.
         if (frame_only and frame_ms != null and !composition.isDirty()) return false;
-        var frame = try composition.snapshotAndLower(.{
+        var frame = try composition.lower(.{
             .width = self.extent.width,
             .height = self.extent.height,
         });

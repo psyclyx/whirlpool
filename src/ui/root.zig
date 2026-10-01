@@ -11,6 +11,7 @@ pub const scene = @import("scene.zig");
 pub const signal = @import("signal.zig");
 pub const animation = @import("animation.zig");
 pub const target = @import("target.zig");
+pub const layout = @import("layout.zig");
 
 pub const NodeHandle = tree.NodeHandle;
 pub const NodeKind = tree.NodeKind;
@@ -18,6 +19,12 @@ pub const Edges = tree.Edges;
 pub const Color = tree.Color;
 pub const TextAlign = tree.TextAlign;
 pub const TextVAlign = tree.TextVAlign;
+pub const Align = properties.Align;
+pub const Justify = properties.Justify;
+pub const TextOverflow = properties.TextOverflow;
+pub const Node = tree.Node;
+pub const Box = layout.Box;
+pub const Measurer = layout.Measurer;
 pub const Point = tree.Point;
 pub const Polygon = tree.Polygon;
 pub const DirtyFlags = tree.DirtyFlags;
@@ -42,4 +49,5 @@ test {
     _ = signal;
     _ = animation;
     _ = target;
+    _ = layout;
 }

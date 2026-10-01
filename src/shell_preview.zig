@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
         // Advance the retained clock so scrolling plots sit mid-sample.
         try shell.update(.{ .service = "frame", .values = &.{.{ .number = 250 }} });
 
-        var frame = try shell.snapshotAndLower(.{ .width = width, .height = height });
+        var frame = try shell.lower(.{ .width = width, .height = height });
         defer frame.deinit();
         var renderer = try graphics.skia.Renderer.init(true);
         defer renderer.deinit();
@@ -80,7 +80,7 @@ fn renderLive(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !
     var storage: status.StatusValues(Value) = .{};
     try shell.update(.{ .service = "status", .values = storage.build(&snapshot) });
     try shell.update(.{ .service = "frame", .values = &.{.{ .number = 250 }} });
-    var frame = try shell.snapshotAndLower(.{ .width = width, .height = height });
+    var frame = try shell.lower(.{ .width = width, .height = height });
     defer frame.deinit();
     var renderer = try graphics.skia.Renderer.init(true);
     defer renderer.deinit();

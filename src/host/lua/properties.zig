@@ -1,4 +1,10 @@
 //! Translation of script property values into retained UI mutations.
+//!
+//! A Lua property name is the retained property of the same name (see
+//! `ui.properties`), decoded by that property's type, so a property added to
+//! the schema is settable from Lua with no change here. A few aliases remain
+//! for convenience: `name` (text), `size` (font_size), and `color` (fill, or
+//! text_color on text).
 
 const std = @import("std");
 const script = @import("whirlpool-script");
@@ -11,200 +17,109 @@ pub fn apply(composition: anytype, id: lua_program.NodeId, key: []const u8, valu
     if (!composition.in_batch) return error.InvalidBatch;
     if (id == 0 or id >= composition.nodes.items.len) return error.StaleNode;
     const handle = composition.nodes.items[id] orelse return error.StaleNode;
-    const snapshot = composition.scene.node(handle) orelse return error.StaleNode;
+    const node = composition.scene.get(handle) orelse return error.StaleNode;
 
-    if (std.mem.eql(u8, key, "text") or std.mem.eql(u8, key, "name")) {
-        try setText(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "width")) {
-        try setU32(composition, handle, value, .width);
-    } else if (std.mem.eql(u8, key, "height")) {
-        try setU32(composition, handle, value, .height);
-    } else if (std.mem.eql(u8, key, "gap")) {
-        try setU32(composition, handle, value, .gap);
-    } else if (std.mem.eql(u8, key, "flex")) {
-        try setU32(composition, handle, value, .flex);
-    } else if (std.mem.eql(u8, key, "font_size") or std.mem.eql(u8, key, "size")) {
-        try setFontSize(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "text_align")) {
-        try setTextAlign(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "text_valign")) {
-        try setTextVAlign(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "opacity")) {
-        try setOpacity(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "clip")) {
-        try setClip(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "offset_x")) {
-        try setOffsetX(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "padding")) {
-        try setPadding(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "radius")) {
-        try setRadius(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "points")) {
-        try setPoints(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "fill") or std.mem.eql(u8, key, "color")) {
-        try setColor(composition, snapshot.kind, handle, value);
-    } else if (std.mem.eql(u8, key, "text_color")) {
-        try setTextColor(composition, handle, value);
-    } else if (std.mem.eql(u8, key, "icon_source")) {
-        try setIconSource(composition, handle, value);
-    } else {
-        return error.InvalidProperty;
+    const name = resolve(key, node.kind);
+    inline for (@typeInfo(ui.PropertyValue).@"union".fields) |field| {
+        if (std.mem.eql(u8, name, field.name)) {
+            const decoded = try decode(field.type, value);
+            try composition.delta.set(handle, @unionInit(ui.PropertyValue, field.name, decoded));
+            composition.stats.applied_properties += 1;
+            return;
+        }
     }
-    std.debug.assert(composition.stats.applied_properties > 0);
+    return error.InvalidProperty;
 }
 
-fn setIconSource(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    switch (value) {
-        .string => |source| try composition.delta.setIconSource(handle, source),
-        else => return error.InvalidProperty,
-    }
-    composition.stats.applied_properties += 1;
+fn resolve(key: []const u8, kind: ui.NodeKind) []const u8 {
+    if (std.mem.eql(u8, key, "name")) return "text";
+    if (std.mem.eql(u8, key, "size")) return "font_size";
+    if (std.mem.eql(u8, key, "color")) return if (kind == .text) "text_color" else "fill";
+    return key;
 }
 
-const U32Property = enum { width, height, gap, flex };
-
-fn setText(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    switch (value) {
-        .string => |text| try composition.delta.setText(handle, text),
-        else => return error.InvalidProperty,
-    }
-    composition.stats.applied_properties += 1;
-}
-
-fn setU32(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value, property: U32Property) !void {
-    const number = try integerValue(value);
-    if (number > std.math.maxInt(u32)) return error.InvalidProperty;
-    const converted: u32 = @intCast(number);
-    switch (property) {
-        .width => try composition.delta.setWidth(handle, converted),
-        .height => try composition.delta.setHeight(handle, converted),
-        .gap => try composition.delta.setGap(handle, converted),
-        .flex => try composition.delta.setFlex(handle, converted),
-    }
-    composition.stats.applied_properties += 1;
-}
-
-fn setFontSize(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    const number = try integerValue(value);
-    if (number == 0 or number > std.math.maxInt(u16)) return error.InvalidProperty;
-    try composition.delta.setFontSize(handle, @intCast(number));
-    composition.stats.applied_properties += 1;
-}
-
-fn setTextAlign(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    const name = switch (value) {
-        .string => |item| item,
-        else => return error.InvalidProperty,
-    };
-    const align_value = std.meta.stringToEnum(ui.TextAlign, name) orelse return error.InvalidProperty;
-    try composition.delta.setTextAlign(handle, align_value);
-    composition.stats.applied_properties += 1;
-}
-
-fn setTextVAlign(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    const name = switch (value) {
-        .string => |item| item,
-        else => return error.InvalidProperty,
-    };
-    const align_value = std.meta.stringToEnum(ui.TextVAlign, name) orelse return error.InvalidProperty;
-    try composition.delta.setTextVAlign(handle, align_value);
-    composition.stats.applied_properties += 1;
-}
-
-fn setOpacity(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    try composition.delta.setOpacity(handle, @floatCast(try finiteNumber(value)));
-    composition.stats.applied_properties += 1;
-}
-
-fn setClip(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    const enabled = switch (value) {
+fn decode(comptime T: type, value: lua_program.Value) !T {
+    if (T == bool) return switch (value) {
         .boolean => |item| item,
+        else => error.InvalidProperty,
+    };
+    if (T == ?u32) return switch (value) {
+        .nil => null,
+        else => try integer(u32, value),
+    };
+    if (T == u32 or T == u16) return integer(T, value);
+    if (T == f32) return number(value);
+    if (T == []const u8) return switch (value) {
+        .string => |item| item,
+        else => error.InvalidProperty,
+    };
+    if (T == ui.Edges) return edges(value);
+    if (T == ui.Color) return color(value);
+    if (T == ui.Polygon) return polygon(value);
+    if (@typeInfo(T) == .@"enum") return switch (value) {
+        .string => |item| std.meta.stringToEnum(T, item) orelse error.InvalidProperty,
+        else => error.InvalidProperty,
+    };
+    @compileError("no Lua decoding for property type " ++ @typeName(T));
+}
+
+fn number(value: lua_program.Value) !f32 {
+    return switch (value) {
+        .number => |item| if (std.math.isFinite(item) and @abs(item) <= std.math.maxInt(i32))
+            @floatCast(item)
+        else
+            error.InvalidProperty,
+        else => error.InvalidProperty,
+    };
+}
+
+fn integer(comptime T: type, value: lua_program.Value) !T {
+    const item = switch (value) {
+        .number => |item| item,
         else => return error.InvalidProperty,
     };
-    try composition.delta.setClip(handle, enabled);
-    composition.stats.applied_properties += 1;
+    if (!std.math.isFinite(item) or item < 0 or @floor(item) != item or item > std.math.maxInt(T))
+        return error.InvalidProperty;
+    return @intFromFloat(item);
 }
 
-fn setOffsetX(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    const number = try signedFiniteNumber(value);
-    if (@abs(number) > std.math.maxInt(i32)) return error.InvalidProperty;
-    try composition.delta.setOffsetX(handle, @floatCast(number));
-    composition.stats.applied_properties += 1;
-}
-
-fn setRadius(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    try composition.delta.setRadius(handle, @floatCast(try finiteNumber(value)));
-    composition.stats.applied_properties += 1;
-}
-
-fn setPadding(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    const values = array(value, 4) orelse return error.InvalidProperty;
-    try composition.delta.setPadding(handle, .{
-        .top = try arrayU32(values[0]),
-        .right = try arrayU32(values[1]),
-        .bottom = try arrayU32(values[2]),
-        .left = try arrayU32(values[3]),
-    });
-    composition.stats.applied_properties += 1;
-}
-
-fn setColor(composition: anytype, kind: ui.NodeKind, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    const color = try colorValue(value);
-    switch (kind) {
-        .shape, .polygon => try composition.delta.setFill(handle, color),
-        .text => try composition.delta.setTextColor(handle, color),
-        .icon => return error.InvalidProperty,
-        else => return error.InvalidProperty,
+/// `{ top, right, bottom, left }`, or one number for all four sides.
+fn edges(value: lua_program.Value) !ui.Edges {
+    if (value == .number) {
+        const all = try integer(u32, value);
+        return .{ .top = all, .right = all, .bottom = all, .left = all };
     }
-    composition.stats.applied_properties += 1;
+    const values = array(value, 4) orelse return error.InvalidProperty;
+    return .{
+        .top = try integer(u32, values[0]),
+        .right = try integer(u32, values[1]),
+        .bottom = try integer(u32, values[2]),
+        .left = try integer(u32, values[3]),
+    };
 }
 
-fn setPoints(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
+fn color(value: lua_program.Value) !ui.Color {
+    const values = array(value, 3) orelse return error.InvalidProperty;
+    const result = ui.Color{
+        .r = try number(values[0]),
+        .g = try number(values[1]),
+        .b = try number(values[2]),
+        .a = if (values.len >= 4) try number(values[3]) else 1,
+    };
+    if (!ui.properties.validColor(result)) return error.InvalidProperty;
+    return result;
+}
+
+fn polygon(value: lua_program.Value) !ui.Polygon {
     const values = array(value, 3) orelse return error.InvalidProperty;
     if (values.len > ui.properties.max_polygon_points) return error.InvalidProperty;
-    var polygon = ui.Polygon{};
-    polygon.len = @intCast(values.len);
+    var result = ui.Polygon{ .len = @intCast(values.len) };
     for (values, 0..) |item, index| {
         const coordinates = array(item, 2) orelse return error.InvalidProperty;
         if (coordinates.len != 2) return error.InvalidProperty;
-        polygon.points[index] = .{
-            .x = try coordinateValue(coordinates[0]),
-            .y = try coordinateValue(coordinates[1]),
-        };
+        result.points[index] = .{ .x = try number(coordinates[0]), .y = try number(coordinates[1]) };
     }
-    try composition.delta.setPoints(handle, polygon);
-    composition.stats.applied_properties += 1;
-}
-
-fn setTextColor(composition: anytype, handle: ui.NodeHandle, value: lua_program.Value) !void {
-    try composition.delta.setTextColor(handle, try colorValue(value));
-    composition.stats.applied_properties += 1;
-}
-
-fn finiteNumber(value: lua_program.Value) !f64 {
-    return switch (value) {
-        .number => |number| if (std.math.isFinite(number) and number >= 0) number else error.InvalidProperty,
-        else => error.InvalidProperty,
-    };
-}
-
-fn signedFiniteNumber(value: lua_program.Value) !f64 {
-    return switch (value) {
-        .number => |number| if (std.math.isFinite(number)) number else error.InvalidProperty,
-        else => error.InvalidProperty,
-    };
-}
-
-fn coordinateValue(value: lua_program.Value) !f32 {
-    const number = try signedFiniteNumber(value);
-    if (@abs(number) > ui.properties.max_polygon_coordinate) return error.InvalidProperty;
-    return @floatCast(number);
-}
-
-fn integerValue(value: lua_program.Value) !u64 {
-    const number = try finiteNumber(value);
-    if (@floor(number) != number) return error.InvalidProperty;
-    return @intFromFloat(number);
+    return result;
 }
 
 fn array(value: lua_program.Value, minimum: usize) ?[]const lua_program.Value {
@@ -214,21 +129,13 @@ fn array(value: lua_program.Value, minimum: usize) ?[]const lua_program.Value {
     };
 }
 
-fn arrayU32(value: lua_program.Value) !u32 {
-    const number = try integerValue(value);
-    if (number > std.math.maxInt(u32)) return error.InvalidProperty;
-    return @intCast(number);
-}
-
-fn colorValue(value: lua_program.Value) !ui.Color {
-    const values = array(value, 3) orelse return error.InvalidProperty;
-    const alpha = if (values.len >= 4) try finiteNumber(values[3]) else 1;
-    const color = ui.Color{
-        .r = @floatCast(try finiteNumber(values[0])),
-        .g = @floatCast(try finiteNumber(values[1])),
-        .b = @floatCast(try finiteNumber(values[2])),
-        .a = @floatCast(alpha),
-    };
-    if (color.r > 1 or color.g > 1 or color.b > 1 or color.a > 1) return error.InvalidProperty;
-    return color;
+test "every retained property decodes from its Lua form" {
+    try std.testing.expectEqual(@as(?u32, null), try decode(?u32, .nil));
+    try std.testing.expectEqual(@as(?u32, 12), try decode(?u32, .{ .number = 12 }));
+    try std.testing.expectError(error.InvalidProperty, decode(u32, .{ .number = 1.5 }));
+    try std.testing.expectEqual(ui.Align.center, try decode(ui.Align, .{ .string = "center" }));
+    try std.testing.expectError(error.InvalidProperty, decode(ui.Justify, .{ .string = "sideways" }));
+    try std.testing.expectEqual(ui.Edges{ .top = 3, .right = 3, .bottom = 3, .left = 3 }, try decode(ui.Edges, .{ .number = 3 }));
+    try std.testing.expectEqual(@as(f32, -4), try decode(f32, .{ .number = -4 }));
+    try std.testing.expectError(error.InvalidProperty, decode(ui.Color, .{ .array = &.{ .{ .number = 2 }, .{ .number = 0 }, .{ .number = 0 } } }));
 }

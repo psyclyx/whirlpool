@@ -48,4 +48,7 @@ pub const Sink = struct {
     create: *const fn (?*anyopaque, NodeId, NodeKind, ?NodeId) anyerror!void,
     set: *const fn (?*anyopaque, NodeId, []const u8, Value) anyerror!void,
     finish: *const fn (?*anyopaque) anyerror!void,
+    /// Where a node is on the surface: x, y, width, height. Null when the
+    /// host cannot say (no surface size yet, or the node is hidden).
+    bounds: ?*const fn (?*anyopaque, NodeId) anyerror!?[4]f32 = null,
 };

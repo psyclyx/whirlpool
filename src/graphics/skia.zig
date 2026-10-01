@@ -22,6 +22,26 @@ extern fn whirlpool_skia_pop_clip(renderer: *Native) void;
 extern fn whirlpool_skia_end(renderer: *Native, row_bytes: *usize) ?[*]const u8;
 extern fn whirlpool_skia_begin_vulkan(renderer: *Native, width: u32, height: u32, image: *anyopaque, memory: *anyopaque, memory_size: u64, format: u32, layout: u32, queue_family: u32) c_int;
 extern fn whirlpool_skia_end_vulkan(renderer: *Native, final_layout: u32, final_queue_family: u32) c_int;
+extern fn whirlpool_skia_measure_text(renderer: *Native, text: [*]const u8, length: usize, size: f32) f32;
+extern fn whirlpool_skia_fit_text(renderer: *Native, text: [*]const u8, length: usize, size: f32, max_width: f32) usize;
+
+/// Widths of text as a renderer draws it (its fonts, fallback included).
+/// Borrowed from, and only valid as long as, that renderer.
+pub const TextMetrics = struct {
+    native: *Native,
+
+    pub fn width(self: TextMetrics, text: []const u8, size: f32) f32 {
+        if (text.len == 0) return 0;
+        return whirlpool_skia_measure_text(self.native, text.ptr, text.len, size);
+    }
+
+    /// Bytes of the longest prefix of `text` (whole characters) at most
+    /// `max_width` wide.
+    pub fn fit(self: TextMetrics, text: []const u8, size: f32, max_width: f32) usize {
+        if (text.len == 0) return 0;
+        return @min(text.len, whirlpool_skia_fit_text(self.native, text.ptr, text.len, size, max_width));
+    }
+};
 
 pub const Frame = struct {
     pixels: [*]const u8,
@@ -43,6 +63,10 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         whirlpool_skia_destroy(self.native);
         self.* = undefined;
+    }
+
+    pub fn textMetrics(self: *const Renderer) TextMetrics {
+        return .{ .native = self.native };
     }
 
     pub fn begin(self: *Renderer, width: u32, height: u32, clear: [4]f32) !void {
@@ -118,6 +142,10 @@ pub const GpuRenderer = struct {
     pub fn deinit(self: *GpuRenderer) void {
         whirlpool_skia_destroy(self.native);
         self.* = undefined;
+    }
+
+    pub fn textMetrics(self: *const GpuRenderer) TextMetrics {
+        return .{ .native = self.native };
     }
 
     pub fn begin(self: *GpuRenderer, target: VulkanTarget, clear: [4]f32) !void {
