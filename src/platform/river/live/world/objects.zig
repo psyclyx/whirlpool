@@ -17,6 +17,12 @@ pub const WindowRecord = struct {
     actual_size: ?types.Size = null,
     dimensions_hint: wm.SizeHints = .{},
     last_proposed_size: ?types.Size = null,
+    /// A proposal was sent and its answering dimensions event has not arrived.
+    /// Until it does, `actual_size` is the window's previous size, not a reply.
+    awaiting_dimensions: bool = false,
+    /// The largest size the window answered a smaller tiled proposal with: a
+    /// minimum it enforces without advertising it. Forgotten whenever the
+    /// window's placement changes.
     confirmed_minimum: wm.Size = .{ .width = 0, .height = 0 },
     parent: ?types.WindowId = null,
     decoration_hint: ?types.DecorationHint = null,
@@ -24,6 +30,8 @@ pub const WindowRecord = struct {
     app_id: []u8 = &.{},
     title: []u8 = &.{},
     closed: bool = false,
+    /// River has been asked to close the window (once; it may decline).
+    close_sent: bool = false,
     identifier: wm.Identifier = .{},
 
     pub fn deinit(self: *WindowRecord, allocator: std.mem.Allocator) void {

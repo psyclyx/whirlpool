@@ -5,6 +5,8 @@
 local peek, inner_gap, outer_gap = 16, 8, 4
 local border_width, decoration_height = 4, 28
 local min_root_width, max_root_width = 0.05, 4
+-- Column widths, as fractions of the viewport, that width actions step through.
+local widths = { 0.25, 1 / 3, 0.5, 2 / 3, 0.75, 1 }
 local animation_duration_ms = 180
 local main_axis, main_reverse, cross_reverse = "horizontal", false, false
 
@@ -214,6 +216,11 @@ local function classify(fact)
     and minimum.width == maximum.width and minimum.height == maximum.height
   if fact.transient or fixed then return "floating" end
   return "tiled"
+end
+-- Whether a window is drawn. A closing window keeps its place until River
+-- destroys it: the client may decline (to ask about unsaved work, say).
+local function shown(fact)
+  return fact.lifecycle == "managed" or fact.lifecycle == "closing"
 end
 local function remove_window(window)
   local leaf = node(model.window_nodes[window])
@@ -495,7 +502,7 @@ local function restore_saved_unchecked(snapshot)
   local saved = model.saved
   local present = {}
   for _, fact in ipairs(snapshot.windows or {}) do
-    if (fact.identifier or "") ~= "" and fact.lifecycle ~= "closed" then present[fact.identifier] = fact end
+    if (fact.identifier or "") ~= "" then present[fact.identifier] = fact end
   end
   -- Windows may not have been announced yet; keep waiting for the first batch.
   if next(present) == nil then return end
@@ -641,22 +648,20 @@ local function sync(snapshot)
     end
     for _, fact in ipairs(snapshot.windows or {}) do
       seen[fact.id], model.windows[fact.id] = true, fact
-      if fact.lifecycle ~= "closed" then
-        local leaf = node(model.window_nodes[fact.id]) or new_leaf(fact.id)
-        leaf.state = leaf.state or classify(fact)
-        leaf.tag = leaf.tag or fact.tag
-        local state = tag_state(fact.tag)
-        local root = containing_root(leaf.id)
-        local owner = root and placed[root.id]
-        if leaf.state == "tiled" and not owner then
-          local strip, index = current_insertion(state,
-            snapshot.tag.id == fact.tag and snapshot.tag.focused_window or nil)
-          attach_root(state, strip, leaf.id, index, 0.5)
-          placed[leaf.id] = true
-        elseif leaf.state ~= "tiled" and owner then
-          detach(root.id)
-          placed[root.id] = nil
-        end
+      local leaf = node(model.window_nodes[fact.id]) or new_leaf(fact.id)
+      leaf.state = leaf.state or classify(fact)
+      leaf.tag = leaf.tag or fact.tag
+      local state = tag_state(fact.tag)
+      local root = containing_root(leaf.id)
+      local owner = root and placed[root.id]
+      if leaf.state == "tiled" and not owner then
+        local strip, index = current_insertion(state,
+          snapshot.tag.id == fact.tag and snapshot.tag.focused_window or nil)
+        attach_root(state, strip, leaf.id, index, 0.5)
+        placed[leaf.id] = true
+      elseif leaf.state ~= "tiled" and owner then
+        detach(root.id)
+        placed[root.id] = nil
       end
     end
     local stale = {}
@@ -942,8 +947,27 @@ local function mutate_action(snapshot, request)
   if name == "focus-parent" then focus_parent(state, snapshot); return {} end
   if name == "focus-child" then focus_child(state, snapshot); return {} end
   if name == "close-focused" then
-    local result = {}
-    for _, window in ipairs(target_windows(state, target)) do result[#result + 1] = { name = "close-window", window = window } end
+    local result, closing = {}, {}
+    for _, window in ipairs(target_windows(state, target)) do
+      result[#result + 1] = { name = "close-window", window = window }
+      closing[window] = true
+    end
+    if not next(closing) then return result end
+    -- Focus moves to the nearest window that stays: one sharing the column,
+    -- then a neighbouring column, else whatever this monitor would focus.
+    local current = descriptor_node(target)
+    local start = current and (current.kind == "window" and current or active_leaf(current.id))
+    local successor
+    for _, direction in ipairs(start and { "down", "up", "left", "right" } or {}) do
+      local adjacent = neighbor(state, start.id, direction)
+      if adjacent and adjacent.window and not closing[adjacent.window] then successor = adjacent.window; break end
+    end
+    set_focus(state, nil, snapshot)
+    if successor then
+      result[#result + 1] = { name = "focus-window", window = successor }
+    else
+      for _, effect in ipairs(focus_output(snapshot, snapshot.output, closing)) do result[#result + 1] = effect end
+    end
     return result
   end
   if name == "mark" then
@@ -1038,17 +1062,20 @@ local function mutate_action(snapshot, request)
     end
     return {}
   end
-  if name == "grow-width" or name == "shrink-width" then
+  if name == "cycle-width" or name == "grow-width" or name == "shrink-width" then
     local current, slot = descriptor_node(target)
     local root = current and containing_root(current.id)
     if root then local _; _, _, _, _, slot = root_location(root.id) end
     if slot then
-      local presets, nearest = { 0.25, 0.5, 0.75, 1, 1.5, 2 }, 1
-      for index, value in ipairs(presets) do
-        if math.abs(value - slot.width) < math.abs(presets[nearest] - slot.width) then nearest = index end
+      -- Step from the preset nearest the current width. Cycling wraps around;
+      -- growing and shrinking stop at the ends.
+      local nearest = 1
+      for index, value in ipairs(widths) do
+        if math.abs(value - slot.width) < math.abs(widths[nearest] - slot.width) then nearest = index end
       end
-      nearest = clamp(nearest + (name == "grow-width" and 1 or -1), 1, #presets)
-      slot.width = presets[nearest]
+      if name == "cycle-width" then nearest = nearest % #widths + 1
+      else nearest = clamp(nearest + (name == "grow-width" and 1 or -1), 1, #widths) end
+      slot.width = widths[nearest]
     end
     return {}
   end
@@ -1194,14 +1221,10 @@ end
 local function window_minimum(fact)
   local hints = fact.size_hints or {}
   local minimum = hints.min or { width = hints.min_width or 0, height = hints.min_height or 0 }
+  -- The host folds sizes a window has actually refused into its minimum, so
+  -- `actual` is never read here: until a window answers a proposal, its actual
+  -- size is just its previous one (say, fullscreen), not a constraint.
   local width, height = minimum.width or 0, minimum.height or 0
-  -- An actual size larger than the last proposal is an observed constraint,
-  -- not merely stale geometry. Feed it back through the same recursive
-  -- constraint calculation so every sibling sharing that extent agrees.
-  if fact.actual and fact.proposed then
-    if fact.actual.width > fact.proposed.width then width = math.max(width, fact.actual.width) end
-    if fact.actual.height > fact.proposed.height then height = math.max(height, fact.actual.height) end
-  end
   return {
     width = width > 0 and width + 2 * border_width or 0,
     height = height > 0 and height + decoration_height + 2 * border_width or 0,
@@ -1259,7 +1282,7 @@ local function layout_node(root_id, rect, active, entries, z)
         width = math.max(1, rect.width - 2 * border_width),
         height = math.max(1, rect.height - decoration_height - 2 * border_width),
       },
-      visible = active and fact.lifecycle == "managed", z = z,
+      visible = active and shown(fact), z = z,
     }
     return z + 1
   end
@@ -1424,7 +1447,7 @@ local function layout(snapshot)
       entries[#entries + 1] = {
         window = window, state = leaf.state, frame = geometry,
         propose = leaf.state == "fullscreen" and { width = geometry.width, height = geometry.height } or nil,
-        visible = leaf.state ~= "scratchpad" and fact.lifecycle == "managed", z = z,
+        visible = leaf.state ~= "scratchpad" and shown(fact), z = z,
       }
       z = z + 1
       if leaf.state == "fullscreen" and (fact.focus_serial or 0) >= fullscreen_serial then

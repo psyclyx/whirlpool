@@ -439,6 +439,7 @@ pub const Runtime = struct {
         };
         try self.adapter.appendServerDecorationRequests(&operations);
         try self.adapter.appendWindowPlacementRequests(&operations);
+        try self.adapter.appendCloseRequests(&operations);
         try self.adapter.appendPointerOperationRequests(&operations);
         try self.adapter.appendSeatFocusRequests(&operations);
         try plans.applyManageTransport(transport.manage(Runtime, self), .{ .operations = operations.items });
@@ -448,6 +449,7 @@ pub const Runtime = struct {
         };
         self.adapter.commitServerDecorationRequests();
         self.adapter.commitWindowPlacementRequests(operations.items);
+        self.adapter.commitCloseRequests(operations.items);
         self.adapter.commitPointerOperationRequests();
         self.adapter.commitSeatFocusRequests();
         // River guarantees at least one render sequence after every completed

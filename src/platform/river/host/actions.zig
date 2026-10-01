@@ -90,6 +90,10 @@ test "configured spawn failures do not escape into the compositor loop" {
         }
     };
 
+    // The failure is logged as a warning, which the test runner would report.
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
     var runner: Runner = undefined;
     runner.spawn = .{ .run = FailingSpawn.run };
     try runner.spawnCommand(&.{"missing-command"});

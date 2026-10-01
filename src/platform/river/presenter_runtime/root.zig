@@ -276,7 +276,15 @@ const RolePresenter = struct {
             return;
         };
         self.owner.gpu_mutex.unlock(self.owner.io);
-        defer renderer.deinit();
+        // Tearing down a Skia context flushes and waits on the Vulkan queue
+        // every role shares, and queue access must not race another role's
+        // submission. That wait also retires this role's last frame, so its
+        // images are idle by the time `destroy` frees them.
+        defer {
+            self.owner.gpu_mutex.lockUncancelable(self.owner.io);
+            renderer.deinit();
+            self.owner.gpu_mutex.unlock(self.owner.io);
+        }
         while (true) {
             self.lock();
             while (!self.closing and !self.canRender())

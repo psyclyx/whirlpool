@@ -58,7 +58,7 @@ local bindings = {
   { modifiers = mod_ctrl_shift, key = "l", action = layout("expel-right") },
 
   -- Width, tabs, and outputs
-  { modifiers = mod_only, key = "r", action = layout("grow-width") },
+  { modifiers = mod_only, key = "r", action = layout("cycle-width") },
   { modifiers = mod_only, key = "space", action = layout("cycle-container-mode") },
   { modifiers = mod_only, key = "t", action = layout("cycle-container-mode") },
   { modifiers = mod_only, key = "Tab", action = layout("focus-tab-next") },

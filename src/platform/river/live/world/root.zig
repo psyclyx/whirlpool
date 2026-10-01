@@ -249,6 +249,7 @@ pub const Adapter = struct {
     pub fn commitDimensionProposal(self: *Adapter, proposal: types.WindowSize) !void {
         const record = self.objects.windows.getPtr(proposal.window) orelse return error.UnknownWindow;
         record.last_proposed_size = proposal.size;
+        record.awaiting_dimensions = true;
     }
 
     pub fn takeInputIntents(self: *Adapter) ![]input_intents.Intent {
@@ -323,6 +324,25 @@ pub const Adapter = struct {
         }
     }
 
+    /// Ask River to close every window the WM has begun closing, once each.
+    pub fn appendCloseRequests(self: *const Adapter, operations: *std.ArrayList(types.ManageOperation)) !void {
+        for (self.objects.window_order.items) |window| {
+            const record = self.objects.windows.get(window) orelse continue;
+            if (record.closed or record.close_sent) continue;
+            const state = self.world.getWindow(record.wm_id orelse continue) orelse continue;
+            if (state.lifecycle == .closing) try operations.append(self.allocator, .{ .close = window });
+        }
+    }
+
+    pub fn commitCloseRequests(self: *Adapter, operations: []const types.ManageOperation) void {
+        for (operations) |operation| switch (operation) {
+            .close => |window| if (self.objects.windows.getPtr(window)) |record| {
+                record.close_sent = true;
+            },
+            else => {},
+        };
+    }
+
     pub fn needsWindowPlacementRequest(self: *const Adapter, operation: types.ManageOperation) bool {
         const desired: struct { window: types.WindowId, placement: wm.Placement } = switch (operation) {
             .set_tiled => |value| .{ .window = value.window, .placement = if (value.edges == 0) .floating else .tiled },
@@ -337,16 +357,22 @@ pub const Adapter = struct {
         for (operations) |operation| switch (operation) {
             .set_tiled => |value| {
                 if (self.objects.windows.getPtr(value.window)) |record|
-                    record.placement_applied = if (value.edges == 0) .floating else .tiled;
+                    applyPlacement(record, if (value.edges == 0) .floating else .tiled);
             },
             .fullscreen => |value| {
-                if (self.objects.windows.getPtr(value.window)) |record| record.placement_applied = .fullscreen;
+                if (self.objects.windows.getPtr(value.window)) |record| applyPlacement(record, .fullscreen);
             },
             .exit_fullscreen => |window| {
-                if (self.objects.windows.getPtr(window)) |record| record.placement_applied = null;
+                if (self.objects.windows.getPtr(window)) |record| applyPlacement(record, null);
             },
             else => {},
         };
+    }
+
+    /// A minimum learned under one placement says nothing about another.
+    fn applyPlacement(record: *live_objects.WindowRecord, placement: ?wm.Placement) void {
+        record.placement_applied = placement;
+        record.confirmed_minimum = .{ .width = 0, .height = 0 };
     }
 
     pub fn appendPointerOperationRequests(self: *const Adapter, operations: *std.ArrayList(types.ManageOperation)) !void {
@@ -525,6 +551,13 @@ pub const Adapter = struct {
                 dimensions_changed = dimensions_changed or record.actual_size == null or
                     !std.meta.eql(record.actual_size.?, value.size);
                 record.actual_size = value.size;
+                // River answers every proposal with a dimensions event, maybe
+                // several render sequences later. Only that answer says what the
+                // window accepts; a stale size in between (still fullscreen-sized
+                // just after leaving fullscreen, say) is not a refusal.
+                const answer = record.awaiting_dimensions;
+                record.awaiting_dimensions = false;
+                if (!answer or record.placement_applied != .tiled) continue;
                 if (record.last_proposed_size) |proposed| {
                     if (value.size.width > proposed.width)
                         record.confirmed_minimum.width = @max(record.confirmed_minimum.width, @as(u32, @intCast(value.size.width)));
@@ -1021,6 +1054,7 @@ test "dimensions response promotes only confirmed resize mismatches into layout 
     var initial = try adapter.beginManage(testPlanConfig());
     defer initial.deinit();
 
+    adapter.commitWindowPlacementRequests(&.{.{ .set_tiled = .{ .window = window, .edges = 0xf } }});
     try adapter.commitDimensionProposal(.{
         .window = window,
         .size = .{ .width = 200, .height = 100 },
@@ -1040,6 +1074,56 @@ test "dimensions response promotes only confirmed resize mismatches into layout 
     try std.testing.expectEqual(@as(u32, 360), sizing.size_hints.min.width);
     try std.testing.expectEqual(@as(u32, 0), sizing.size_hints.min.height);
     try std.testing.expectEqual(@as(?wm.Size, .{ .width = 360, .height = 100 }), sizing.actual_size);
+}
+
+test "a stale size before the proposal is answered never becomes a layout floor" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+
+    const output = try adapter.objects.bindOutput(fakeRef(0x12d0));
+    try adapter.stageManageFact(.{ .output_position = .{ .output = output, .position = .{ .x = 0, .y = 0 } } });
+    try adapter.stageManageFact(.{ .output_dimensions = .{ .output = output, .size = .{ .width = 500, .height = 400 } } });
+    const window = try adapter.objects.bindWindow(fakeRef(0x22d0), fakeRef(0x22d1));
+    var initial = try adapter.beginManage(testPlanConfig());
+    defer initial.deinit();
+
+    // Leaving fullscreen: the window is still 500x400 when the smaller tiled
+    // proposal goes out, and River reports that size before the answer.
+    adapter.commitWindowPlacementRequests(&.{.{ .set_tiled = .{ .window = window, .edges = 0xf } }});
+    try adapter.commitDimensionProposal(.{ .window = window, .size = .{ .width = 240, .height = 180 } });
+    try adapter.stageRenderFact(.{ .window_dimensions = .{ .window = window, .size = .{ .width = 240, .height = 180 } } });
+    var answered = try adapter.beginRender(&initial.frames);
+    answered.deinit();
+    try adapter.stageRenderFact(.{ .window_dimensions = .{ .window = window, .size = .{ .width = 500, .height = 400 } } });
+    var unprompted = try adapter.beginRender(&initial.frames);
+    unprompted.deinit();
+
+    var reconciled = try adapter.beginManage(testPlanConfig());
+    defer reconciled.deinit();
+    const sizing = adapter.world.getWindow(try adapter.objects.wmWindowId(window)).?;
+    try std.testing.expectEqual(wm.Size{ .width = 0, .height = 0 }, sizing.size_hints.min);
+}
+
+test "a refused proposal is a floor until the window's placement changes" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+
+    const output = try adapter.objects.bindOutput(fakeRef(0x12e0));
+    try adapter.stageManageFact(.{ .output_position = .{ .output = output, .position = .{ .x = 0, .y = 0 } } });
+    try adapter.stageManageFact(.{ .output_dimensions = .{ .output = output, .size = .{ .width = 500, .height = 400 } } });
+    const window = try adapter.objects.bindWindow(fakeRef(0x22e0), fakeRef(0x22e1));
+    var initial = try adapter.beginManage(testPlanConfig());
+    defer initial.deinit();
+
+    adapter.commitWindowPlacementRequests(&.{.{ .set_tiled = .{ .window = window, .edges = 0xf } }});
+    try adapter.commitDimensionProposal(.{ .window = window, .size = .{ .width = 200, .height = 100 } });
+    try adapter.stageRenderFact(.{ .window_dimensions = .{ .window = window, .size = .{ .width = 300, .height = 100 } } });
+    var render = try adapter.beginRender(&initial.frames);
+    render.deinit();
+    try std.testing.expectEqual(@as(u32, 300), adapter.objects.windows.get(window).?.confirmed_minimum.width);
+
+    adapter.commitWindowPlacementRequests(&.{.{ .fullscreen = .{ .window = window, .output = output } }});
+    try std.testing.expectEqual(@as(u32, 0), adapter.objects.windows.get(window).?.confirmed_minimum.width);
 }
 
 test "all output plans in a manage cycle share one world epoch" {
