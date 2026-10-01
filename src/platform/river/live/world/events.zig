@@ -15,7 +15,10 @@ pub fn onWindow(self: anytype, window: *wayland.client.river.WindowV1, event: wa
     const id = self.objects.maps.windows.idFor(proxy) orelse return error.UnknownWindow;
     switch (event) {
         .closed => _ = try self.closeWindowRef(proxy),
-        .unreliable_pid,
+        .unreliable_pid => |value| if (value.unreliable_pid > 0) {
+            self.objects.windows.getPtr(id).?.pid = value.unreliable_pid;
+            self.objects.metadata_revision +%= 1;
+        },
         .presentation_hint,
         .capture_sessions,
         => {},

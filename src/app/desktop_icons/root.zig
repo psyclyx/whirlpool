@@ -1,8 +1,13 @@
 //! Asynchronous application-id to desktop icon resolution.
 //!
 //! Requests only touch bounded in-memory state. A single `std.Io` producer
-//! reads desktop entries and probes the hicolor theme away from Wayland and
-//! Lua callbacks, then publishes stable icon paths for retained surfaces.
+//! reads desktop entries and probes icon themes away from Wayland and Lua
+//! callbacks, then publishes stable icon paths for retained surfaces.
+//!
+//! Lookups search the session's XDG data directories and, given the
+//! window's process, that process's own: the Nix store path its executable
+//! is in, and the XDG_DATA_DIRS it was started with. So an application run
+//! from a nix-shell or with `nix run` still finds its icon.
 
 const std = @import("std");
 
@@ -14,7 +19,11 @@ pub const Wake = struct {
 const Entry = struct {
     path: []u8 = &.{},
     ready: bool = false,
+    /// The process whose own data directories the last lookup also searched.
+    pid: ?i32 = null,
 };
+
+const Request = struct { app_id: []const u8, pid: ?i32 };
 
 pub const Service = struct {
     allocator: std.mem.Allocator,
@@ -23,7 +32,7 @@ pub const Service = struct {
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
-    queue: std.ArrayList([]const u8) = .empty,
+    queue: std.ArrayList(Request) = .empty,
     wake: ?Wake = null,
     /// How many icons have been looked up so far; changes as lookups finish.
     resolved: u64 = 0,
@@ -63,18 +72,31 @@ pub const Service = struct {
         self.unlock();
     }
 
-    /// Return a stable resolved path or queue one non-blocking lookup.
-    pub fn pathFor(self: *Service, app_id: []const u8) ![]const u8 {
+    /// Return a stable resolved path or queue one non-blocking lookup. `pid`,
+    /// the window's process when known, lets the lookup also search that
+    /// process's own data directories (an app started from a nix-shell, say).
+    /// A failed lookup is tried again for a window of another process.
+    pub fn pathFor(self: *Service, app_id: []const u8, pid: ?i32) ![]const u8 {
         if (app_id.len == 0) return &.{};
         self.lock();
         defer self.unlock();
-        if (self.entries.get(app_id)) |entry| return if (entry.ready) entry.path else &.{};
+        if (self.entries.getEntry(app_id)) |found| {
+            const entry = found.value_ptr;
+            if (!entry.ready) return &.{};
+            if (entry.path.len == 0 and pid != null and !std.meta.eql(pid, entry.pid)) {
+                entry.ready = false;
+                entry.pid = pid;
+                try self.queue.append(self.allocator, .{ .app_id = found.key_ptr.*, .pid = pid });
+                self.changed.signal(self.io);
+            }
+            return entry.path;
+        }
 
         const key = try self.allocator.dupe(u8, app_id);
         errdefer self.allocator.free(key);
-        try self.entries.put(self.allocator, key, .{});
+        try self.entries.put(self.allocator, key, .{ .pid = pid });
         errdefer _ = self.entries.remove(key);
-        try self.queue.append(self.allocator, key);
+        try self.queue.append(self.allocator, .{ .app_id = key, .pid = pid });
         self.changed.signal(self.io);
         return &.{};
     }
@@ -87,10 +109,11 @@ pub const Service = struct {
                     self.unlock();
                     return err;
                 };
-            const app_id = self.queue.orderedRemove(0);
+            const request = self.queue.orderedRemove(0);
+            const app_id = request.app_id;
             self.unlock();
 
-            const path = resolve(self.allocator, self.io, app_id) catch |err| blk: {
+            const path = resolve(self.allocator, self.io, app_id, request.pid) catch |err| blk: {
                 if (err == error.Canceled) return error.Canceled;
                 break :blk @as([]u8, &.{});
             };
@@ -132,12 +155,14 @@ const Search = struct {
     themes: []const []const u8,
 };
 
-fn resolve(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8) ![]u8 {
+fn resolve(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, pid: ?i32) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const roots = try dataRoots(arena);
-    const search = Search{ .roots = roots, .themes = try themeChain(arena, io, roots) };
+    var roots = std.ArrayList([]const u8).empty;
+    try roots.appendSlice(arena, try dataRoots(arena));
+    if (pid) |process| try appendProcessRoots(arena, io, process, &roots);
+    const search = Search{ .roots = roots.items, .themes = try themeChain(arena, io, roots.items) };
     return resolveIn(allocator, io, app_id, search);
 }
 
@@ -222,6 +247,57 @@ fn findIconFile(arena: std.mem.Allocator, io: std.Io, icon: []const u8, search: 
 fn exists(io: std.Io, path: []const u8) bool {
     std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
+}
+
+/// A process's own data directories, after `roots` (skipping repeats): the
+/// `XDG_DATA_DIRS` it was started with, and the `share` directory of the Nix
+/// store path its executable is in. That is how an application run from a
+/// nix-shell or `nix run` finds its desktop entry and icons.
+fn appendProcessRoots(arena: std.mem.Allocator, io: std.Io, pid: i32, roots: *std.ArrayList([]const u8)) !void {
+    var candidates = std.ArrayList([]const u8).empty;
+    const environ_path = try std.fmt.allocPrint(arena, "/proc/{d}/environ", .{pid});
+    if (readStream(arena, io, environ_path)) |environ| {
+        var dirs = std.mem.tokenizeScalar(u8, environValue(environ, "XDG_DATA_DIRS") orelse "", ':');
+        while (dirs.next()) |dir| try candidates.append(arena, dir);
+    } else |_| {}
+    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std.fmt.allocPrint(arena, "/proc/{d}/exe", .{pid});
+    if (std.Io.Dir.cwd().readLink(io, exe_path, &link_buffer)) |length| {
+        if (storePath(link_buffer[0..length])) |store| try candidates.append(arena, try std.fs.path.join(arena, &.{ store, "share" }));
+    } else |_| {}
+    for (candidates.items) |candidate| {
+        for (roots.items) |root| {
+            if (std.mem.eql(u8, root, candidate)) break;
+        } else try roots.append(arena, try arena.dupe(u8, candidate));
+    }
+}
+
+/// A variable's value in a `/proc/<pid>/environ` block (NUL-separated).
+fn environValue(environ: []const u8, name: []const u8) ?[]const u8 {
+    var variables = std.mem.splitScalar(u8, environ, 0);
+    while (variables.next()) |variable| {
+        if (variable.len > name.len and std.mem.startsWith(u8, variable, name) and variable[name.len] == '=')
+            return variable[name.len + 1 ..];
+    }
+    return null;
+}
+
+/// A whole file read until its end: `/proc` files report a size of zero, so
+/// reads that trust the size see nothing.
+fn readStream(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    return reader.interface.allocRemaining(arena, .limited(1024 * 1024));
+}
+
+/// `/nix/store/<hash>-<name>` for a path inside the Nix store.
+fn storePath(path: []const u8) ?[]const u8 {
+    const prefix = "/nix/store/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const end = std.mem.indexOfScalarPos(u8, path, prefix.len, '/') orelse path.len;
+    return path[0..end];
 }
 
 /// XDG data directories, most specific first.
@@ -377,4 +453,15 @@ test "without an entry, an icon named after the app id is used, themes first" {
 test "ini values are read from their own section" {
     const index = "[Icon Theme]\nName=Papirus\nInherits=breeze,hicolor\n[16x16/apps]\nInherits=nope\n";
     try std.testing.expectEqualStrings("breeze,hicolor", iniValue(index, "Icon Theme", "Inherits").?);
+}
+
+test "a store path is the package an executable belongs to" {
+    try std.testing.expectEqualStrings("/nix/store/abc-ghostty-1.3.1", storePath("/nix/store/abc-ghostty-1.3.1/bin/.ghostty-wrapped").?);
+    try std.testing.expect(storePath("/usr/bin/foot") == null);
+}
+
+test "a process's XDG_DATA_DIRS is read from its environment block" {
+    const environ = "HOME=/home/a\x00XDG_DATA_DIRS_X=no\x00XDG_DATA_DIRS=/nix/store/abc-mpv/share:/usr/share\x00";
+    try std.testing.expectEqualStrings("/nix/store/abc-mpv/share:/usr/share", environValue(environ, "XDG_DATA_DIRS").?);
+    try std.testing.expect(environValue(environ, "PATH") == null);
 }

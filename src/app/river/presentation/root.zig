@@ -433,7 +433,7 @@ pub const Context = struct {
                 const record = try self.runtime.adapter.objects.windowRecord(live_window);
                 app_id = try arena.dupe(u8, record.app_id);
                 title = try arena.dupe(u8, record.title);
-                icon = try arena.dupe(u8, try self.icons.pathFor(record.app_id));
+                icon = try arena.dupe(u8, try self.icons.pathFor(record.app_id, record.pid));
             };
             const args = try arena.alloc(Value, item.arg_count);
             for (item.args[0..item.arg_count], args) |*arg, *value| value.* = .{ .string = try arena.dupe(u8, arg.slice()) };

@@ -29,6 +29,9 @@ pub const WindowRecord = struct {
     decoration_ssd_applied: ?bool = null,
     app_id: []u8 = &.{},
     title: []u8 = &.{},
+    /// The creating process, as River reports it (racy: for presentation, such
+    /// as finding an app's icon, never for anything security-sensitive).
+    pid: ?i32 = null,
     closed: bool = false,
     /// River has been asked to close the window (once; it may decline).
     close_sent: bool = false,
