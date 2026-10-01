@@ -304,8 +304,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const app_desktop_icons = b.addModule("whirlpool-app-desktop-icons", .{
-        .root_source_file = b.path("src/app/desktop_icons/root.zig"),
+    const app_desktop_entries = b.addModule("whirlpool-app-desktop-entries", .{
+        .root_source_file = b.path("src/app/desktop_entries/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -338,7 +338,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "whirlpool-river-role-lifecycle", .module = river_role_lifecycle },
             .{ .name = "whirlpool-river-presenter-runtime", .module = river_presenter_runtime },
             .{ .name = "whirlpool-app-status", .module = app_status },
-            .{ .name = "whirlpool-app-desktop-icons", .module = app_desktop_icons },
+            .{ .name = "whirlpool-app-desktop-entries", .module = app_desktop_entries },
         },
     });
     const app_river = b.addModule("whirlpool-app-river", .{
@@ -463,7 +463,7 @@ pub fn build(b: *std.Build) void {
         river_presentation,
         river_presenter_runtime,
         app_river_configured,
-        app_desktop_icons,
+        app_desktop_entries,
         app_river_presentation,
         app_river,
         app_layer_shell,

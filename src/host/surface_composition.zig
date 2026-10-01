@@ -215,6 +215,26 @@ test "the bar shows the active tag and occupied ones, and the windows on this ta
     for ([_][]const u8{ "3", "5" }) |text| try std.testing.expect(findText(&frame, text) == null);
 }
 
+test "a window is labelled with its application's name when it has one" {
+    var bar: BarTest = undefined;
+    try bar.init();
+    defer bar.deinit();
+    const b = bar.b();
+    const named = b.object(.{
+        .{ "kind", "window" }, .{ "label", "" }, .{ "detail", "" }, .{ "focused", true },
+        .{ "overlay", false }, .{ "window", 1 }, .{ "app_id", "com.mitchellh.ghostty" },
+        .{ "name", "Ghostty" }, .{ "title", "~" }, .{ "icon", "" },
+        .{ "action", "focus-window" }, .{ "args", b.array(&.{b.from("1")}) },
+    });
+    try bar.desktop(&.{ named, bar.window(2, "foot", false) });
+    var frame = try bar.lower();
+    defer frame.deinit();
+    try std.testing.expect(findText(&frame, "Ghostty") != null);
+    try std.testing.expect(findText(&frame, "com.mitchellh.ghostty") == null);
+    // Without a name, the app id is the label.
+    try std.testing.expect(findText(&frame, "foot") != null);
+}
+
 test "clicking a window asks the layout to focus it; clicking a tag shows it" {
     var bar: BarTest = undefined;
     try bar.init();

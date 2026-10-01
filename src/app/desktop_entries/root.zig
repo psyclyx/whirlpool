@@ -1,13 +1,14 @@
-//! Asynchronous application-id to desktop icon resolution.
+//! Asynchronous application-id to desktop entry resolution: an application's
+//! human name and icon file, as its desktop entry gives them.
 //!
 //! Requests only touch bounded in-memory state. A single `std.Io` producer
 //! reads desktop entries and probes icon themes away from Wayland and Lua
-//! callbacks, then publishes stable icon paths for retained surfaces.
+//! callbacks, then publishes what it found for retained surfaces.
 //!
 //! Lookups search the session's XDG data directories and, given the
 //! window's process, that process's own: the Nix store path its executable
 //! is in, and the XDG_DATA_DIRS it was started with. So an application run
-//! from a nix-shell or with `nix run` still finds its icon.
+//! from a nix-shell or with `nix run` is still found.
 
 const std = @import("std");
 
@@ -16,11 +17,25 @@ pub const Wake = struct {
     run: *const fn (?*anyopaque) void,
 };
 
+/// What is known about an application; empty strings where nothing was found.
+pub const AppInfo = struct {
+    /// The desktop entry's Name ("Ghostty" for com.mitchellh.ghostty).
+    name: []const u8 = "",
+    /// An icon file path.
+    icon: []const u8 = "",
+};
+
 const Entry = struct {
-    path: []u8 = &.{},
+    info: AppInfo = .{},
     ready: bool = false,
     /// The process whose own data directories the last lookup also searched.
     pid: ?i32 = null,
+
+    fn free(self: *Entry, allocator: std.mem.Allocator) void {
+        if (self.info.name.len != 0) allocator.free(self.info.name);
+        if (self.info.icon.len != 0) allocator.free(self.info.icon);
+        self.info = .{};
+    }
 };
 
 const Request = struct { app_id: []const u8, pid: ?i32 };
@@ -34,7 +49,7 @@ pub const Service = struct {
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
     queue: std.ArrayList(Request) = .empty,
     wake: ?Wake = null,
-    /// How many icons have been looked up so far; changes as lookups finish.
+    /// How many lookups have finished; changes as each does.
     resolved: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !*Service {
@@ -51,7 +66,7 @@ pub const Service = struct {
         var iterator = self.entries.iterator();
         while (iterator.next()) |item| {
             self.allocator.free(item.key_ptr.*);
-            if (item.value_ptr.path.len != 0) self.allocator.free(item.value_ptr.path);
+            item.value_ptr.free(self.allocator);
         }
         self.entries.deinit(self.allocator);
         self.queue.deinit(self.allocator);
@@ -72,24 +87,25 @@ pub const Service = struct {
         self.unlock();
     }
 
-    /// Return a stable resolved path or queue one non-blocking lookup. `pid`,
-    /// the window's process when known, lets the lookup also search that
-    /// process's own data directories (an app started from a nix-shell, say).
-    /// A failed lookup is tried again for a window of another process.
-    pub fn pathFor(self: *Service, app_id: []const u8, pid: ?i32) ![]const u8 {
-        if (app_id.len == 0) return &.{};
+    /// What is known about `app_id` so far, copied into `arena`; unknown parts
+    /// are empty while a non-blocking lookup is queued. `pid`, the window's
+    /// process when known, lets the lookup also search that process's own data
+    /// directories (an app started from a nix-shell, say). A lookup that found
+    /// no icon is tried again for a window of another process.
+    pub fn lookup(self: *Service, arena: std.mem.Allocator, app_id: []const u8, pid: ?i32) !AppInfo {
+        if (app_id.len == 0) return .{};
         self.lock();
         defer self.unlock();
         if (self.entries.getEntry(app_id)) |found| {
             const entry = found.value_ptr;
-            if (!entry.ready) return &.{};
-            if (entry.path.len == 0 and pid != null and !std.meta.eql(pid, entry.pid)) {
+            if (!entry.ready) return .{};
+            if (entry.info.icon.len == 0 and pid != null and !std.meta.eql(pid, entry.pid)) {
                 entry.ready = false;
                 entry.pid = pid;
                 try self.queue.append(self.allocator, .{ .app_id = found.key_ptr.*, .pid = pid });
                 self.changed.signal(self.io);
             }
-            return entry.path;
+            return .{ .name = try arena.dupe(u8, entry.info.name), .icon = try arena.dupe(u8, entry.info.icon) };
         }
 
         const key = try self.allocator.dupe(u8, app_id);
@@ -98,7 +114,7 @@ pub const Service = struct {
         errdefer _ = self.entries.remove(key);
         try self.queue.append(self.allocator, .{ .app_id = key, .pid = pid });
         self.changed.signal(self.io);
-        return &.{};
+        return .{};
     }
 
     fn workerLoop(self: *Service) std.Io.Cancelable!void {
@@ -113,18 +129,22 @@ pub const Service = struct {
             const app_id = request.app_id;
             self.unlock();
 
-            const path = resolve(self.allocator, self.io, app_id, request.pid) catch |err| blk: {
+            var info = resolve(self.allocator, self.io, app_id, request.pid) catch |err| blk: {
                 if (err == error.Canceled) return error.Canceled;
-                break :blk @as([]u8, &.{});
+                break :blk AppInfo{};
             };
 
             self.lock();
             const entry = self.entries.getPtr(app_id) orelse {
                 self.unlock();
-                if (path.len != 0) self.allocator.free(path);
+                var orphan = Entry{ .info = info };
+                orphan.free(self.allocator);
                 continue;
             };
-            entry.path = path;
+            // Callers copied what they read under the lock, so replacing it is safe.
+            entry.free(self.allocator);
+            entry.info = info;
+            info = .{};
             entry.ready = true;
             self.resolved +%= 1;
             const wake = self.wake;
@@ -155,7 +175,7 @@ const Search = struct {
     themes: []const []const u8,
 };
 
-fn resolve(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, pid: ?i32) ![]u8 {
+fn resolve(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, pid: ?i32) !AppInfo {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -166,19 +186,23 @@ fn resolve(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, pid: ?i
     return resolveIn(allocator, io, app_id, search);
 }
 
-/// An application id to an icon file: through its desktop entry (named after
-/// the id, or claiming it as StartupWMClass) when there is one, else an icon
-/// named after the id itself.
-fn resolveIn(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, search: Search) ![]u8 {
+/// An application id to its name and icon: through its desktop entry (named
+/// after the id, or claiming it as StartupWMClass) when there is one, else an
+/// icon named after the id itself. The result is owned by `allocator`.
+fn resolveIn(allocator: std.mem.Allocator, io: std.Io, app_id: []const u8, search: Search) !AppInfo {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var icon: []const u8 = app_id;
+    var name: []const u8 = "";
     if (try findDesktopEntry(arena, io, app_id, search.roots)) |contents| {
         if (desktopKey(contents, "Icon")) |named| icon = named;
+        if (desktopKey(contents, "Name")) |named| name = named;
     }
-    const found = try findIconFile(arena, io, icon, search) orelse return &.{};
-    return allocator.dupe(u8, found);
+    const found = try findIconFile(arena, io, icon, search) orelse "";
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    return .{ .name = owned_name, .icon = try allocator.dupe(u8, found) };
 }
 
 /// The contents of the desktop entry for `app_id`: `<id>.desktop` (or its
@@ -412,20 +436,27 @@ const Fixture = struct {
         self.dir.cleanup();
     }
 
-    fn resolve(self: *const Fixture, app_id: []const u8, themes: []const []const u8) ![]u8 {
+    fn resolve(self: *const Fixture, app_id: []const u8, themes: []const []const u8) !AppInfo {
         return resolveIn(std.testing.allocator, std.testing.io, app_id, .{ .roots = &.{self.root}, .themes = themes });
+    }
+
+    fn free(info: AppInfo) void {
+        var entry = Entry{ .info = info };
+        entry.free(std.testing.allocator);
     }
 };
 
 test "reverse-DNS icon names are names, not files with an extension" {
     var fixture = try Fixture.init(&.{
-        "applications/com.mitchellh.ghostty.desktop=[Desktop Entry]\nIcon=com.mitchellh.ghostty\n",
+        "applications/com.mitchellh.ghostty.desktop=[Desktop Entry]\nName=Ghostty\nIcon=com.mitchellh.ghostty\n[Desktop Action new-window]\nName=New Window\n",
         "icons/hicolor/32x32/apps/com.mitchellh.ghostty.png",
     });
     defer fixture.deinit();
-    const path = try fixture.resolve("com.mitchellh.ghostty", &.{"hicolor"});
-    defer std.testing.allocator.free(path);
-    try std.testing.expect(std.mem.endsWith(u8, path, "icons/hicolor/32x32/apps/com.mitchellh.ghostty.png"));
+    const info = try fixture.resolve("com.mitchellh.ghostty", &.{"hicolor"});
+    defer Fixture.free(info);
+    try std.testing.expect(std.mem.endsWith(u8, info.icon, "icons/hicolor/32x32/apps/com.mitchellh.ghostty.png"));
+    // The application's name, not an action's.
+    try std.testing.expectEqualStrings("Ghostty", info.name);
 }
 
 test "an entry claiming the app id as its window class supplies the icon" {
@@ -434,9 +465,9 @@ test "an entry claiming the app id as its window class supplies the icon" {
         "icons/hicolor/48x48/apps/signal-desktop.png",
     });
     defer fixture.deinit();
-    const path = try fixture.resolve("signal", &.{"hicolor"});
-    defer std.testing.allocator.free(path);
-    try std.testing.expect(std.mem.endsWith(u8, path, "signal-desktop.png"));
+    const info = try fixture.resolve("signal", &.{"hicolor"});
+    defer Fixture.free(info);
+    try std.testing.expect(std.mem.endsWith(u8, info.icon, "signal-desktop.png"));
 }
 
 test "without an entry, an icon named after the app id is used, themes first" {
@@ -445,9 +476,9 @@ test "without an entry, an icon named after the app id is used, themes first" {
         "icons/hicolor/scalable/apps/foot.svg",
     });
     defer fixture.deinit();
-    const path = try fixture.resolve("foot", &.{ "Papirus", "hicolor" });
-    defer std.testing.allocator.free(path);
-    try std.testing.expect(std.mem.endsWith(u8, path, "icons/Papirus/64x64/apps/foot.svg"));
+    const info = try fixture.resolve("foot", &.{ "Papirus", "hicolor" });
+    defer Fixture.free(info);
+    try std.testing.expect(std.mem.endsWith(u8, info.icon, "icons/Papirus/64x64/apps/foot.svg"));
 }
 
 test "ini values are read from their own section" {

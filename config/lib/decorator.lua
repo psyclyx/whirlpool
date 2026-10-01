@@ -15,7 +15,8 @@ return function(root)
   })
 
   surface.on("decoration", function(window)
-    title:set("text", window.title ~= "" and window.title or window.app_id)
+    local name = (window.name or "") ~= "" and window.name or window.app_id
+    title:set("text", window.title ~= "" and window.title or name)
     title:set("text_color", window.focused and theme.bright or theme.text)
     background:set("fill", window.focused and theme.blend(theme.accent, 80) or theme.blend(theme.surface, 120))
   end)

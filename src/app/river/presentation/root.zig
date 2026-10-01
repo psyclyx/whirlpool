@@ -17,7 +17,7 @@ const river_host_runtime = @import("whirlpool-river-host-runtime");
 const river_role_lifecycle = @import("whirlpool-river-role-lifecycle");
 const river_presenter_runtime = @import("whirlpool-river-presenter-runtime");
 const status_app = @import("whirlpool-app-status");
-const desktop_icons = @import("whirlpool-app-desktop-icons");
+const desktop_entries = @import("whirlpool-app-desktop-entries");
 
 const Value = script.program_loader.Value;
 
@@ -34,7 +34,7 @@ pub const Bridge = struct {
     clock_origin: std.Io.Timestamp = undefined,
     graphics: ?*river_presenter_runtime.Runtime = null,
     status: ?*status_app.Service = null,
-    icons: ?*desktop_icons.Service = null,
+    apps: ?*desktop_entries.Service = null,
     context: Context = undefined,
     input_seats: std.ArrayList(*InputSeat) = .empty,
     generation: u64 = 1,
@@ -69,10 +69,10 @@ pub const Bridge = struct {
             self.status.?.deinit();
             self.status = null;
         }
-        self.icons = try desktop_icons.Service.init(allocator, io);
+        self.apps = try desktop_entries.Service.init(allocator, io);
         errdefer {
-            self.icons.?.deinit();
-            self.icons = null;
+            self.apps.?.deinit();
+            self.apps = null;
         }
         try runtime.setSurfaceHooks(self.graphics.?.surfaceHooks());
         self.context = .{
@@ -80,7 +80,7 @@ pub const Bridge = struct {
             .runtime = runtime,
             .roles = undefined,
             .graphics = self.graphics.?,
-            .icons = self.icons.?,
+            .apps = self.apps.?,
             .spawner = spawner,
             .source_revisions = try allocator.alloc(u64, self.status.?.sourceCount()),
         };
@@ -99,12 +99,12 @@ pub const Bridge = struct {
     pub fn setWake(self: *Bridge, wake: river_presenter_runtime.Wake) void {
         if (self.graphics) |graphics| graphics.setWake(wake);
         if (self.status) |status| status.setWake(.{ .context = wake.context, .run = wake.run });
-        if (self.icons) |icons| icons.setWake(.{ .context = wake.context, .run = wake.run });
+        if (self.apps) |apps| apps.setWake(.{ .context = wake.context, .run = wake.run });
     }
 
     pub fn clearWake(self: *Bridge) void {
         if (self.status) |status| status.clearWake();
-        if (self.icons) |icons| icons.clearWake();
+        if (self.apps) |apps| apps.clearWake();
         if (self.graphics) |graphics| graphics.clearWake();
     }
 
@@ -147,7 +147,7 @@ pub const Bridge = struct {
         for (self.input_seats.items) |seat| seat.deinit();
         self.input_seats.deinit(self.allocator);
         if (self.status) |status| status.deinit();
-        if (self.icons) |icons| icons.deinit();
+        if (self.apps) |apps| apps.deinit();
         if (self.graphics) |graphics| {
             self.context.deinit();
             try graphics.deinit();
@@ -161,8 +161,8 @@ pub const Bridge = struct {
         self.input_seats.deinit(self.allocator);
         if (self.status) |status| status.deinit();
         self.status = null;
-        if (self.icons) |icons| icons.deinit();
-        self.icons = null;
+        if (self.apps) |apps| apps.deinit();
+        self.apps = null;
         if (self.graphics) |graphics| {
             self.context.deinit();
             graphics.abandon();
@@ -304,7 +304,7 @@ pub const Context = struct {
     runtime: *river_host_runtime.Runtime,
     roles: *river_role_lifecycle.Runtime,
     graphics: *river_presenter_runtime.Runtime,
-    icons: *desktop_icons.Service,
+    apps: *desktop_entries.Service,
     spawner: ?Spawner,
     frame_ms: f64 = 0,
     /// The shell surface on each output, by output id.
@@ -323,7 +323,7 @@ pub const Context = struct {
         manage_revision: u64,
         epoch: u64,
         metadata: u64,
-        icons: u64,
+        apps: u64,
         focused_output: ?wm.OutputId,
     };
 
@@ -383,7 +383,7 @@ pub const Context = struct {
             .manage_revision = self.runtime.adapter.revision,
             .epoch = world.epoch(),
             .metadata = self.runtime.adapter.objects.metadata_revision,
-            .icons = self.icons.resolvedCount(),
+            .apps = self.apps.resolvedCount(),
             .focused_output = world.focusedOutput(),
         };
     }
@@ -404,7 +404,8 @@ pub const Context = struct {
     ///   tags     per tag: { occupied, active }
     ///   focused  whether this output has keyboard focus
     ///   items    the layout's projection, in order: { kind, label, detail,
-    ///            focused, overlay, window, app_id, title, icon, action, args }
+    ///            focused, overlay, window, app_id, name (the application's, from
+    ///            its desktop entry), title, icon, action, args }
     fn sendDesktop(self: *Context, output_id: host.types.OutputId, shell_id: host.types.ShellSurfaceId) !void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -428,12 +429,12 @@ pub const Context = struct {
         for (projected, items) |*item, *destination| {
             var app_id: []const u8 = "";
             var title: []const u8 = "";
-            var icon: []const u8 = "";
+            var app: desktop_entries.AppInfo = .{};
             if (item.window) |window| if (self.runtime.adapter.objects.wm_to_window.get(window)) |live_window| {
                 const record = try self.runtime.adapter.objects.windowRecord(live_window);
                 app_id = try arena.dupe(u8, record.app_id);
                 title = try arena.dupe(u8, record.title);
-                icon = try arena.dupe(u8, try self.icons.pathFor(record.app_id, record.pid));
+                app = try self.apps.lookup(arena, record.app_id, record.pid);
             };
             const args = try arena.alloc(Value, item.arg_count);
             for (item.args[0..item.arg_count], args) |*arg, *value| value.* = .{ .string = try arena.dupe(u8, arg.slice()) };
@@ -445,8 +446,9 @@ pub const Context = struct {
                 .{ .key = "overlay", .value = .{ .boolean = item.overlay } },
                 .{ .key = "window", .value = if (item.window) |window| .{ .number = @floatFromInt(window.raw()) } else .nil },
                 .{ .key = "app_id", .value = .{ .string = app_id } },
+                .{ .key = "name", .value = .{ .string = app.name } },
                 .{ .key = "title", .value = .{ .string = title } },
-                .{ .key = "icon", .value = .{ .string = icon } },
+                .{ .key = "icon", .value = .{ .string = app.icon } },
                 .{ .key = "action", .value = .{ .string = try arena.dupe(u8, item.action.slice()) } },
                 .{ .key = "args", .value = .{ .array = args } },
             }) };
@@ -487,16 +489,20 @@ pub const Context = struct {
         try self.graphics.requestFrame(.{ .shell = shell_id }, self.frame_ms);
     }
 
-    /// The `decoration` service: `{ title, app_id, focused }`.
+    /// The `decoration` service: `{ title, app_id, name, focused }`.
     pub fn updateDecorationServices(raw: ?*anyopaque, window_id: host.types.WindowId, decoration_id: host.types.DecorationId) !void {
         const self: *Context = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         const record = try self.runtime.adapter.objects.windowRecord(window_id);
         const wm_window = record.wm_id orelse return;
         const world = self.runtime.adapter.worldView();
         _ = world.getWindow(wm_window) orelse return error.UnknownWindow;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const app = try self.apps.lookup(arena.allocator(), record.app_id, record.pid);
         const fields = [_]Value.Field{
             .{ .key = "title", .value = .{ .string = record.title } },
             .{ .key = "app_id", .value = .{ .string = record.app_id } },
+            .{ .key = "name", .value = .{ .string = app.name } },
             .{ .key = "focused", .value = .{ .boolean = world.focusedWindow() == wm_window } },
         };
         const values = [_]Value{.{ .object = &fields }};

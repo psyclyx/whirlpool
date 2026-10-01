@@ -355,7 +355,9 @@ return function(root, options)
       entry.marker:set("visible", is_marker == true)
       if is_window then
         entry.icon:set("icon_source", item.icon)
-        entry.app:set("text", item.app_id ~= "" and item.app_id or "window")
+        -- The application's own name (its desktop entry's), else its id.
+        local name = (item.name or "") ~= "" and item.name or item.app_id
+        entry.app:set("text", name ~= "" and name or "window")
         entry.app:set("text_color", item.focused and theme.bright or theme.text)
         entry.title:set("text", item.title)
         entry.title:set("text_color", item.focused and theme.text or theme.muted)
