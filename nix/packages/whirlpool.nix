@@ -47,15 +47,12 @@ stdenv.mkDerivation (finalAttrs: {
   postInstall = ''
     wrapProgram $out/bin/whirlpool \
       --set-default WHIRLPOOL_CONFIG "$out/share/whirlpool/config/whirlpool.lua" \
-      --set LUA_PATH "$out/share/whirlpool/lua/?.lua;$out/share/whirlpool/lua/?/init.lua;$out/share/whirlpool/lua/?/?.lua;;" \
       --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath [ lua5_4 ]}"
     install -Dm755 scripts/compositor-free-smoke.sh $out/bin/whirlpool-compositor-free-smoke
     install -Dm755 scripts/nested-river-smoke.sh $out/bin/whirlpool-nested-river-smoke
     install -Dm644 scripts/smoke-common.sh $out/share/whirlpool/scripts/smoke-common.sh
     install -Dm644 scripts/smoke-common.sh $out/bin/smoke-common.sh
     install -Dm644 docs/operational-smoke.md $out/share/doc/whirlpool/operational-smoke.md
-    mkdir -p $out/share/whirlpool
-    cp -r config $out/share/whirlpool/config
   '';
 
   deps = callPackage ../../build.zig.zon.nix { };

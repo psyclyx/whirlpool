@@ -151,9 +151,6 @@ pub const Program = struct {
     limits: Limits,
     entry_name: []u8,
     modules: []OwnedModule,
-    /// Modules found after `modules`, borrowed: many programs (a decoration per
-    /// window) share one configuration's sources, which outlive them.
-    shared: []const Module = &.{},
 
     const OwnedModule = struct {
         name: [:0]u8,
@@ -291,19 +288,6 @@ pub const Loader = struct {
         };
         program.assertValid();
         std.debug.assert(std.mem.eql(u8, program.entryName(), entry_name));
-        return program;
-    }
-
-    /// Like `load`, with `shared` modules available to `require` as well. They
-    /// are borrowed and must outlive the program.
-    pub fn loadShared(
-        self: Loader,
-        entry_name: []const u8,
-        modules: []const Module,
-        shared: []const Module,
-    ) Error!Program {
-        var program = try self.load(entry_name, modules);
-        program.shared = shared;
         return program;
     }
 };

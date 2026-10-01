@@ -19,6 +19,13 @@ local registry = {
   layout = nil,
 }
 
+-- The all-in-one program table this replaced.
+function whirlpool.program()
+  error("whirlpool.program{...} is gone: register pieces instead with whirlpool.bind, "
+    .. "whirlpool.layout, whirlpool.surface and whirlpool.source (see the example "
+    .. "configuration, share/whirlpool/config/whirlpool.lua)", 2)
+end
+
 -- Actions ------------------------------------------------------------------
 
 -- An action the host performs. `whirlpool.spawn` and friends cover the

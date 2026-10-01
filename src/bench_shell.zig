@@ -10,9 +10,7 @@ const viewport_height = 600;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
-    var example_modules = try script.modules.collect(allocator, init.io, "config");
-    defer example_modules.deinit();
-    var shell = try host.surface_composition.Composition.initModule(allocator, example_modules.modules, "lib.bar", "{}");
+    var shell = try host.surface_composition.Composition.initModule(allocator, script.modules.source_tree_path, "lib.bar", "{}");
     defer shell.deinit();
     try populate(&shell);
 

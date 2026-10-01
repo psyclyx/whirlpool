@@ -28,11 +28,10 @@ whirlpool_bin=${WHIRLPOOL_BIN:-$smoke_root/zig-out/bin/whirlpool}
 [ -x "$whirlpool_bin" ] || die "Whirlpool executable not found: $whirlpool_bin"
 config=${WHIRLPOOL_CONFIG:-$smoke_root/config/whirlpool.lua}
 log_file=${WHIRLPOOL_NESTED_LOG:-${TMPDIR:-/tmp}/whirlpool-river-smoke-$$.log}
-lua_path="$smoke_root/lua/?.lua;$smoke_root/lua/?/init.lua;$smoke_root/lua/?/?.lua;;"
 
 log "starting nested River with Whirlpool as its init (log=$log_file)"
 set +e
-WLR_BACKENDS=wayland WLR_LIBINPUT_NO_DEVICES=1 LUA_PATH="$lua_path" \
+WLR_BACKENDS=wayland WLR_LIBINPUT_NO_DEVICES=1 \
 	timeout "${WHIRLPOOL_CLIENT_TIMEOUT:-5}s" river -c \
 	"exec $whirlpool_bin river --config \"$config\"" >"$log_file" 2>&1
 status=$?

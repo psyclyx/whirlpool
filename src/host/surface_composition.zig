@@ -16,11 +16,11 @@ pub const Composition = struct {
     retained: lua_composition.Composition,
 
     /// `source` mounts the surface (see `script.config.SurfaceSpec.content`);
-    /// it may `require` any of `modules`, which are borrowed for the
-    /// composition's lifetime.
-    pub fn init(allocator: std.mem.Allocator, modules: []const script.modules.Module, source: []const u8) !Composition {
+    /// it `require`s modules on `module_path` (a `package.path`).
+    pub fn init(allocator: std.mem.Allocator, module_path: []const u8, source: []const u8) !Composition {
         var vm = try script.program_loader.Vm.init(true);
         errdefer vm.deinit();
+        try script.modules.install(&vm, module_path);
         // Surface programs are policy callbacks, not data providers: no file,
         // process or environment access, so they cannot block a render worker.
         // Data comes from host services. Reading the clock is not I/O, so `os`
@@ -32,7 +32,7 @@ pub const Composition = struct {
         , "=whirlpool.sandbox");
 
         const loader = script.program_loader.Loader.init(allocator, .{});
-        var program = try loader.loadShared("surface", &.{.{ .name = "surface", .source = source }}, modules);
+        var program = try loader.load("surface", &.{.{ .name = "surface", .source = source }});
         errdefer program.deinit();
 
         const retained = try lua_composition.Composition.mount(allocator, &vm, &program, .{});
@@ -41,10 +41,10 @@ pub const Composition = struct {
 
     /// Mount content module `name` exactly as a configured surface would,
     /// with options given as a Lua literal (e.g. "{}").
-    pub fn initModule(allocator: std.mem.Allocator, modules: []const script.modules.Module, name: []const u8, options: []const u8) !Composition {
+    pub fn initModule(allocator: std.mem.Allocator, module_path: []const u8, name: []const u8, options: []const u8) !Composition {
         const entry = try script.config.surfaceEntry(allocator, name, options);
         defer allocator.free(entry);
-        return init(allocator, modules, entry);
+        return init(allocator, module_path, entry);
     }
 
     pub fn deinit(self: *Composition) void {
@@ -88,7 +88,7 @@ pub const Composition = struct {
 };
 
 test "surface composition mounts retained Lua source" {
-    var composition = try Composition.init(std.testing.allocator, testModules(),
+    var composition = try Composition.init(std.testing.allocator, script.modules.source_tree_path,
         \\return function(root)
         \\  local label = root:text({ text = 'surface' })
         \\  return { update = function() label:set('text', 'updated') end }
@@ -102,7 +102,7 @@ test "surface composition mounts retained Lua source" {
 }
 
 test "surface composition cannot perform file or process I/O" {
-    var composition = try Composition.init(std.testing.allocator, testModules(),
+    var composition = try Composition.init(std.testing.allocator, script.modules.source_tree_path,
         \\assert(io == nil)
         \\assert(os.execute == nil and os.getenv == nil and os.remove == nil)
         \\assert(type(os.date("%H")) == "string")
@@ -115,7 +115,7 @@ test "surface composition cannot perform file or process I/O" {
 }
 
 test "surface controllers can retain nodes created during later updates" {
-    var composition = try Composition.init(std.testing.allocator, testModules(),
+    var composition = try Composition.init(std.testing.allocator, script.modules.source_tree_path,
         \\return function(root)
         \\  local child
         \\  return { update = function()
@@ -150,7 +150,7 @@ const BarTest = struct {
 
     fn init(self: *BarTest) !void {
         self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        self.shell = try Composition.initModule(std.testing.allocator, testModules(), "lib.bar", "{}");
+        self.shell = try Composition.initModule(std.testing.allocator, script.modules.source_tree_path, "lib.bar", "{}");
         self.shell.setViewport(.{ .width = bar_width, .height = bar_height });
     }
 
@@ -333,7 +333,7 @@ test "network readouts are rates computed from cumulative counters" {
 }
 
 test "window titles show on decorations, brighter when focused" {
-    var decoration = try Composition.initModule(std.testing.allocator, testModules(), "lib.decorator", "{}");
+    var decoration = try Composition.initModule(std.testing.allocator, script.modules.source_tree_path, "lib.decorator", "{}");
     defer decoration.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -344,13 +344,4 @@ test "window titles show on decorations, brighter when focused" {
     var frame = try decoration.lower(.{ .width = 300, .height = 28 });
     defer frame.deinit();
     try std.testing.expect(findText(&frame, "notes.txt") != null);
-}
-
-/// The example configuration's modules, shared by every test here (and so
-/// allocated once, outside the leak-checked testing allocator).
-var test_modules_cache: ?script.modules.Set = null;
-fn testModules() []const script.modules.Module {
-    if (test_modules_cache == null)
-        test_modules_cache = script.modules.collect(std.heap.page_allocator, std.testing.io, "config") catch @panic("example configuration modules");
-    return test_modules_cache.?.modules;
 }

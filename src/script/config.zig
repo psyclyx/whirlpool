@@ -34,8 +34,9 @@ pub const SurfaceSpec = struct {
     edge: []u8,
     height: u32 = 0,
     exclusive_zone: u32 = 0,
-    /// The modules `content` may require; borrowed from the owning `Config`.
-    modules: []const modules.Module = &.{},
+    /// Where `content` finds modules (a `package.path`); borrowed from the
+    /// owning `Config`.
+    module_path: []const u8 = "",
 
     pub fn deinit(self: *SurfaceSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
@@ -75,7 +76,8 @@ pub const Config = struct {
     sources: []SourceSpec,
     /// Lua source producing the layout controller.
     layout_source: []u8,
-    modules: modules.Set,
+    /// Where every Lua state finds modules (a `package.path`).
+    module_path: []u8,
 
     pub fn deinit(self: *Config) void {
         for (self.bindings) |*binding| binding.deinit(self.allocator);
@@ -85,7 +87,7 @@ pub const Config = struct {
         for (self.sources) |*source| source.deinit(self.allocator);
         self.allocator.free(self.sources);
         self.allocator.free(self.layout_source);
-        self.modules.deinit();
+        self.allocator.free(self.module_path);
         self.* = undefined;
     }
 
@@ -109,6 +111,7 @@ pub const Error = std.mem.Allocator.Error || lua_vm.Error || binding_config.Erro
     TooManySurfaces,
     InvalidContent,
     InvalidSources,
+    MissingStandardLibrary,
 };
 
 pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!Config {
@@ -119,17 +122,24 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Error!Co
         };
     };
     defer allocator.free(source);
-    var set = try modules.collect(allocator, io, std.fs.path.dirname(path) orelse ".");
-    errdefer set.deinit();
-    return loadSource(allocator, source, set);
+    const module_path = try modules.defaultSearchPath(allocator, io, path);
+    errdefer allocator.free(module_path);
+    return loadSource(allocator, source, module_path);
 }
 
-/// Run a configuration's source with `set` as its modules. Takes ownership of
-/// `set` on success.
-pub fn loadSource(allocator: std.mem.Allocator, source: []const u8, set: modules.Set) Error!Config {
+/// Run a configuration's source, finding modules on `module_path`. Takes
+/// ownership of `module_path` (allocated with `allocator`) on success.
+pub fn loadSource(allocator: std.mem.Allocator, source: []const u8, module_path: []u8) Error!Config {
     var vm = try lua_vm.Vm.init(true);
     defer vm.deinit();
-    try modules.install(&vm, set.modules);
+    try modules.install(&vm, module_path);
+    // A configuration is usually itself `whirlpool.lua`; if the standard
+    // library were missing, `require("whirlpool")` would find it instead.
+    vm.run(
+        \\local found = package.searchpath("whirlpool", package.path)
+        \\assert(found and found:match("whirlpool[/\\]init%.lua$"),
+        \\  "the whirlpool standard library is not on the module path: " .. package.path)
+    , "=whirlpool.stdlib") catch return error.MissingStandardLibrary;
     try vm.run(source, "=whirlpool.config");
     try vm.evalValue("return require('whirlpool')._build()", "=whirlpool.build");
     defer vm.setTop(0);
@@ -146,7 +156,7 @@ pub fn loadSource(allocator: std.mem.Allocator, source: []const u8, set: modules
         for (surfaces) |*surface| surface.deinit(allocator);
         allocator.free(surfaces);
     }
-    for (surfaces) |*surface| surface.modules = set.modules;
+    for (surfaces) |*surface| surface.module_path = module_path;
     vm.setTop(1);
 
     vm.getField(-1, "sources");
@@ -166,7 +176,7 @@ pub fn loadSource(allocator: std.mem.Allocator, source: []const u8, set: modules
         .surfaces = surfaces,
         .sources = sources,
         .layout_source = layout_source,
-        .modules = set,
+        .module_path = module_path,
     };
 }
 
@@ -368,7 +378,7 @@ test "registrations are keyed: a later one replaces an earlier one, nil removes 
         \\wp.surface("old", { provider = "layer-shell", role = "shell", placement = "default-output",
         \\  content = "lib.old" })
         \\wp.surface("old", nil)
-    , try modules.Set.standard(allocator));
+    , try allocator.dupe(u8, modules.source_tree_path));
     defer config.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), config.bindings.len);
@@ -381,11 +391,9 @@ test "registrations are keyed: a later one replaces an earlier one, nil removes 
 }
 
 test "options must be plain data" {
-    var set = try modules.Set.standard(std.testing.allocator);
-    defer set.deinit();
     var vm = try lua_vm.Vm.init(true);
     defer vm.deinit();
-    try modules.install(&vm, set.modules);
+    try modules.install(&vm, modules.source_tree_path);
     try std.testing.expectEqual(@as(i64, 1), try vm.evalInteger(
         \\local wp = require("whirlpool")
         \\local ok = pcall(wp.serialize, { callback = print })
@@ -395,7 +403,9 @@ test "options must be plain data" {
 }
 
 test "the example configuration loads" {
-    var config = try load(std.testing.allocator, std.testing.io, "config/whirlpool.lua");
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "config/whirlpool.lua", std.testing.allocator, .limited(MaxConfigBytes));
+    defer std.testing.allocator.free(source);
+    var config = try loadSource(std.testing.allocator, source, try std.testing.allocator.dupe(u8, modules.source_tree_path));
     defer config.deinit();
     try std.testing.expect(config.bindings.len > 50);
     try std.testing.expect(config.surface("river", "shell") != null);

@@ -36,12 +36,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{.{ .name = "whirlpool-wm", .module = wm }},
     });
-    const lua_stdlib = b.addModule("whirlpool-lua-stdlib", .{
-        .root_source_file = b.path("lua/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    script.addImport("whirlpool-lua-stdlib", lua_stdlib);
     const host = b.addModule("whirlpool-host", .{
         .root_source_file = b.path("src/host/root.zig"),
         .target = target,
@@ -51,7 +45,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "whirlpool-ui", .module = ui },
             .{ .name = "whirlpool-graphics", .module = graphics },
             .{ .name = "whirlpool-script", .module = script },
-            .{ .name = "whirlpool-lua-stdlib", .module = lua_stdlib },
         },
     });
     const scanner = Scanner.create(b, .{});
@@ -396,6 +389,11 @@ pub fn build(b: *std.Build) void {
         .install_dir = .prefix,
         .install_subdir = "share/whirlpool/lua",
         .exclude_extensions = &.{"zig"},
+    });
+    b.installDirectory(.{
+        .source_dir = b.path("config"),
+        .install_dir = .prefix,
+        .install_subdir = "share/whirlpool/config",
     });
 
     const run = b.addRunArtifact(exe);

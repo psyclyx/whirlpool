@@ -76,7 +76,7 @@ pub const Services = struct {
         if (config_path) |path| {
             self.config = try script.config.load(allocator, io, path);
             const config = &self.config.?;
-            self.layout = try river_layout.Runtime.initWithModules(allocator, config.modules.modules, config.layout_source, .{});
+            self.layout = try river_layout.Runtime.initWithPath(allocator, config.module_path, config.layout_source, .{});
             self.keybindings = try river_keybindings.Runtime.init(allocator, client, config);
             std.log.info("Loaded Whirlpool config: {s} ({d} bindings)", .{ path, config.bindings.len });
         }

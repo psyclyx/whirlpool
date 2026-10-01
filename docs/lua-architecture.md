@@ -81,7 +81,7 @@ Three layers of Lua meet here, and they are kept apart:
   engine (rows, columns, stacks, flex, alignment, measured text, hidden nodes),
   node geometry queries (`node:bounds()`), pointer events, surface actions,
   and measurement sources.
-- The standard library (`lua/whirlpool`, embedded in the binary) is what any
+- The standard library (`lua/whirlpool`, installed as ordinary files) is what any
   configuration would otherwise rewrite, with no opinion about appearance:
   the registration API, `whirlpool.surface` (service handlers by name, and
   `act` for host actions), `whirlpool.series` (rates and windows over
@@ -91,8 +91,16 @@ Three layers of Lua meet here, and they are kept apart:
 - The configuration composes them. The example's `config/lib` holds its
   opinions (the angled panels, plots, theme, bar, title bars, the scrolling
   layout, mark bindings) and `config/whirlpool.lua` is a short leaf that
-  registers them. Modules beside the configuration are named by path
-  (`lib/bar.lua` is `lib.bar`) and are available to every Lua state.
+  registers them.
+
+Whirlpool loads one file, the configuration; everything else is an ordinary
+Lua module loaded with `require`. Every Lua state (configuration, layout, each
+surface) has the same `package.path`: the standard library
+(`<prefix>/share/whirlpool/lua`) first, so a configuration named
+`whirlpool.lua` cannot shadow it; then the configuration's directory
+(`lib/bar.lua` beside it is `lib.bar`); then the installed example library
+(`<prefix>/share/whirlpool/config`), which a configuration may build on.
+Nothing is read until it is required.
 
 Layouts and surfaces run in their own Lua states, so a configuration names
 them by module and passes options as plain data.

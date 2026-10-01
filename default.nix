@@ -60,9 +60,7 @@ in
         /*) ;;
         *) config="$PWD/$config" ;;
       esac
-      lua_path="${basePackages.whirlpool}/share/whirlpool/lua/?.lua;${basePackages.whirlpool}/share/whirlpool/lua/?/init.lua;${basePackages.whirlpool}/share/whirlpool/lua/?/?.lua;;"
       export WHIRLPOOL_CONFIG="$config"
-      export LUA_PATH="$lua_path"
       # Keep configured spawns self-contained when this launcher is built from
       # Nix; in particular Alt+d must resolve Fuzzel in the nested session.
       export PATH="${finalPkgs.fuzzel}/bin:$PATH"

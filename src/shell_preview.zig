@@ -39,17 +39,15 @@ const scenarios = [_]Scenario{
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
-    var example_modules = try script.modules.collect(allocator, init.io, "config");
-    defer example_modules.deinit();
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next();
     const directory = args.next() orelse return error.MissingOutputDirectory;
     try std.Io.Dir.cwd().createDirPath(init.io, directory);
-    if (args.next()) |flag| if (std.mem.eql(u8, flag, "--live")) return renderLive(allocator, init.io, example_modules.modules, directory);
+    if (args.next()) |flag| if (std.mem.eql(u8, flag, "--live")) return renderLive(allocator, init.io, script.modules.source_tree_path, directory);
 
     for (scenarios) |scenario| {
-        var shell = try host.surface_composition.Composition.initModule(allocator, example_modules.modules, "lib.bar", "{}");
+        var shell = try host.surface_composition.Composition.initModule(allocator, script.modules.source_tree_path, "lib.bar", "{}");
         defer shell.deinit();
         var renderer = try graphics.skia.Renderer.init(true);
         defer renderer.deinit();
@@ -62,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Render the bar from this machine's real measurement sources.
-fn renderLive(allocator: std.mem.Allocator, io: std.Io, modules: []const script.modules.Module, directory: []const u8) !void {
+fn renderLive(allocator: std.mem.Allocator, io: std.Io, module_path: []const u8, directory: []const u8) !void {
     const origin = std.Io.Clock.awake.now(io);
     const specs = [_]status.Spec{
         .{ .name = "cpu", .kind = .cpu, .every_ms = 500, .keep_ms = 16_000 },
@@ -76,7 +74,7 @@ fn renderLive(allocator: std.mem.Allocator, io: std.Io, modules: []const script.
     defer service.deinit();
     try std.Io.sleep(io, .fromSeconds(6), .awake);
 
-    var shell = try host.surface_composition.Composition.initModule(allocator, modules, "lib.bar", "{}");
+    var shell = try host.surface_composition.Composition.initModule(allocator, module_path, "lib.bar", "{}");
     defer shell.deinit();
     var renderer = try graphics.skia.Renderer.init(true);
     defer renderer.deinit();

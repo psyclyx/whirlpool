@@ -116,10 +116,12 @@ pub fn Execution(comptime Program: type) type {
             for (self.program.modules) |module| {
                 if (std.mem.eql(u8, module.name, requested_name)) return self.runModule(module.name, module.source);
             }
-            for (self.program.shared) |module| {
-                if (std.mem.eql(u8, module.name, requested_name)) return self.runModule(module.name, module.source);
-            }
-            return self.raise("module not found");
+            // Anything else is an ordinary Lua module, found on `package.path`.
+            const state = self.api.state;
+            _ = self.api.get_global(state, "require");
+            _ = self.api.push_lstring(state, requested_name.ptr, requested_name.len);
+            if (self.api.protectedCall(self.vm, 1, 1) != 0) return self.api.lua_error(state);
+            return 1;
         }
 
         fn runModule(self: *Bridge, name: []const u8, source: []const u8) c_int {

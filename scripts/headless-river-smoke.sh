@@ -20,7 +20,6 @@ if [ "${1:-}" = "--inner" ]; then
 	export WHIRLPOOL_CONFIG="$config"
 	# Keep the nested session's saved state away from the real session's.
 	export WHIRLPOOL_STATE_PREFIX="$shots/state"
-	export LUA_PATH="$smoke_root/lua/?.lua;$smoke_root/lua/?/init.lua;$smoke_root/lua/?/?.lua;;"
 	"$whirlpool_bin" river --config "$config" >"$shots/whirlpool.log" 2>&1 &
 	whirlpool_pid=$!
 	sleep 2
