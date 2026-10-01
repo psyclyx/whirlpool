@@ -48,8 +48,8 @@ local defaults = {
     scale = { floor = 1024 * 1024, percentile = 0.8, headroom = 1.25, peak_range = 20, curve = "sqrt" },
     -- The usual range ramps from the panel colour to `fill`; peaks continue
     -- from `fill` to `peak`.
-    rx = { fill = theme.blend(theme.green, 150), peak = theme.green },
-    tx = { fill = theme.blend(theme.cyan, 150), peak = theme.cyan },
+    rx = { fill = theme.green, peak = theme.light.green },
+    tx = { fill = theme.cyan, peak = theme.light.cyan },
   },
   disks = { max = 5 },
 }
@@ -76,13 +76,6 @@ local DIM = with_alpha(theme.text, 0.62)
 
 local function clamp01(value)
   return math.min(1, math.max(0, value))
-end
-
-local function lighten(color, amount)
-  return {
-    color[1] + (1 - color[1]) * amount, color[2] + (1 - color[2]) * amount,
-    color[3] + (1 - color[3]) * amount, color[4] or 1,
-  }
 end
 
 -- A column of text lines centred vertically: { text, size, color, width }.
@@ -247,7 +240,8 @@ return function(root, options)
     local active = index == tag_state.active
     local hovered = pointer:hovering(tag.panel.frame)
     local fill = active and (tag_state.focused and theme.accent or theme.overlay) or CLEAR
-    if hovered then fill = active and lighten(fill, 0.2) or theme.blend(theme.surface, 160) end
+    -- Hovered: the light accent (or the next surface step) of the same role.
+    if hovered then fill = active and (tag_state.focused and theme.light.blue or theme.muted) or theme.overlay end
     tag.panel:set_fill(fill)
     tag.label:set("text_color", active and (tag_state.focused and theme.bg or theme.bright) or theme.text)
   end
@@ -307,7 +301,7 @@ return function(root, options)
     if not item or item.kind ~= "window" then return end
     local hovered = pointer:hovering(view_item.panel.frame)
     local fill = item.focused and theme.blend(theme.accent, 112) or theme.blend(theme.surface, 96)
-    if hovered then fill = lighten(fill, 0.12) end
+    if hovered then fill = item.focused and theme.blend(theme.accent, 150) or theme.overlay end
     view_item.panel:set_fill(fill)
   end
 

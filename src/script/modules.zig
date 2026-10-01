@@ -29,17 +29,34 @@ pub fn searchPath(allocator: std.mem.Allocator, roots: []const []const u8) Error
 
 /// The search path for the configuration at `config_path`, given the prefix
 /// this executable is installed in: `<prefix>/share/whirlpool/lua`, the
-/// configuration's directory, then `<prefix>/share/whirlpool/config`.
+/// configuration's directory, the directories in `WHIRLPOOL_MODULES` (a
+/// colon-separated list, for modules generated outside the configuration,
+/// such as a home-manager theme), then `<prefix>/share/whirlpool/config`.
 pub fn defaultSearchPath(allocator: std.mem.Allocator, io: std.Io, config_path: []const u8) Error![]u8 {
     const config_dir = std.fs.path.dirname(config_path) orelse ".";
-    const executable_dir = std.process.executableDirPathAlloc(io, allocator) catch
-        return searchPath(allocator, &.{config_dir});
+    var roots = std.ArrayList([]const u8).empty;
+    defer roots.deinit(allocator);
+    const injected: []const u8 = if (std.c.getenv("WHIRLPOOL_MODULES")) |value| std.mem.span(value) else "";
+    const executable_dir = std.process.executableDirPathAlloc(io, allocator) catch {
+        try roots.append(allocator, config_dir);
+        try appendRoots(allocator, &roots, injected);
+        return searchPath(allocator, roots.items);
+    };
     defer allocator.free(executable_dir);
     const library = try std.fs.path.join(allocator, &.{ executable_dir, "..", "share", "whirlpool", "lua" });
     defer allocator.free(library);
     const examples = try std.fs.path.join(allocator, &.{ executable_dir, "..", "share", "whirlpool", "config" });
     defer allocator.free(examples);
-    return searchPath(allocator, &.{ library, config_dir, examples });
+    try roots.appendSlice(allocator, &.{ library, config_dir });
+    try appendRoots(allocator, &roots, injected);
+    try roots.append(allocator, examples);
+    return searchPath(allocator, roots.items);
+}
+
+/// The non-empty entries of a colon-separated directory list.
+fn appendRoots(allocator: std.mem.Allocator, roots: *std.ArrayList([]const u8), list: []const u8) Error!void {
+    var entries = std.mem.tokenizeScalar(u8, list, ':');
+    while (entries.next()) |entry| try roots.append(allocator, entry);
 }
 
 /// Set a Lua state's `require` to search `search_path` and nothing else (no

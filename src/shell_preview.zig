@@ -42,15 +42,23 @@ const scenarios = [_]Scenario{
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
+    // The source tree, plus any `WHIRLPOOL_MODULES` directories (a `stylix`
+    // module there colours the bar as home-manager would).
+    var module_path = std.ArrayList(u8).empty;
+    try module_path.appendSlice(allocator, script.modules.source_tree_path);
+    if (init.minimal.environ.getAlloc(allocator, "WHIRLPOOL_MODULES") catch null) |extra| {
+        var roots = std.mem.tokenizeScalar(u8, extra, ':');
+        while (roots.next()) |root| try module_path.print(allocator, ";{s}/?.lua", .{root});
+    }
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next();
     const directory = args.next() orelse return error.MissingOutputDirectory;
     try std.Io.Dir.cwd().createDirPath(init.io, directory);
-    if (args.next()) |flag| if (std.mem.eql(u8, flag, "--live")) return renderLive(allocator, init.io, script.modules.source_tree_path, directory);
+    if (args.next()) |flag| if (std.mem.eql(u8, flag, "--live")) return renderLive(allocator, init.io, module_path.items, directory);
 
     for (scenarios) |scenario| {
-        var shell = try host.surface_composition.Composition.initModule(allocator, script.modules.source_tree_path, "lib.bar", "{}");
+        var shell = try host.surface_composition.Composition.initModule(allocator, module_path.items, "lib.bar", "{}");
         defer shell.deinit();
         var renderer = try graphics.skia.Renderer.init(true);
         defer renderer.deinit();
