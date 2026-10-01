@@ -18,6 +18,7 @@ extern fn whirlpool_skia_draw_polygon(renderer: *Native, points: [*]const f32, p
 extern fn whirlpool_skia_draw_text(renderer: *Native, text: [*]const u8, length: usize, x: f32, y: f32, size: f32, r: f32, g: f32, b: f32, a: f32, anchor: c_int, middle: c_int) void;
 extern fn whirlpool_skia_draw_icon(renderer: *Native, source: [*]const u8, length: usize, x: f32, y: f32, width: f32, height: f32, opacity: f32) void;
 extern fn whirlpool_skia_push_clip(renderer: *Native, x: f32, y: f32, width: f32, height: f32) void;
+extern fn whirlpool_skia_push_clip_polygon(renderer: *Native, points: [*]const f32, point_count: usize) void;
 extern fn whirlpool_skia_pop_clip(renderer: *Native) void;
 extern fn whirlpool_skia_end(renderer: *Native, row_bytes: *usize) ?[*]const u8;
 extern fn whirlpool_skia_begin_vulkan(renderer: *Native, width: u32, height: u32, image: *anyopaque, memory: *anyopaque, memory_size: u64, format: u32, layout: u32, queue_family: u32) c_int;
@@ -107,6 +108,7 @@ pub const Renderer = struct {
             .text => |item| self.drawTextItem(item),
             .icon => |item| self.drawIcon(item.source, item.rect, item.opacity),
             .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
+            .push_clip_polygon => |polygon| whirlpool_skia_push_clip_polygon(self.native, @ptrCast(&polygon.points[0]), polygon.len),
             .pop_clip => whirlpool_skia_pop_clip(self.native),
         };
     }
@@ -174,6 +176,7 @@ pub const GpuRenderer = struct {
             .text => |item| drawTextNative(self.native, item),
             .icon => |item| whirlpool_skia_draw_icon(self.native, item.source.ptr, item.source.len, item.rect.x, item.rect.y, item.rect.width, item.rect.height, item.opacity),
             .push_clip => |rect| whirlpool_skia_push_clip(self.native, rect.x, rect.y, rect.width, rect.height),
+            .push_clip_polygon => |polygon| whirlpool_skia_push_clip_polygon(self.native, @ptrCast(&polygon.points[0]), polygon.len),
             .pop_clip => whirlpool_skia_pop_clip(self.native),
         };
     }
@@ -225,6 +228,8 @@ pub const DrawList = struct {
 
 pub const DrawOp = union(enum) {
     push_clip: Rect,
+    /// Clip to a polygon until the matching `pop_clip`.
+    push_clip_polygon: Polygon,
     pop_clip,
     rect: struct {
         rect: Rect,

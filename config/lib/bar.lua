@@ -251,8 +251,11 @@ return function(root)
   ---------------------------------------------------------------------------
   -- Windows: the layout's list for this output's tag, scrolled to keep the
   -- focused window in view; the wheel scrolls it by hand until focus moves.
-  local list_area = bar:stack({ flex = 1, height = HEIGHT, clip = true })
-  local viewport = list_area:row({ clip = true })
+  -- Items sliding past either end are cut along the same diagonal as the
+  -- panels beside the list, and fade out in slanted slices.
+  local list_area = bar:stack({ flex = 1, height = HEIGHT })
+  Angled.clip(list_area, HEIGHT)
+  local viewport = list_area:row({})
   local strip = viewport:row({ height = HEIGHT, gap = 4, align = "center" })
   local view = Scroll.new(viewport, strip)
   local fades = list_area:row({ height = HEIGHT })
@@ -260,7 +263,8 @@ return function(root)
     local edge = fades:row({ width = 24, height = HEIGHT, opacity = 0 })
     for step = 1, 8 do
       local alpha = reversed and step / 8 or (9 - step) / 8
-      edge:shape({ width = 3, fill = with_alpha(theme.bg, alpha) })
+      -- Slanted slices tile without overlapping, so no alpha doubles up.
+      edge:stack({ width = 3 }):polygon({ fill = with_alpha(theme.bg, alpha), points = Angled.points(HEIGHT, nil, 0) })
     end
     return edge
   end
@@ -389,7 +393,7 @@ return function(root)
   -- CPU: history in busy cores on a logarithmic scale, so one saturated core
   -- on a many-core machine is still visible; the hottest cores as a heat
   -- field (one bright cell is single-thread load, a lit field is parallel).
-  local cpu_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.yellow), gap = 4, pad = 2 })
+  local cpu_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.yellow), gap = 4, pad = 2, flush = true })
   local cpu_canvas = Angled.canvas(cpu_panel.row, { width = 96, height = HEIGHT })
   local cpu_plot = Graph.new(cpu_canvas, {
     span = PLOT_SPAN_MS, delay = PLOT_DELAY_MS, style = "area", fill = theme.blend(theme.yellow, 220),
@@ -437,7 +441,7 @@ return function(root)
 
   -- Network: receive (top) and send (bottom) as heat strips on a shared,
   -- smoothly adapting square-root scale, with steady readouts.
-  local net_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.cyan), gap = 4, pad = 2 })
+  local net_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.cyan), gap = 4, pad = 2, flush = true })
   local net_canvas = Angled.canvas(net_panel.row, { width = 96, height = HEIGHT })
   local net_base = theme.blend(theme.cyan)
   local rx_plot = Graph.new(net_canvas, {
@@ -481,7 +485,7 @@ return function(root)
   end
 
   -- Audio: a level meter and a speaker; changes also show the OSD.
-  local audio_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.purple), gap = 2, pad = 2 })
+  local audio_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.purple), gap = 2, pad = 2, flush = true })
   local audio_meter_canvas = Angled.canvas(audio_panel.row, { width = 8, height = HEIGHT })
   local audio_meter = meter(audio_meter_canvas, 0, 8, theme.purple)
   local speaker_canvas = Angled.canvas(audio_panel.row, { width = 22, height = HEIGHT })
@@ -521,7 +525,7 @@ return function(root)
 
   -- Memory: what programs hold, the ZFS ARC, and page cache, out of the
   -- total; swap beside it once there is any.
-  local memory_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.green), gap = 4, pad = 2 })
+  local memory_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.green), gap = 4, pad = 2, flush = true })
   local memory_meters = Angled.canvas(memory_panel.row, { width = 14, height = HEIGHT })
   local memory_meter = meter(memory_meters, 0, 8, theme.green, 3)
   local swap_meter = meter(memory_meters, 10, 3, theme.orange)
@@ -612,7 +616,7 @@ return function(root)
   end
 
   -- Battery, when there is one; plots also slow down while discharging.
-  local battery_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.red), gap = 4, pad = 2 })
+  local battery_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.red), gap = 4, pad = 2, flush = true })
   local battery_meter_canvas = Angled.canvas(battery_panel.row, { width = 8, height = HEIGHT })
   local battery_meter = meter(battery_meter_canvas, 0, 8, theme.red)
   local battery_glyph_canvas = Angled.canvas(battery_panel.row, { width = 16, height = HEIGHT })

@@ -83,21 +83,20 @@ const Lowerer = struct {
         const y = dy + p.offset_y;
         const box = ui.Box{ .x = node.layout.x + x, .y = node.layout.y + y, .width = node.layout.width, .height = node.layout.height };
 
-        if (p.clip) try self.emit(.{ .push_clip = toRect(box) });
+        if (p.clip) try self.emit(if (p.clip_shape.len >= 3)
+            .{ .push_clip_polygon = place(p.clip_shape, box) }
+        else
+            .{ .push_clip = toRect(box) });
         switch (node.kind) {
             .shape => if (box.width > 0 and box.height > 0) try self.emit(.{ .rect = .{
                 .rect = toRect(box),
                 .radius = p.radius,
                 .color = colorWithOpacity(p.fill, opacity),
             } }),
-            .polygon => if (box.width > 0 and box.height > 0 and p.points.len >= 3) {
-                var polygon = graphics.skia.Polygon{ .len = p.points.len };
-                for (p.points.slice(), 0..) |point, index| polygon.points[index] = .{
-                    .x = box.x + point.x * box.width + point.dx,
-                    .y = box.y + point.y * box.height + point.dy,
-                };
-                try self.emit(.{ .polygon = .{ .points = polygon, .color = colorWithOpacity(p.fill, opacity) } });
-            },
+            .polygon => if (box.width > 0 and box.height > 0 and p.points.len >= 3) try self.emit(.{ .polygon = .{
+                .points = place(p.points, box),
+                .color = colorWithOpacity(p.fill, opacity),
+            } }),
             .text => if (p.text.len != 0) try self.text(handle, box, opacity),
             .icon => if (p.icon_source.len != 0 and box.width > 0 and box.height > 0) try self.emit(.{ .icon = .{
                 .source = p.icon_source,
@@ -188,6 +187,16 @@ pub fn lower(allocator: Allocator, scene: *ui.Scene, viewport: Viewport, text_me
     return .{ .allocator = allocator, .arena = arena, .ops = try ops.toOwnedSlice(allocator) };
 }
 
+/// Box-relative points (fractions plus pixel offsets) on the surface.
+fn place(points: ui.Polygon, box: ui.Box) graphics.skia.Polygon {
+    var polygon = graphics.skia.Polygon{ .len = points.len };
+    for (points.slice(), 0..) |point, index| polygon.points[index] = .{
+        .x = box.x + point.x * box.width + point.dx,
+        .y = box.y + point.y * box.height + point.dy,
+    };
+    return polygon;
+}
+
 fn toRect(box: ui.Box) graphics.skia.Rect {
     return .{ .x = box.x, .y = box.y, .width = box.width, .height = box.height };
 }
@@ -267,6 +276,26 @@ test "offsets and clips move and bound a subtree; invisible nodes are skipped" {
     try testing.expectEqual(graphics.skia.Rect{ .x = 0, .y = 0, .width = 50, .height = 20 }, list.ops[0].push_clip);
     try testing.expectEqual(@as(f32, -20), list.ops[1].rect.rect.x);
     try testing.expect(list.ops[2] == .pop_clip);
+}
+
+test "a clip shape cuts content along its edges instead of the box" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var shape = ui.Polygon{ .len = 4 };
+    shape.points[0] = .{ .x = 0, .y = 0, .dx = 6 };
+    shape.points[1] = .{ .x = 1, .y = 0, .dx = 6 };
+    shape.points[2] = .{ .x = 1, .y = 1 };
+    shape.points[3] = .{ .x = 0, .y = 1 };
+    const list = try f.add(.row, null, &.{ .{ .width = 50 }, .{ .clip = true }, .{ .clip_shape = shape } });
+    _ = try f.add(.shape, list, &.{ .{ .width = 80 }, .{ .fill = red } });
+    var lowered = try f.lowered(100, 20);
+    defer lowered.deinit();
+    const clip = lowered.ops[0].push_clip_polygon;
+    try testing.expectEqual(@as(u8, 4), clip.len);
+    try testing.expectEqual(graphics.skia.Point{ .x = 56, .y = 0 }, clip.points[1]);
+    try testing.expectEqual(graphics.skia.Point{ .x = 50, .y = 20 }, clip.points[2]);
+    try testing.expect(lowered.ops[2] == .pop_clip);
 }
 
 test "text wider than its box is cut with an ellipsis when asked" {

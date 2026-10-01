@@ -39,6 +39,8 @@ Panel.__index = Panel
 --   pad      padding inside each end (beyond what clears the slant)
 --   top      the highest row content reaches (default height / 6), which sets
 --            how far in content starts
+--   flush    the panel opens with a canvas, whose drawings already lean along
+--            the slanted edge: start it at the edge, without the inset text needs
 -- `panel.row` takes the content.
 function Angled.panel(parent, spec)
   local height = spec.height
@@ -49,9 +51,9 @@ function Angled.panel(parent, spec)
   })
   local top = spec.top or math.floor(height / 6)
   local pad = spec.pad or 0
+  local left = spec.flush and 0 or math.ceil(Angled.edge(height, top, spec.slant)) + pad
   local row = frame:row({
-    height = height, gap = spec.gap or 0, align = "center",
-    padding = { 0, pad, 0, math.ceil(Angled.edge(height, top, spec.slant)) + pad },
+    height = height, gap = spec.gap or 0, align = "center", padding = { 0, pad, 0, left },
   })
   return setmetatable({ frame = frame, background = background, row = row, height = height }, Panel)
 end
@@ -62,6 +64,14 @@ end
 
 function Panel:set_visible(visible)
   self.frame:set("visible", visible)
+end
+
+-- Confine what `node` draws to the panels' parallelogram over its box, so
+-- content sliding past its ends is cut along the same diagonals as the panels
+-- beside it rather than square.
+function Angled.clip(node, height, slant)
+  node:set("clip", true)
+  node:set("clip_shape", Angled.points(height, slant, 0))
 end
 
 local Canvas = {}

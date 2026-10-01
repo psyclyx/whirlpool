@@ -18,7 +18,7 @@ Graph.__index = Graph
 
 -- Retained polygons have at most 16 vertices; long outlines are drawn as
 -- chunks sharing an edge.
-local MAX_POINTS = 14
+local MAX_POINTS = 13
 local MAX_CHUNKS = 6
 local SHADES = 32
 
@@ -172,7 +172,11 @@ function Graph:draw_area(now, level)
     for index = range[1], range[2] do
       points[#points + 1] = { curve[index][1], self:row(curve[index][2]) }
     end
-    points[#points + 1] = { curve[range[2]][1], baseline }
+    -- Run a pixel under the next chunk (drawn later, same opaque fill) so
+    -- their shared edge is not antialiased twice into a visible seam.
+    local last = curve[range[2]]
+    if chunk < #ranges then points[#points + 1] = { last[1] + 1, self:row(last[2]) } end
+    points[#points + 1] = { last[1] + (chunk < #ranges and 1 or 0), baseline }
     self.canvas:set_polygon(self.pool[chunk], points)
     self:show(chunk, true)
   end

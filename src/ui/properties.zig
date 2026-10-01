@@ -102,6 +102,9 @@ fn Fields(comptime Bytes: type) type {
         offset_y: f32 = 0,
         opacity: f32 = 1,
         clip: bool = false,
+        /// With `clip`, the region drawing is confined to: these points (as for
+        /// a polygon) when there are any, else the node's box.
+        clip_shape: Polygon = .{},
         fill: Color = Color.transparent,
         radius: f32 = 0,
         points: Polygon = .{},
@@ -137,6 +140,7 @@ pub const Value = union(enum) {
     offset_y: f32,
     opacity: f32,
     clip: bool,
+    clip_shape: Polygon,
     fill: Color,
     radius: f32,
     points: Polygon,
@@ -176,7 +180,7 @@ pub fn metadata(value: Value) Metadata {
     return switch (value) {
         .visible, .width, .height, .min_width, .max_width, .min_height, .max_height => .{ .supported_by = .every_node, .dirty = layout_and_paint },
         .gap, .padding, .flex, .shrink, .@"align", .justify => .{ .supported_by = .every_node, .dirty = layout_and_paint },
-        .offset_x, .offset_y, .opacity, .clip => .{ .supported_by = .every_node, .dirty = paint },
+        .offset_x, .offset_y, .opacity, .clip, .clip_shape => .{ .supported_by = .every_node, .dirty = paint },
         .fill => .{ .supported_by = .paint, .dirty = paint },
         .radius => .{ .supported_by = .shape, .dirty = paint },
         .points => .{ .supported_by = .polygon, .dirty = paint },
@@ -202,8 +206,9 @@ pub fn validate(kind: NodeKind, value: Value) Error!void {
         .fill, .text_color => |color| if (!validColor(color)) return error.InvalidValue,
         .radius => |radius| if (!std.math.isFinite(radius) or radius < 0) return error.InvalidValue,
         .offset_x, .offset_y => |offset| if (!std.math.isFinite(offset)) return error.InvalidValue,
-        .points => |polygon| {
-            if (polygon.len < 3 or polygon.len > max_polygon_points) return error.InvalidValue;
+        .points, .clip_shape => |polygon| {
+            if (polygon.len > max_polygon_points) return error.InvalidValue;
+            if (polygon.len < 3 and !(value == .clip_shape and polygon.len == 0)) return error.InvalidValue;
             for (polygon.slice()) |point| {
                 if (!validCoordinate(point.x) or !validCoordinate(point.y) or !validCoordinate(point.dx) or !validCoordinate(point.dy)) return error.InvalidValue;
             }
@@ -280,7 +285,7 @@ pub const Owned = struct {
 pub fn matches(current: anytype, value: Value) bool {
     return switch (value) {
         inline .text, .icon_source => |item, tag| std.mem.eql(u8, @field(current, @tagName(tag)), item),
-        .points => |item| samePoints(current.points, item),
+        inline .points, .clip_shape => |item, tag| samePoints(@field(current, @tagName(tag)), item),
         inline else => |item, tag| std.meta.eql(@field(current, @tagName(tag)), item),
     };
 }

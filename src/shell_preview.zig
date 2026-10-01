@@ -28,6 +28,8 @@ const Scenario = struct {
     /// Idle, then a gigabit-class burst, with a stepped CPU trace: makes the
     /// plots' geometry (shear, clipping, scale) easy to judge.
     spiky: bool = false,
+    /// More windows than fit: the list is cut and faded at both ends.
+    crowded: bool = false,
 };
 
 const scenarios = [_]Scenario{
@@ -35,6 +37,7 @@ const scenarios = [_]Scenario{
     .{ .name = "unfocused-monitor", .monitor_focused = false },
     .{ .name = "muted-no-battery", .muted = true, .battery = false, .swap = false },
     .{ .name = "spiky", .spiky = true },
+    .{ .name = "crowded", .crowded = true },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -52,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
         var renderer = try graphics.skia.Renderer.init(true);
         defer renderer.deinit();
         shell.setTextMetrics(renderer.textMetrics());
+        shell.setViewport(.{ .width = width, .height = height });
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         try populate(&shell, arena.allocator(), scenario);
@@ -79,6 +83,7 @@ fn renderLive(allocator: std.mem.Allocator, io: std.Io, module_path: []const u8,
     var renderer = try graphics.skia.Renderer.init(true);
     defer renderer.deinit();
     shell.setTextMetrics(renderer.textMetrics());
+    shell.setViewport(.{ .width = width, .height = height });
     for (0..service.sourceCount()) |index| {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -134,7 +139,7 @@ fn writePpm(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, nam
 /// Feed one scenario's desktop and measurements, as a host would.
 pub fn populate(shell: *host.surface_composition.Composition, arena: std.mem.Allocator, scenario: Scenario) !void {
     const b = Builder{ .arena = arena };
-    try shell.update(.{ .service = "desktop", .values = &.{desktop(b, scenario.monitor_focused)} });
+    try shell.update(.{ .service = "desktop", .values = &.{desktop(b, scenario)} });
 
     const count = 32;
     const every = 500.0;
@@ -217,13 +222,14 @@ pub fn populate(shell: *host.surface_composition.Composition, arena: std.mem.All
         .{ "charging", b.numbers(&.{0}) },
         .{ "on_ac", b.numbers(&.{1}) },
     })} });
-    // Two frames: the first starts the clocks, the second lets readouts and
-    // the network scale settle.
-    try frame(shell, now_ms);
-    try frame(shell, now_ms + 1500);
+    // Frames over a second and a half: readouts, the network scale and the
+    // window list's scrolling settle.
+    for (0..31) |step| try frame(shell, now_ms + 50 * @as(f64, @floatFromInt(step)));
 }
 
-fn desktop(b: Builder, focused: bool) Value {
+fn desktop(b: Builder, scenario: Scenario) Value {
+    const focused = scenario.monitor_focused;
+    if (scenario.crowded) return crowded(b);
     const occupied = [_]bool{ true, true, false, true, false, false, false, false, false };
     var tags: [9]Value = undefined;
     for (&tags, occupied, 0..) |*tag, busy, index| tag.* = b.object(.{ .{ "occupied", busy }, .{ "active", index == 1 } });
@@ -275,4 +281,15 @@ pub fn marker(b: Builder, kind: []const u8, label: []const u8, focused: bool) Va
         .{ "action", "" },
         .{ "args", b.array(&.{}) },
     });
+}
+
+/// Fourteen windows with the middle one focused: wider than the list, so it
+/// scrolls and both ends are cut.
+fn crowded(b: Builder) Value {
+    const names = [_][]const u8{ "foot", "firefox", "nvim", "mpv", "thunar", "slack", "signal", "zathura", "gimp", "ghostty", "htop", "obs", "steam", "kitty" };
+    var items: [names.len]Value = undefined;
+    for (&items, names, 0..) |*item, name, index| item.* = window(b, @intCast(index + 1), name, "~/snail", index == 7);
+    var tags: [9]Value = undefined;
+    for (&tags, 0..) |*tag, index| tag.* = b.object(.{ .{ "occupied", index < 3 }, .{ "active", index == 0 } });
+    return b.object(.{ .{ "tag", 1 }, .{ "focused", true }, .{ "tags", b.array(&tags) }, .{ "items", b.array(&items) } });
 }

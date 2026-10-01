@@ -453,10 +453,13 @@ extern "C" void whirlpool_skia_draw_rect(WhirlpoolSkia *renderer,
         renderer->canvas->drawRect(rect, paint);
 }
 
+// Polygons and polygon clips carry at most this many vertices (the retained
+// UI's limit).
+constexpr size_t kMaxPolygonPoints = 16;
+
 extern "C" void whirlpool_skia_draw_polygon(WhirlpoolSkia *renderer,
                                                const float *points, size_t point_count,
                                                float r, float g, float b, float a) {
-    constexpr size_t kMaxPolygonPoints = 16;
     if (!renderer || !renderer->canvas || !points ||
         point_count < 3 || point_count > kMaxPolygonPoints) return;
     SkPoint vertices[kMaxPolygonPoints];
@@ -665,6 +668,19 @@ extern "C" void whirlpool_skia_push_clip(WhirlpoolSkia *renderer,
     if (!renderer || !renderer->canvas) return;
     renderer->canvas->save();
     renderer->canvas->clipRect(SkRect::MakeXYWH(x, y, std::max(0.0f, width), std::max(0.0f, height)));
+}
+
+// Like whirlpool_skia_push_clip, but to a polygon (antialiased), so content
+// can be cut along a slanted edge.
+extern "C" void whirlpool_skia_push_clip_polygon(WhirlpoolSkia *renderer,
+                                                   const float *points, size_t point_count) {
+    if (!renderer || !renderer->canvas || !points) return;
+    renderer->canvas->save();
+    if (point_count < 3 || point_count > kMaxPolygonPoints) return;
+    SkPoint vertices[kMaxPolygonPoints];
+    for (size_t index = 0; index < point_count; ++index)
+        vertices[index] = SkPoint::Make(points[index * 2], points[index * 2 + 1]);
+    renderer->canvas->clipPath(SkPath::Polygon(SkSpan<const SkPoint>(vertices, point_count), true), true);
 }
 
 extern "C" void whirlpool_skia_pop_clip(WhirlpoolSkia *renderer) {

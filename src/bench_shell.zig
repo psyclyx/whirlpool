@@ -100,7 +100,7 @@ fn measureDraw(io: std.Io, renderer: *graphics.skia.Renderer, list: graphics.ski
             .polygon => |polygon| if (mode == .geometry) renderer.drawPolygon(polygon.points, polygon.color),
             .text => |item| if (mode == .text) renderer.drawTextItem(item),
             .icon => |item| if (mode == .icon) renderer.drawIcon(item.source, item.rect, item.opacity),
-            .push_clip, .pop_clip => {},
+            .push_clip, .push_clip_polygon, .pop_clip => {},
         };
         const pixels = try renderer.end();
         const end = std.Io.Clock.awake.now(io);
