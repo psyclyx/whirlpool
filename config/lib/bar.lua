@@ -18,36 +18,54 @@ local theme = require("lib.theme")
 local Angled = require("lib.angled")
 local Graph = require("lib.graph")
 
-local HEIGHT = 38
+local Scale = require("whirlpool.scale")
+
 local CLEAR = { 0, 0, 0, 0 }
--- How much history the plots show, and how far behind the newest sample they
--- run (about one sample period, so new data slides in from the right edge).
-local PLOT_SPAN_MS = 12000
-local PLOT_DELAY_MS = 500
--- Plots and meters redraw on a shared tick: often on mains power, rarely on
--- battery. Scrolling and the OSD follow every frame.
-local TICK_AC_MS = 33
-local TICK_BATTERY_MS = 125
--- The network scale fits typical traffic, not the peaks: it is set so that
--- NETWORK_SCALE_PERCENTILE of the visible samples (with some headroom) fall in
--- the normal colour ramp. Anything above continues on a brighter ramp, at
--- full brightness NETWORK_PEAK_RANGE times above the scale, so a burst stands
--- out instead of washing the rest of the chart out. The scale rises within
--- about a second and falls slowly, so the chart does not breathe.
-local NETWORK_SCALE_FLOOR = 1024 * 1024
-local NETWORK_SCALE_PERCENTILE = 0.8
-local NETWORK_SCALE_HEADROOM = 1.25
-local NETWORK_PEAK_RANGE = 20
-local NETWORK_SCALE_ATTACK_MS = 1000
-local NETWORK_SCALE_DECAY_MS = 2500
--- Readouts average over longer than the plots, so they are steady enough to read.
-local READOUT_WINDOW_MS = 4000
-local PLOT_WINDOW_MS = 1000
-local OSD_MS = 1500
-local CPU_CORE_CELLS = 16
-local MAX_DISKS = 5
--- The window list keeps at least this much room; status detail gives way.
-local MIN_LIST_WIDTH = 320
+
+-- What the bar does unless the configuration says otherwise: pass any subset
+-- as the surface's `options` (nested tables merge; colours are { r, g, b, a }).
+local defaults = {
+  -- Must match the surface's registered height.
+  height = 38,
+  -- How much history plots show, and how far behind the newest sample they
+  -- run (about one sample period, so new data slides in from the right edge).
+  plot = { span = 12000, delay = 500 },
+  -- Plots and meters redraw on a shared tick, in milliseconds: often on mains
+  -- power, rarely on battery. Scrolling and the OSD follow every frame.
+  tick = { ac = 33, battery = 125 },
+  -- Rate readouts average over this long, so they are steady enough to read.
+  readout_window = 4000,
+  -- How long the volume OSD stays after a change.
+  osd = 1500,
+  -- The window list keeps at least this much room; status detail gives way.
+  min_list_width = 320,
+  cpu = { cores = 16 },
+  network = {
+    -- Each plotted sample is the rate over this many milliseconds.
+    rate_window = 1000,
+    -- The colour scale (see whirlpool.scale): it fits typical traffic, and
+    -- bursts above it climb a second ramp to the peak colour.
+    scale = { floor = 1024 * 1024, percentile = 0.8, headroom = 1.25, peak_range = 20, curve = "sqrt" },
+    -- The usual range ramps from the panel colour to `fill`; peaks continue
+    -- from `fill` to `peak`.
+    rx = { fill = theme.blend(theme.green, 150), peak = theme.green },
+    tx = { fill = theme.blend(theme.cyan, 150), peak = theme.cyan },
+  },
+  disks = { max = 5 },
+}
+
+-- `defaults` with `options` laid over it. Arrays (lists, colours) are values,
+-- not merged element by element.
+local function merge(base, options)
+  if type(base) ~= "table" or type(options) ~= "table" or base[1] ~= nil or options[1] ~= nil then
+    if options == nil then return base end
+    return options
+  end
+  local result = {}
+  for key, value in pairs(base) do result[key] = value end
+  for key, value in pairs(options) do result[key] = merge(base[key], value) end
+  return result
+end
 
 local function with_alpha(color, alpha)
   return { color[1], color[2], color[3], alpha }
@@ -201,11 +219,13 @@ local function fullness_color(fraction)
   return theme.orange
 end
 
-return function(root)
+return function(root, options)
+  local o = merge(defaults, options)
+  local HEIGHT = o.height
   local pointer = Pointer.new()
   surface.on("pointer", function(event) pointer:handle(event) end)
 
-  local now_ms, tick_ms, drawn_ms = 0, TICK_AC_MS, nil
+  local now_ms, tick_ms, drawn_ms = 0, o.tick.ac, nil
   local redraws = {} -- per-tick drawing, by panel
 
   -- On a full-output River shell the spacer pins the bar to the bottom; on a
@@ -403,12 +423,12 @@ return function(root)
   local cpu_panel = Angled.panel(status, { height = HEIGHT, fill = theme.blend(theme.yellow), gap = 4, pad = 2, flush = true })
   local cpu_canvas = Angled.canvas(cpu_panel.row, { width = 96, height = HEIGHT })
   local cpu_plot = Graph.new(cpu_canvas, {
-    span = PLOT_SPAN_MS, delay = PLOT_DELAY_MS, style = "area", fill = theme.blend(theme.yellow, 220),
+    span = o.plot.span, delay = o.plot.delay, style = "area", fill = theme.blend(theme.yellow, 220),
   })
   local cores_canvas = Angled.canvas(cpu_panel.row, { width = 40, height = HEIGHT })
   local cores_optional = optional_node(cores_canvas.node)
   local cores = {}
-  for index = 1, CPU_CORE_CELLS do
+  for index = 1, o.cpu.cores do
     local column, row = (index - 1) % 8, (index - 1) // 8
     cores[index] = {
       node = cores_canvas:polygon({ fill = theme.yellow, points = Angled.rectangle(column * 5, 10 + row * 10, 3, 8) }),
@@ -452,47 +472,34 @@ return function(root)
   local net_canvas = Angled.canvas(net_panel.row, { width = 96, height = HEIGHT })
   local net_base = theme.blend(theme.cyan)
   local rx_plot = Graph.new(net_canvas, {
-    span = PLOT_SPAN_MS, delay = PLOT_DELAY_MS, style = "heat", region = { 0, HEIGHT / 2 },
-    fill = theme.blend(theme.green, 220), base = net_base, hot = lighten(theme.green, 0.8),
+    span = o.plot.span, delay = o.plot.delay, style = "heat", region = { 0, HEIGHT / 2 },
+    fill = o.network.rx.fill, base = net_base, hot = o.network.rx.peak,
   })
   local tx_plot = Graph.new(net_canvas, {
-    span = PLOT_SPAN_MS, delay = PLOT_DELAY_MS, style = "heat", region = { HEIGHT / 2, HEIGHT },
-    fill = theme.blend(theme.cyan, 220), base = net_base, hot = lighten(theme.cyan, 0.8),
+    span = o.plot.span, delay = o.plot.delay, style = "heat", region = { HEIGHT / 2, HEIGHT },
+    fill = o.network.tx.fill, base = net_base, hot = o.network.tx.peak,
   })
   local net_column = net_panel.row:column({ gap = 1, justify = "center" })
   local rx_readout = readout(net_column, { label = "↓", size = 12, color = theme.green, number_width = 26, unit_width = 34, parts = format.bit_rate_parts })
   local tx_readout = readout(net_column, { label = "↑", size = 12, color = theme.cyan, number_width = 26, unit_width = 34, parts = format.bit_rate_parts })
-  local network = { rx = {}, tx = {}, t = {}, scale = NETWORK_SCALE_FLOOR }
+  local network = { rx = {}, tx = {}, t = {} }
+  local network_scale = Scale.new(o.network.scale)
+  local function network_level(value) return network_scale:level(value) end
 
   surface.on("network", function(net)
     network.t = net.t
-    network.rx = series.rates(net.t, net.rx, PLOT_WINDOW_MS)
-    network.tx = series.rates(net.t, net.tx, PLOT_WINDOW_MS)
+    network.rx = series.rates(net.t, net.rx, o.network.rate_window)
+    network.tx = series.rates(net.t, net.tx, o.network.rate_window)
     rx_plot:set(net.t, network.rx)
     tx_plot:set(net.t, network.tx)
-    network.rx_now = series.rate(net.t, net.rx, READOUT_WINDOW_MS)
-    network.tx_now = series.rate(net.t, net.tx, READOUT_WINDOW_MS)
+    network.rx_now = series.rate(net.t, net.rx, o.readout_window)
+    network.tx_now = series.rate(net.t, net.tx, o.readout_window)
   end)
 
   redraws.network = function(now, elapsed)
-    local since = now - PLOT_SPAN_MS - PLOT_DELAY_MS
-    local typical = series.percentile(NETWORK_SCALE_PERCENTILE, network.t, since, network.rx, network.tx)
-    local target = math.max(NETWORK_SCALE_FLOOR, typical * NETWORK_SCALE_HEADROOM)
-    local current, wanted = math.log(network.scale), math.log(target)
-    local tau = wanted > current and NETWORK_SCALE_ATTACK_MS or NETWORK_SCALE_DECAY_MS
-    network.scale = math.exp(current + (wanted - current) * (1 - math.exp(-elapsed / tau)))
-    -- The scale moves in 2.5% steps, so a quiet chart is not redrawn.
-    local step = math.floor(math.log(network.scale) * 40)
-    local scale = math.exp(step / 40)
-    -- 0..1: square root of the share of the scale (quiet traffic stays
-    -- visible); 1..2: a peak's height above the scale, logarithmically.
-    local function level(value)
-      local ratio = math.max(0, value) / scale
-      if ratio <= 1 then return math.sqrt(ratio) end
-      return 1 + math.min(1, math.log(ratio) / math.log(NETWORK_PEAK_RANGE))
-    end
-    rx_plot:draw(now, level, step)
-    tx_plot:draw(now, level, step)
+    network_scale:update(elapsed, network.t, now - o.plot.span - o.plot.delay, network.rx, network.tx)
+    rx_plot:draw(now, network_level, network_scale.version)
+    tx_plot:draw(now, network_level, network_scale.version)
     rx_readout(network.rx_now, now)
     tx_readout(network.tx_now, now)
   end
@@ -528,7 +535,7 @@ return function(root)
     show_speaker(percent, muted, color)
     local key = percent .. (muted and "m" or "")
     if last_audio and key ~= last_audio then
-      osd.until_ms = now_ms + OSD_MS
+      osd.until_ms = now_ms + o.osd
       osd_fill:set("width", math.max(2, math.floor(2.8 * math.min(100, percent))))
       osd_fill:set("fill", color)
       osd_value:set("text", muted and (percent .. "% (muted)") or (percent .. "%"))
@@ -587,7 +594,7 @@ return function(root)
   local drive_canvas = Angled.canvas(disk_panel.row, { width = 16, height = HEIGHT })
   drive(drive_canvas, 1, 12, theme.orange)
   local disks, disk_data = {}, nil
-  for index = 1, MAX_DISKS do
+  for index = 1, o.disks.max do
     local cell = disk_panel.row:row({ gap = 4, visible = false })
     local bar_canvas = Angled.canvas(cell, { width = 6, height = HEIGHT })
     local fill_meter = meter(bar_canvas, 0, 6, theme.orange)
@@ -623,8 +630,8 @@ return function(root)
     for index, chip_view in ipairs(disks) do
       local entry = disk_data.disks[index]
       if entry then
-        chip_view.read(series.rate(disk_data.t, entry.read, READOUT_WINDOW_MS), now)
-        chip_view.write(series.rate(disk_data.t, entry.write, READOUT_WINDOW_MS), now)
+        chip_view.read(series.rate(disk_data.t, entry.read, o.readout_window), now)
+        chip_view.write(series.rate(disk_data.t, entry.write, o.readout_window), now)
       end
     end
   end
@@ -640,7 +647,7 @@ return function(root)
 
   surface.on("battery", function(battery)
     local present = series.last(battery.present, 0) == 1
-    tick_ms = series.last(battery.on_ac, 1) == 0 and TICK_BATTERY_MS or TICK_AC_MS
+    tick_ms = series.last(battery.on_ac, 1) == 0 and o.tick.battery or o.tick.ac
     battery_panel:set_visible(present)
     if not present then return end
     local percent = series.last(battery.percent, 0)
@@ -673,7 +680,7 @@ return function(root)
   end
 
   -- Drop order: the last disks first, then swap, then the core field.
-  for index = MAX_DISKS, 1, -1 do optional[#optional + 1] = disks[index].optional end
+  for index = o.disks.max, 1, -1 do optional[#optional + 1] = disks[index].optional end
   optional[#optional + 1] = swap_optional
   optional[#optional + 1] = cores_optional
 
@@ -682,7 +689,7 @@ return function(root)
   local function fit()
     local list = list_area:bounds()
     if not list then return end
-    if list.width < MIN_LIST_WIDTH then
+    if list.width < o.min_list_width then
       for _, entry in ipairs(optional) do
         if entry.data and not entry.dropped then
           local box = entry.node:bounds()
@@ -696,7 +703,7 @@ return function(root)
       for index = #optional, 1, -1 do
         local entry = optional[index]
         if entry.dropped then
-          if list.width - (entry.width or 0) >= MIN_LIST_WIDTH then
+          if list.width - (entry.width or 0) >= o.min_list_width then
             entry.dropped = false
             entry.apply()
           end

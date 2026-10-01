@@ -27,16 +27,26 @@ wp.source("memory", { every = 2000, keep = 0 })
 wp.source("audio", { every = 500, keep = 0 })
 wp.source("battery", { every = 10000, keep = 0 })
 
+-- The bar's options (see `defaults` in lib/bar.lua for all of them).
+local bar = {
+  height = 38,
+  network = {
+    -- Colour the usual 80% of traffic (with 25% headroom) on the normal ramp;
+    -- bursts climb a second ramp, fully bright at 20x that.
+    scale = { floor = 1024 * 1024, percentile = 0.8, headroom = 1.25, peak_range = 20 },
+  },
+}
+
 wp.surface("bar", {
   provider = "river", role = "shell", placement = "all-outputs",
-  edge = "bottom", height = 38, exclusive_zone = 38,
-  content = "lib.bar",
+  edge = "bottom", height = bar.height, exclusive_zone = bar.height,
+  content = "lib.bar", options = bar,
 })
 -- The same bar as a portable layer-shell panel, for other compositors.
 wp.surface("bar-portable", {
   provider = "layer-shell", role = "shell", placement = "default-output",
-  edge = "bottom", height = 38, exclusive_zone = 38,
-  content = "lib.bar",
+  edge = "bottom", height = bar.height, exclusive_zone = bar.height,
+  content = "lib.bar", options = bar,
 })
 wp.surface("titles", {
   provider = "river", role = "decoration", placement = "windows",
