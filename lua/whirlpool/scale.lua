@@ -19,14 +19,20 @@ local Scale = {}
 Scale.__index = Scale
 
 Scale.defaults = {
-  -- The scale never goes below this (quiet data reads quiet, not magnified).
+  -- The scale never goes below this (quiet data reads quiet, not magnified),
+  -- nor above `ceiling` (so the usual range never stretches to swallow a
+  -- burst: what exceeds it is a peak).
   floor = 1,
+  ceiling = math.huge,
   -- What share of recent samples the usual range should hold.
   percentile = 0.8,
   -- How far above that percentile the usual range reaches.
   headroom = 1.25,
-  -- With a number, levels above 1 continue to 2 as a peak reaches this many
-  -- times the scale (logarithmically); without, levels stop at 1.
+  -- Levels above 1 continue to 2 as a value climbs (logarithmically) from
+  -- the scale to `peak`, an absolute value such as a link's capacity; or,
+  -- with `peak_range` instead, to that many times the scale. With neither,
+  -- levels stop at 1.
+  peak = nil,
   peak_range = nil,
   -- Milliseconds for the scale to move most of the way up / down.
   attack = 1000,
@@ -53,7 +59,7 @@ end
 -- after `since`, `elapsed` milliseconds after the last update.
 function Scale:update(elapsed, t, since, ...)
   local typical = series.percentile(self.percentile, t, since, ...)
-  local target = math.max(self.floor, typical * self.headroom)
+  local target = math.min(self.ceiling, math.max(self.floor, typical * self.headroom))
   local current, wanted = math.log(self.current), math.log(target)
   local tau = wanted > current and self.attack or self.decay
   if elapsed > 0 then
@@ -72,8 +78,9 @@ local curves = {
 function Scale:level(value)
   local ratio = math.max(0, value) / self.value
   if ratio <= 1 then return curves[self.curve](ratio) end
-  if not self.peak_range then return 1 end
-  return 1 + math.min(1, math.log(ratio) / math.log(self.peak_range))
+  local range = self.peak and self.peak / self.value or self.peak_range
+  if not range or range <= 1 then return 1 end
+  return 1 + math.min(1, math.log(ratio) / math.log(range))
 end
 
 return Scale

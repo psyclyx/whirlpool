@@ -37,12 +37,19 @@ function series.rate(t, values, window, index)
   return math.max(0, (values[index] - values[start]) / elapsed * 1000)
 end
 
--- The rate at every sample (each over its own trailing `window`), aligned with
--- `t`; the first sample has nothing before it and reads 0.
+-- The rate at every sample whose trailing `window` the samples cover in
+-- full, as `times, rates`. Earlier samples are left out rather than read as
+-- a rate over less time (the first would read 0), so a chart of them never
+-- shows a dip that is only missing history.
 function series.rates(t, values, window)
-  local result = {}
-  for index = 1, #t do result[index] = series.rate(t, values, window, index) end
-  return result
+  local times, rates = {}, {}
+  for index = 2, #t do
+    if t[index] - window >= t[1] then
+      times[#times + 1] = t[index]
+      rates[#rates + 1] = series.rate(t, values, window, index)
+    end
+  end
+  return times, rates
 end
 
 -- The largest value among samples taken after time `since`.

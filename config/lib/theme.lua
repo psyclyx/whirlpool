@@ -37,6 +37,8 @@ local theme = {
   surface = slot("base01"),
   overlay = slot("base02"),
   muted = slot("base03"),
+  -- Secondary text: base03 is for comments, too faint on a raised surface.
+  subtle = slot("base04"),
   text = slot("base05"),
   bright = slot("base07"),
   red = slot("base08"),
@@ -86,6 +88,21 @@ for _, hue in ipairs(theme.hues) do
   theme.panel[hue] = theme.blend(theme[hue])
   theme.ink[hue] = theme.polarity == "light" and theme[hue] or theme.light[hue] or theme[hue]
 end
+
+-- What the bar and title bars draw with:
+--   bg        the bar itself
+--   raised    panels on it, and title bars: base02, as base01 is barely
+--             apart from base00 in many dark schemes
+--   selected  the focused or hovered panel
+--   text, subtle, bright  primary, secondary and emphasised text on those
+--   data      plots, meters and focus lines: the accent as ink, which reads
+--             on a panel where the plain accent may be too dark
+--   accent    a fill behind bright text (the active tag)
+-- The other hues only signal a state (good, warning, critical), never which
+-- panel something is in.
+theme.raised = theme.overlay
+theme.selected = theme.muted
+theme.data = theme.ink.blue
 
 -- Fonts: Stylix's, else the renderer's default (empty names). `font` is for
 -- labels; `font_mono` for figures, whose digits then keep their places.

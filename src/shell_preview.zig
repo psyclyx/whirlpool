@@ -16,6 +16,18 @@ const Builder = host.values.Builder;
 const width = 2400;
 const height = 38;
 const icon = "/run/current-system/sw/share/icons/hicolor/96x96/apps/corectrl.svg";
+/// Applications with an icon of their own, so runs of one application show.
+const app_icons = [_][2][]const u8{
+    .{ "mpv", "/run/current-system/sw/share/icons/hicolor/scalable/apps/mpv.svg" },
+    .{ "btop", "/run/current-system/sw/share/icons/hicolor/scalable/apps/btop.svg" },
+    .{ "gimp", "/run/current-system/sw/share/icons/hicolor/scalable/apps/gimp.svg" },
+    .{ "kicad", "/run/current-system/sw/share/icons/hicolor/scalable/apps/kicad.svg" },
+};
+
+fn iconFor(app_id: []const u8) []const u8 {
+    for (app_icons) |entry| if (std.mem.eql(u8, entry[0], app_id)) return entry[1];
+    return icon;
+}
 /// The frame clock the scenarios are drawn at.
 const now_ms: f64 = 60_000;
 
@@ -30,6 +42,8 @@ const Scenario = struct {
     spiky: bool = false,
     /// More windows than fit: the list is cut and faded at both ends.
     crowded: bool = false,
+    /// Focus on a group rather than a window.
+    group_focused: bool = false,
 };
 
 const scenarios = [_]Scenario{
@@ -38,6 +52,7 @@ const scenarios = [_]Scenario{
     .{ .name = "muted-no-battery", .muted = true, .battery = false, .swap = false },
     .{ .name = "spiky", .spiky = true },
     .{ .name = "crowded", .crowded = true },
+    .{ .name = "group-focused", .group_focused = true },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -69,7 +84,40 @@ pub fn main(init: std.process.Init) !void {
         try populate(&shell, arena.allocator(), scenario);
         try writeFrame(allocator, init.io, &shell, &renderer, directory, scenario.name);
     }
+    try renderOsd(allocator, init.io, module_path.items, directory);
 }
+
+/// The volume popup: nothing at rest (so its surface would be unmapped),
+/// then shown by a change of volume.
+fn renderOsd(allocator: std.mem.Allocator, io: std.Io, module_path: []const u8, directory: []const u8) !void {
+    const size = Extent{ .width = 320, .height = 120 };
+    var osd = try host.surface_composition.Composition.initModule(allocator, module_path, "lib.osd", "{}");
+    defer osd.deinit();
+    var renderer = try graphics.skia.Renderer.init(true);
+    defer renderer.deinit();
+    osd.setTextMetrics(renderer.textMetrics());
+    osd.setViewport(.{ .width = size.width, .height = size.height });
+    const b = Builder{ .arena = std.heap.page_allocator };
+    const volume = struct {
+        fn reading(builder: Builder, percent: f64) Value {
+            return builder.object(.{
+                .{ "t", builder.numbers(&.{now_ms}) },
+                .{ "percent", builder.numbers(&.{percent}) },
+                .{ "muted", builder.numbers(&.{0}) },
+            });
+        }
+    };
+    try osd.update(.{ .service = "audio", .values = &.{volume.reading(b, 40)} });
+    try frame(&osd, now_ms);
+    var rest = try osd.lower(.{ .width = size.width, .height = size.height });
+    defer rest.deinit();
+    if (rest.drawList().bounds(size.width, size.height) != null) return error.OsdDrawsAtRest;
+    try osd.update(.{ .service = "audio", .values = &.{volume.reading(b, 63)} });
+    try frame(&osd, now_ms + 16);
+    try writeFrameSized(allocator, io, &osd, &renderer, directory, "osd", size);
+}
+
+const Extent = struct { width: u32, height: u32 };
 
 /// Render the bar from this machine's real measurement sources.
 fn renderLive(allocator: std.mem.Allocator, io: std.Io, module_path: []const u8, directory: []const u8) !void {
@@ -77,8 +125,10 @@ fn renderLive(allocator: std.mem.Allocator, io: std.Io, module_path: []const u8,
     const specs = [_]status.Spec{
         .{ .name = "cpu", .kind = .cpu, .every_ms = 500, .keep_ms = 16_000 },
         .{ .name = "network", .kind = .network, .every_ms = 500, .keep_ms = 16_000 },
-        .{ .name = "disks", .kind = .disks, .every_ms = 1000, .keep_ms = 8_000 },
+        .{ .name = "disks", .kind = .disks, .every_ms = 1000, .keep_ms = 16_000 },
         .{ .name = "memory", .kind = .memory, .every_ms = 2000, .keep_ms = 0 },
+        .{ .name = "sensors", .kind = .sensors, .every_ms = 2000, .keep_ms = 0 },
+        .{ .name = "gpu", .kind = .gpu, .every_ms = 1000, .keep_ms = 16_000 },
         .{ .name = "audio", .kind = .audio, .every_ms = 500, .keep_ms = 0 },
         .{ .name = "battery", .kind = .battery, .every_ms = 10_000, .keep_ms = 0 },
     };
@@ -116,11 +166,30 @@ fn writeFrame(
     directory: []const u8,
     name: []const u8,
 ) !void {
-    var lowered = try shell.lower(.{ .width = width, .height = height });
+    return writeFrameSized(allocator, io, shell, renderer, directory, name, .{ .width = width, .height = height });
+}
+
+fn writeFrameSized(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    shell: *host.surface_composition.Composition,
+    renderer: *graphics.skia.Renderer,
+    directory: []const u8,
+    name: []const u8,
+    size: Extent,
+) !void {
+    var lowered = try shell.lower(.{ .width = size.width, .height = size.height });
     defer lowered.deinit();
-    try renderer.begin(width, height, .{ 0, 0, 0, 1 });
+    try renderer.begin(size.width, size.height, .{ 0, 0, 0, 1 });
     renderer.drawList(lowered.drawList());
-    try writePpm(allocator, io, directory, name, try renderer.end());
+    var pixels = try renderer.end();
+    // Icons load in the background; once they have, draw them in.
+    if (renderer.waitForIcons()) {
+        try renderer.begin(size.width, size.height, .{ 0, 0, 0, 1 });
+        renderer.drawList(lowered.drawList());
+        pixels = try renderer.end();
+    }
+    try writePpm(allocator, io, directory, name, pixels);
 }
 
 fn writePpm(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u8, pixels: graphics.skia.Frame) !void {
@@ -172,6 +241,8 @@ pub fn populate(shell: *host.surface_composition.Composition, arena: std.mem.All
         .{ "t", b.numbers(t) },
         .{ "busy", b.numbers(&busy) },
         .{ "percent", b.numbers(&busy) },
+        .{ "mhz", b.numbers(&([_]f64{4213} ** count)) },
+        .{ "mhz_max", b.numbers(&([_]f64{5490} ** count)) },
         .{ "count", 32 },
         .{ "cores", b.numbers(&cores) },
     })} });
@@ -179,7 +250,37 @@ pub fn populate(shell: *host.surface_composition.Composition, arena: std.mem.All
         .{ "t", b.numbers(t) },
         .{ "rx", b.numbers(host.values.counter(arena, &rx, every)) },
         .{ "tx", b.numbers(host.values.counter(arena, &tx, every)) },
-        .{ "interface", "eth0" },
+        .{ "interface", "br0" },
+        .{ "address", "10.0.10.102" },
+        .{ "address6", "2601:602:9202:84d0:4c3b:65ff:fedc:8cf4" },
+        .{ "tunnels", b.array(&.{b.object(.{ .{ "interface", "wg0" }, .{ "address", "10.157.0.3" } })}) },
+    })} });
+    var gpu_busy: [count]f64 = undefined;
+    for (&gpu_busy, 0..) |*value, index| value.* = 20.0 + 30.0 * @abs(@sin(@as(f64, @floatFromInt(index)) * 0.3));
+    try shell.update(.{ .service = "gpu", .values = &.{b.object(.{
+        .{ "t", b.numbers(t) },
+        .{ "busy", b.numbers(&gpu_busy) },
+        .{ "temperature", b.numbers(&([_]f64{61} ** count)) },
+        .{ "memory_used", b.numbers(&([_]f64{2727 * 1024 * 1024} ** count)) },
+        .{ "memory_total", b.numbers(&([_]f64{24576 * 1024 * 1024} ** count)) },
+        .{ "power", b.numbers(&([_]f64{122} ** count)) },
+    })} });
+    // Drives are named as hwmon names them; the pools below are on them.
+    const sensors = [_]struct { []const u8, []const u8, f64 }{
+        .{ "cpu", "cpu", if (scenario.spiky) 91 else 62 },
+        .{ "nvme0", "drive", 47 },
+        .{ "nvme1", "drive", 55 },
+    };
+    var sensor_values: [sensors.len]Value = undefined;
+    for (sensors, &sensor_values) |sensor, *value| value.* = b.object(.{
+        .{ "label", sensor[0] },
+        .{ "kind", sensor[1] },
+        .{ "critical", 0 },
+        .{ "temperature", b.numbers(&.{sensor[2]}) },
+    });
+    try shell.update(.{ .service = "sensors", .values = &.{b.object(.{
+        .{ "t", b.numbers(&.{now_ms}) },
+        .{ "sensors", b.array(&sensor_values) },
     })} });
     try shell.update(.{ .service = "audio", .values = &.{b.object(.{
         .{ "t", b.numbers(&.{now_ms}) },
@@ -200,11 +301,11 @@ pub fn populate(shell: *host.surface_composition.Composition, arena: std.mem.All
         .{ "zswap_compressed", b.numbers(&.{if (scenario.swap) gib else 0}) },
     })} });
     const disk_t = host.values.times(arena, now_ms - 200, 1000, 6);
-    const filesystems = [_]struct { []const u8, f64, f64, f64, f64 }{
-        .{ "rpool", 1660, 1101, 4.2e6, 90e3 },
-        .{ "scratchpool", 450, 24, 0, 0 },
-        .{ "tank", 7373, 4198, 120e6, 3.4e6 },
-        .{ "bulkpool", 21000, 12000, 0, 0 },
+    const filesystems = [_]struct { []const u8, f64, f64, f64, f64, []const u8, []const u8, f64 }{
+        .{ "rpool", 1660, 1101, 4.2e6, 90e3, "nvme1n1p3", "ONLINE", 1 },
+        .{ "scratchpool", 450, 24, 0, 0, "nvme0n1p1", "ONLINE", 0 },
+        .{ "tank", 7373, 4198, 120e6, 3.4e6, "sda1", "ONLINE", 0 },
+        .{ "bulkpool", 21000, 19500, 0, 0, "sdb1", "ONLINE", 0 },
     };
     var disks: [filesystems.len]Value = undefined;
     for (filesystems, &disks) |entry, *disk| {
@@ -217,6 +318,9 @@ pub fn populate(shell: *host.surface_composition.Composition, arena: std.mem.All
             .{ "avail", (entry[1] - entry[2]) * gib },
             .{ "read", b.numbers(host.values.counter(arena, &reads, 1000)) },
             .{ "write", b.numbers(host.values.counter(arena, &writes, 1000)) },
+            .{ "devices", b.array(&.{b.from(entry[5])}) },
+            .{ "state", entry[6] },
+            .{ "data_errors", entry[7] },
         });
     }
     try shell.update(.{ .service = "disks", .values = &.{b.object(.{
@@ -241,13 +345,31 @@ fn desktop(b: Builder, scenario: Scenario) Value {
     const occupied = [_]bool{ true, true, false, true, false, false, false, false, false };
     var tags: [9]Value = undefined;
     for (&tags, occupied, 0..) |*tag, busy, index| tag.* = b.object(.{ .{ "occupied", busy }, .{ "active", index == 1 } });
+    // A row with a lone window, a group holding a run of one application,
+    // and a group with another nested in it; then a second row, and the
+    // floating windows.
     const items = [_]Value{
-        marker(b, "group-open", "h", false),
-        window(b, 11, "foot", "nvim status.lua", true),
-        window(b, 12, "firefox", "Whirlpool documentation — a very long page title indeed", false),
-        marker(b, "insertion", "", false),
-        window(b, 13, "", "", false),
-        marker(b, "group-close", "", false),
+        marker(b, "group-open", "strip:1", "h", false),
+        window(b, 11, "foot", "nvim status.lua", !scenario.group_focused),
+        marker(b, "group-open", "node:1", "v", false),
+        window(b, 12, "kicad", "Whirlpool documentation — a very long page title indeed", false),
+        window(b, 13, "kicad", "pcb layout", false),
+        marker(b, "group-close", "node:1", "", false),
+        marker(b, "group-open", "node:2", "h", scenario.group_focused),
+        window(b, 14, "btop", "btop", false),
+        marker(b, "group-open", "node:3", "t", false),
+        window(b, 15, "mpv", "talk.mkv", false),
+        window(b, 16, "gimp", "", false),
+        marker(b, "group-close", "node:3", "", false),
+        marker(b, "group-close", "node:2", "", false),
+        marker(b, "group-close", "strip:1", "", false),
+        marker(b, "group-open", "strip:2", "h", false),
+        window(b, 17, "mpv", "music", false),
+        window(b, 18, "mpv", "lecture", false),
+        marker(b, "group-close", "strip:2", "", false),
+        marker(b, "group-open", "", "float", false),
+        window(b, 19, "", "", false),
+        marker(b, "group-close", "", "", false),
     };
     return b.object(.{
         .{ "tag", 2 },
@@ -269,14 +391,15 @@ pub fn window(b: Builder, id: u32, app_id: []const u8, title: []const u8, focuse
         .{ "window", id },
         .{ "app_id", app_id },
         .{ "title", title },
-        .{ "icon", icon },
+        .{ "icon", iconFor(app_id) },
         .{ "action", "focus-window" },
         .{ "args", b.array(&.{b.from(b.arena.dupe(u8, id_string) catch unreachable)}) },
     });
 }
 
-pub fn marker(b: Builder, kind: []const u8, label: []const u8, focused: bool) Value {
+pub fn marker(b: Builder, kind: []const u8, key: []const u8, label: []const u8, focused: bool) Value {
     return b.object(.{
+        .{ "key", key },
         .{ "kind", kind },
         .{ "label", label },
         .{ "detail", "" },
