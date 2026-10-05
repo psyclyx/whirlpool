@@ -4,7 +4,9 @@
 //! `ui.properties`), decoded by that property's type, so a property added to
 //! the schema is settable from Lua with no change here. A few aliases remain
 //! for convenience: `name` (text), `size` (font_size), and `color` (fill, or
-//! text_color on text).
+//! text_color on text). `gradient` is a table, `{ slant = 0.3, stops = { { x,
+//! colour }, ... } }`, encoded into the bytes the property holds; nil or no
+//! stops removes it.
 
 const std = @import("std");
 const script = @import("whirlpool-script");
@@ -20,6 +22,13 @@ pub fn apply(composition: anytype, id: lua_program.NodeId, key: []const u8, valu
     const node = composition.scene.get(handle) orelse return error.StaleNode;
 
     const name = resolve(key, node.kind);
+    if (std.mem.eql(u8, name, "gradient")) {
+        var buffer: [ui.properties.Gradient.encodedLength(ui.properties.max_gradient_stops)]u8 = undefined;
+        // The delta copies the bytes before this returns.
+        try composition.delta.set(handle, .{ .gradient = try gradient(value, &buffer) });
+        composition.stats.applied_properties += 1;
+        return;
+    }
     inline for (@typeInfo(ui.PropertyValue).@"union".fields) |field| {
         if (std.mem.eql(u8, name, field.name)) {
             const decoded = try decode(field.type, value);
@@ -55,6 +64,10 @@ fn decode(comptime T: type, value: lua_program.Value) !T {
     };
     if (T == ui.Edges) return edges(value);
     if (T == ui.Color) return color(value);
+    if (T == ?ui.Color) return switch (value) {
+        .nil => null,
+        else => try color(value),
+    };
     if (T == ui.Polygon) return polygon(value);
     if (@typeInfo(T) == .@"enum") return switch (value) {
         .string => |item| std.meta.stringToEnum(T, item) orelse error.InvalidProperty,
@@ -125,6 +138,43 @@ fn polygon(value: lua_program.Value) !ui.Polygon {
         }
     }
     return result;
+}
+
+/// `{ slant = s, stops = { { x, { r, g, b, a } }, ... } }` (stops in
+/// increasing x), encoded into `buffer`; nil, or no stops, is no gradient.
+fn gradient(value: lua_program.Value, buffer: []u8) ![]u8 {
+    const Gradient = ui.properties.Gradient;
+    const fields = switch (value) {
+        .nil => return buffer[0..0],
+        .object => |fields| fields,
+        // An empty Lua table may arrive as an empty array.
+        .array => |items| if (items.len == 0) return buffer[0..0] else return error.InvalidProperty,
+        else => return error.InvalidProperty,
+    };
+    var slant: f32 = 0;
+    var stops_value: lua_program.Value = .nil;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.key, "slant")) {
+            slant = try number(field.value);
+        } else if (std.mem.eql(u8, field.key, "stops")) {
+            stops_value = field.value;
+        } else return error.InvalidProperty;
+    }
+    const items = switch (stops_value) {
+        .nil => return buffer[0..0],
+        .array => |items| items,
+        else => return error.InvalidProperty,
+    };
+    if (items.len > ui.properties.max_gradient_stops) return error.InvalidProperty;
+    var stops: [ui.properties.max_gradient_stops]Gradient.Stop = undefined;
+    for (items, 0..) |item, index| {
+        const pair = array(item, 2) orelse return error.InvalidProperty;
+        if (pair.len != 2) return error.InvalidProperty;
+        stops[index] = .{ .x = try number(pair[0]), .color = try color(pair[1]) };
+    }
+    const bytes = Gradient.encode(buffer, slant, stops[0..items.len]);
+    if (!Gradient.valid(bytes)) return error.InvalidProperty;
+    return bytes;
 }
 
 fn array(value: lua_program.Value, minimum: usize) ?[]const lua_program.Value {

@@ -43,6 +43,84 @@ pub const Polygon = struct {
     }
 };
 
+pub const max_gradient_stops = 64;
+
+/// A polygon's linear gradient, as the bytes a node stores it in (owned like
+/// text, so a node without one carries only an empty slice): little-endian
+/// f32s, `slant` and then `x, r, g, b, a` per stop. A stop's `x` is pixels
+/// from the box's left edge along its bottom edge; colour is a function of
+/// `x - slant * (bottom - y)`, so isolines lean like the angled panels.
+/// Stops are in increasing `x`; colours clamp beyond the first and last.
+pub const Gradient = struct {
+    bytes: []const u8,
+
+    pub const header_bytes = 4;
+    pub const stop_bytes = 20;
+
+    pub const Stop = struct { x: f32, color: Color };
+
+    pub fn encodedLength(stop_count: usize) usize {
+        return if (stop_count == 0) 0 else header_bytes + stop_count * stop_bytes;
+    }
+
+    /// Write the slant (`lean`) and `stops` into `buffer` (at least
+    /// `encodedLength`).
+    pub fn encode(buffer: []u8, lean: f32, stops: []const Stop) []u8 {
+        if (stops.len == 0) return buffer[0..0];
+        writeFloat(buffer[0..4], lean);
+        for (stops, 0..) |item, index| {
+            const at = header_bytes + index * stop_bytes;
+            const values = [5]f32{ item.x, item.color.r, item.color.g, item.color.b, item.color.a };
+            for (values, 0..) |value, offset| writeFloat(buffer[at + offset * 4 ..][0..4], value);
+        }
+        return buffer[0..encodedLength(stops.len)];
+    }
+
+    pub fn len(self: Gradient) usize {
+        if (self.bytes.len < header_bytes) return 0;
+        return (self.bytes.len - header_bytes) / stop_bytes;
+    }
+
+    pub fn slant(self: Gradient) f32 {
+        return readFloat(self.bytes[0..4]);
+    }
+
+    pub fn stop(self: Gradient, index: usize) Stop {
+        const at = header_bytes + index * stop_bytes;
+        return .{ .x = readFloat(self.bytes[at..][0..4]), .color = .{
+            .r = readFloat(self.bytes[at + 4 ..][0..4]),
+            .g = readFloat(self.bytes[at + 8 ..][0..4]),
+            .b = readFloat(self.bytes[at + 12 ..][0..4]),
+            .a = readFloat(self.bytes[at + 16 ..][0..4]),
+        } };
+    }
+
+    /// Whether `bytes` encode a gradient a renderer can draw: empty (none), or
+    /// 1..max stops, finite, in increasing `x`, with valid colours.
+    pub fn valid(bytes: []const u8) bool {
+        if (bytes.len == 0) return true;
+        if (bytes.len < header_bytes + stop_bytes or (bytes.len - header_bytes) % stop_bytes != 0) return false;
+        const gradient = Gradient{ .bytes = bytes };
+        if (gradient.len() > max_gradient_stops) return false;
+        if (!std.math.isFinite(gradient.slant()) or @abs(gradient.slant()) > 16) return false;
+        var previous = -std.math.inf(f32);
+        for (0..gradient.len()) |index| {
+            const item = gradient.stop(index);
+            if (!validCoordinate(item.x) or item.x < previous or !validColor(item.color)) return false;
+            previous = item.x;
+        }
+        return true;
+    }
+
+    fn readFloat(bytes: *const [4]u8) f32 {
+        return @bitCast(std.mem.readInt(u32, bytes, .little));
+    }
+
+    fn writeFloat(bytes: *[4]u8, value: f32) void {
+        std.mem.writeInt(u32, bytes, @bitCast(value), .little);
+    }
+};
+
 pub const TextAlign = enum { start, center, end };
 pub const TextVAlign = enum { top, middle };
 /// Where children sit across a row or column (or within a stack, on both
@@ -106,8 +184,15 @@ fn Fields(comptime Bytes: type) type {
         /// a polygon) when there are any, else the node's box.
         clip_shape: Polygon = .{},
         fill: Color = Color.transparent,
+        /// For a shape: the colour at its centre, `fill` being the colour at
+        /// its corners, with a radial gradient between that follows the
+        /// shape's proportions. Null for a flat `fill`.
+        fill_center: ?Color = null,
         radius: f32 = 0,
         points: Polygon = .{},
+        /// For a polygon: a linear gradient instead of `fill`, encoded as
+        /// `Gradient` describes; empty for a flat `fill`.
+        gradient: Bytes = &.{},
         text: Bytes = &.{},
         icon_source: Bytes = &.{},
         text_color: Color = Color.white,
@@ -120,8 +205,9 @@ fn Fields(comptime Bytes: type) type {
     };
 }
 
-/// The properties holding strings, which a node owns copies of.
-pub const string_fields = .{ "text", "icon_source", "font_family" };
+/// The properties holding bytes (strings, an encoded gradient), which a node
+/// owns copies of.
+pub const string_fields = .{ "text", "icon_source", "font_family", "gradient" };
 
 pub const Snapshot = Fields([]const u8);
 /// The same fields as a node stores them, owning their bytes.
@@ -147,8 +233,10 @@ pub const Value = union(enum) {
     clip: bool,
     clip_shape: Polygon,
     fill: Color,
+    fill_center: ?Color,
     radius: f32,
     points: Polygon,
+    gradient: []const u8,
     text: []const u8,
     icon_source: []const u8,
     text_color: Color,
@@ -188,8 +276,9 @@ pub fn metadata(value: Value) Metadata {
         .gap, .padding, .flex, .shrink, .@"align", .justify => .{ .supported_by = .every_node, .dirty = layout_and_paint },
         .offset_x, .offset_y, .opacity, .clip, .clip_shape => .{ .supported_by = .every_node, .dirty = paint },
         .fill => .{ .supported_by = .paint, .dirty = paint },
-        .radius => .{ .supported_by = .shape, .dirty = paint },
+        .fill_center, .radius => .{ .supported_by = .shape, .dirty = paint },
         .points => .{ .supported_by = .polygon, .dirty = paint },
+        .gradient => .{ .supported_by = .polygon, .dirty = paint, .owns_bytes = true },
         .text => .{ .supported_by = .text, .dirty = layout_and_paint, .owns_bytes = true },
         .font_size => .{ .supported_by = .text, .dirty = layout_and_paint },
         .font_family => .{ .supported_by = .text, .dirty = layout_and_paint, .owns_bytes = true },
@@ -211,6 +300,7 @@ pub fn validate(kind: NodeKind, value: Value) Error!void {
 
     switch (value) {
         .fill, .text_color => |color| if (!validColor(color)) return error.InvalidValue,
+        .fill_center => |center| if (center) |color| if (!validColor(color)) return error.InvalidValue,
         .radius => |radius| if (!std.math.isFinite(radius) or radius < 0) return error.InvalidValue,
         .offset_x, .offset_y => |offset| if (!std.math.isFinite(offset)) return error.InvalidValue,
         .points, .clip_shape => |polygon| {
@@ -221,6 +311,7 @@ pub fn validate(kind: NodeKind, value: Value) Error!void {
             }
         },
         .opacity => |opacity| if (!std.math.isFinite(opacity) or opacity < 0 or opacity > 1) return error.InvalidValue,
+        .gradient => |bytes| if (!Gradient.valid(bytes)) return error.InvalidValue,
         .font_size => |size| if (size == 0) return error.InvalidValue,
         else => {},
     }
@@ -242,13 +333,14 @@ pub fn cloneValue(allocator: Allocator, value: Value) !Value {
         .text => |bytes| .{ .text = try allocator.dupe(u8, bytes) },
         .icon_source => |bytes| .{ .icon_source = try allocator.dupe(u8, bytes) },
         .font_family => |bytes| .{ .font_family = try allocator.dupe(u8, bytes) },
+        .gradient => |bytes| .{ .gradient = try allocator.dupe(u8, bytes) },
         else => value,
     };
 }
 
 pub fn freeValue(allocator: Allocator, value: Value) void {
     switch (value) {
-        .text, .icon_source, .font_family => |bytes| if (bytes.len != 0) allocator.free(bytes),
+        .text, .icon_source, .font_family, .gradient => |bytes| if (bytes.len != 0) allocator.free(bytes),
         else => {},
     }
 }
@@ -265,7 +357,7 @@ pub const Owned = struct {
 
     pub fn commit(self: *Owned, allocator: Allocator, value: Value, owned_bytes: ?[]u8) void {
         switch (value) {
-            inline .text, .icon_source, .font_family => |requested, tag| {
+            inline .text, .icon_source, .font_family, .gradient => |requested, tag| {
                 const slot = &@field(self.fields, @tagName(tag));
                 const replacement = owned_bytes orelse {
                     std.debug.assert(std.mem.eql(u8, slot.*, requested));
@@ -293,7 +385,7 @@ pub const Owned = struct {
 /// `current` is a node's fields, stored or snapshotted, by value or pointer.
 pub fn matches(current: anytype, value: Value) bool {
     return switch (value) {
-        inline .text, .icon_source, .font_family => |item, tag| std.mem.eql(u8, @field(current, @tagName(tag)), item),
+        inline .text, .icon_source, .font_family, .gradient => |item, tag| std.mem.eql(u8, @field(current, @tagName(tag)), item),
         inline .points, .clip_shape => |item, tag| samePoints(@field(current, @tagName(tag)), item),
         inline else => |item, tag| std.meta.eql(@field(current, @tagName(tag)), item),
     };
@@ -359,4 +451,27 @@ test "committing a value stores it under the same-named field" {
     try std.testing.expectEqual(Justify.between, snapshot.justify);
     try std.testing.expectEqual(@as(?u32, 120), snapshot.max_width);
     try std.testing.expectEqualStrings("hi", snapshot.text);
+}
+
+test "a gradient round-trips through its encoding and is validated" {
+    var buffer: [Gradient.encodedLength(2)]u8 = undefined;
+    const stops = [_]Gradient.Stop{
+        .{ .x = 0, .color = .{ .r = 1, .g = 0, .b = 0 } },
+        .{ .x = 40, .color = .{ .r = 0, .g = 0, .b = 1, .a = 0.5 } },
+    };
+    const bytes = Gradient.encode(&buffer, 0.3, &stops);
+    const gradient = Gradient{ .bytes = bytes };
+    try std.testing.expectEqual(@as(usize, 2), gradient.len());
+    try std.testing.expectEqual(@as(f32, 0.3), gradient.slant());
+    try std.testing.expectEqual(stops[1].x, gradient.stop(1).x);
+    try std.testing.expectEqual(stops[1].color, gradient.stop(1).color);
+    try validate(.polygon, .{ .gradient = bytes });
+    try validate(.polygon, .{ .gradient = &.{} });
+    try std.testing.expectError(error.PropertyNotSupported, validate(.shape, .{ .gradient = bytes }));
+    try std.testing.expect(!metadata(.{ .gradient = bytes }).dirty.layout);
+    try std.testing.expect(metadata(.{ .gradient = bytes }).owns_bytes);
+    // Out of order, or a truncated stop, is not a gradient.
+    const backwards = [_]Gradient.Stop{ stops[1], stops[0] };
+    try std.testing.expectError(error.InvalidValue, validate(.polygon, .{ .gradient = Gradient.encode(&buffer, 0, &backwards) }));
+    try std.testing.expectError(error.InvalidValue, validate(.polygon, .{ .gradient = bytes[0 .. bytes.len - 1] }));
 }

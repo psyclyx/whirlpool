@@ -21,6 +21,7 @@ const RawGetI = *const fn (*State, c_int, i64) callconv(.c) c_int;
 const RawSetI = *const fn (*State, c_int, i64) callconv(.c) void;
 const RawSet = *const fn (*State, c_int) callconv(.c) void;
 const RawLen = *const fn (*State, c_int) callconv(.c) usize;
+const Next = *const fn (*State, c_int) callconv(.c) c_int;
 const ToInteger = *const fn (*State, c_int, ?*c_int) callconv(.c) i64;
 const ToNumber = *const fn (*State, c_int, ?*c_int) callconv(.c) f64;
 const ToBoolean = *const fn (*State, c_int) callconv(.c) c_int;
@@ -59,6 +60,7 @@ const Api = struct {
     raw_set_i: RawSetI,
     raw_set: RawSet,
     raw_len: RawLen,
+    next: Next,
     to_integer: ToInteger,
     to_number: ToNumber,
     to_boolean: ToBoolean,
@@ -111,6 +113,7 @@ const Api = struct {
             .raw_set_i = try symbol(RawSetI, &loaded, "lua_rawseti"),
             .raw_set = try symbol(RawSet, &loaded, "lua_rawset"),
             .raw_len = try symbol(RawLen, &loaded, "lua_rawlen"),
+            .next = try symbol(Next, &loaded, "lua_next"),
             .to_integer = try symbol(ToInteger, &loaded, "lua_tointegerx"),
             .to_number = try symbol(ToNumber, &loaded, "lua_tonumberx"),
             .to_boolean = try symbol(ToBoolean, &loaded, "lua_toboolean"),
@@ -158,6 +161,8 @@ pub const CallbackApi = struct {
     raw_get_i: RawGetI,
     raw_set_i: RawSetI,
     raw_set: RawSet,
+    raw_len: RawLen,
+    next: Next,
     to_integer: ToInteger,
     to_number: ToNumber,
     to_boolean: ToBoolean,
@@ -257,6 +262,8 @@ pub const Vm = struct {
             .raw_get_i = self.api.raw_get_i,
             .raw_set_i = self.api.raw_set_i,
             .raw_set = self.api.raw_set,
+            .raw_len = self.api.raw_len,
+            .next = self.api.next,
             .to_integer = self.api.to_integer,
             .to_number = self.api.to_number,
             .to_boolean = self.api.to_boolean,
@@ -290,6 +297,21 @@ pub const Vm = struct {
             return error.LoadFailed;
         }
         if (self.protectedCall(0, 0) != 0) {
+            self.discardStack();
+            return error.CallFailed;
+        }
+    }
+
+    /// `run`, logging Lua's message when it fails: for chunks whose failure
+    /// stops Whirlpool, where the bare error would say nothing useful.
+    pub fn runReporting(self: *Vm, source: []const u8, chunk_name: [:0]const u8) Error!void {
+        if (self.api.load_buffer(self.state, source.ptr, source.len, chunk_name.ptr, null) != 0) {
+            std.log.err("Lua load failed: {s}", .{self.string(-1) orelse "unknown Lua error"});
+            self.discardStack();
+            return error.LoadFailed;
+        }
+        if (self.protectedCall(0, 0) != 0) {
+            std.log.err("Lua call failed: {s}", .{self.string(-1) orelse "unknown Lua error"});
             self.discardStack();
             return error.CallFailed;
         }
@@ -408,6 +430,15 @@ pub const Vm = struct {
     pub fn call(self: *Vm, arguments: u31, results: u31) Error!void {
         if (self.protectedCall(@intCast(arguments), @intCast(results)) != 0)
             return error.CallFailed;
+    }
+
+    /// `call`, logging Lua's message as a warning when it fails, for calls
+    /// whose failure is survived but should be seen.
+    pub fn callReporting(self: *Vm, arguments: u31, results: u31) Error!void {
+        if (self.protectedCall(@intCast(arguments), @intCast(results)) != 0) {
+            std.log.warn("Lua call failed: {s}", .{self.string(-1) orelse "unknown Lua error"});
+            return error.CallFailed;
+        }
     }
 
     pub fn rawLength(self: *const Vm, index: c_int) usize {

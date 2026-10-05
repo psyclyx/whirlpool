@@ -348,6 +348,48 @@ test "Lua defines arbitrary filled polygons through the retained contract" {
     try std.testing.expectEqual(@as(f32, 50), polygon.points.points[1].x);
 }
 
+test "Lua sets and clears a polygon's linear gradient" {
+    var vm = try lua_program.Vm.init(true);
+    defer vm.deinit();
+
+    const modules = [_]lua_program.Module{.{
+        .name = "main",
+        .source =
+        \\return function(parent)
+        \\  local strip = parent:polygon({
+        \\    width = 40, height = 20, fill = { 0, 1, 0, 1 },
+        \\    points = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } },
+        \\    gradient = { slant = 0.3, stops = { { 0, { 1, 0, 0, 1 } }, { 40, { 0, 0, 1 } } } },
+        \\  })
+        \\  return { update = function(_, service)
+        \\    if service == 'clear' then strip:set('gradient', { stops = {} }) end
+        \\  end }
+        \\end
+        ,
+    }};
+    var loader = lua_program.Loader.init(std.testing.allocator, .{});
+    var program = try loader.load("main", &modules);
+    defer program.deinit();
+    var composition = try Composition.mount(std.testing.allocator, &vm, &program, .{});
+    defer composition.deinit();
+
+    {
+        var frame = try composition.lower(.{ .width = 80, .height = 20 });
+        defer frame.deinit();
+        const gradient = frame.drawList().ops[0].polygon.gradient.?;
+        const decoded = ui.properties.Gradient{ .bytes = gradient.stops };
+        try std.testing.expectEqual(@as(usize, 2), decoded.len());
+        try std.testing.expectApproxEqAbs(@as(f32, 0.3), decoded.slant(), 1e-6);
+        try std.testing.expectEqual(@as(f32, 40), decoded.stop(1).x);
+        try std.testing.expectEqual(@as(f32, 1), decoded.stop(1).color.a);
+        try std.testing.expectEqual(@as(f32, 20), gradient.bottom);
+    }
+    try composition.update(&vm, &program, .{ .service = "clear", .values = &.{} });
+    var frame = try composition.lower(.{ .width = 80, .height = 20 });
+    defer frame.deinit();
+    try std.testing.expect(frame.drawList().ops[0].polygon.gradient == null);
+}
+
 test "named service updates mutate the retained Lua controller" {
     var vm = try lua_program.Vm.init(true);
     defer vm.deinit();

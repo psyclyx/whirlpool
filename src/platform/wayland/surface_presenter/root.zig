@@ -323,6 +323,7 @@ pub const Presenter = struct {
             return;
         };
         defer renderer.deinit();
+        renderer.setIconWake(.{ .context = self, .run = iconsReady });
         self.composition.setTextMetrics(renderer.textMetrics());
         self.composition.setViewport(.{ .width = self.width, .height = self.height });
         while (true) {
@@ -365,6 +366,16 @@ pub const Presenter = struct {
             self.unlock();
             if (wake) |callback| callback.run(callback.context);
         }
+    }
+
+    /// The renderer's icon wake (icon loader thread): an icon drawn while it
+    /// was loading is ready, so draw again.
+    fn iconsReady(raw: ?*anyopaque) callconv(.c) void {
+        const self: *Presenter = @ptrCast(@alignCast(raw orelse return));
+        self.lock();
+        self.render_requested = true;
+        self.changed.signal(self.io);
+        self.unlock();
     }
 
     fn render(

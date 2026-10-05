@@ -323,7 +323,12 @@ pub fn Execution(comptime Program: type) type {
                     break :blk .{ .number = number };
                 },
                 lua_type_string => .{ .string = try self.stringAt(index) },
-                lua_type_table => try self.arrayAt(index, depth + 1),
+                // A sequence is an array; a table of named fields (and no
+                // sequence) an object; an empty table an empty array.
+                lua_type_table => if (self.api.raw_len(state, index) == 0)
+                    try self.objectAt(index, depth + 1)
+                else
+                    try self.arrayAt(index, depth + 1),
                 else => error.InvalidProperty,
             };
         }
@@ -347,6 +352,29 @@ pub fn Execution(comptime Program: type) type {
             if (item_index > @as(i64, @intCast(self.program.limits.max_property_items))) return error.PropertyItemLimitExceeded;
             const copied = try self.scratch.allocator().dupe(Value, items.items);
             return .{ .array = copied };
+        }
+
+        /// A table's string-keyed fields, in Lua's iteration order; an empty
+        /// array when it has none. Keys of any other type are an error.
+        fn objectAt(self: *Bridge, index: c_int, depth: usize) Error!Value {
+            const state = self.api.state;
+            // `lua_next` pushes as it goes, so the table needs a fixed index.
+            const table = if (index < 0) self.api.get_top(state) + index + 1 else index;
+            var fields = std.ArrayList(Value.Field).empty;
+            errdefer fields.deinit(self.scratch.allocator());
+            self.api.push_nil(state);
+            while (self.api.next(state, table) != 0) {
+                // Checked before reading: converting a number key in place
+                // would derail the iteration.
+                if (self.api.type_of(state, -2) != lua_type_string) return error.InvalidProperty;
+                if (fields.items.len == self.program.limits.max_property_items) return error.PropertyItemLimitExceeded;
+                const key = try self.stringAt(-2);
+                try fields.append(self.scratch.allocator(), .{ .key = key, .value = try self.valueAt(-1, depth) });
+                // Pop the value, keeping the key for the next step.
+                self.api.set_top(state, self.api.get_top(state) - 1);
+            }
+            if (fields.items.len == 0) return .{ .array = &.{} };
+            return .{ .object = try self.scratch.allocator().dupe(Value.Field, fields.items) };
         }
 
         fn stringAt(self: *Bridge, index: c_int) Error![]const u8 {

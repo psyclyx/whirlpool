@@ -9,6 +9,10 @@ extern "C" {
 #endif
 
 typedef struct WhirlpoolSkia WhirlpoolSkia;
+// Called from another thread when an icon a renderer drew while it was still
+// loading is ready: the renderer's owner should draw again. It must not call
+// back into the renderer.
+typedef void (*WhirlpoolSkiaIconWake)(void *context);
 
 WhirlpoolSkia *whirlpool_skia_create(int bgra);
 WhirlpoolSkia *whirlpool_skia_create_vulkan(void *instance, void *physical_device,
@@ -19,6 +23,20 @@ int whirlpool_skia_begin(WhirlpoolSkia *renderer, uint32_t width, uint32_t heigh
 void whirlpool_skia_clear(WhirlpoolSkia *renderer, float r, float g, float b, float a);
 void whirlpool_skia_draw_rect(WhirlpoolSkia *renderer, float x, float y, float width,
                               float height, float radius, float r, float g, float b, float a);
+// A radial gradient from (cr, cg, cb, ca) at the centre out to (r, g, b, a) at
+// the corners, stretched to the rect.
+void whirlpool_skia_draw_rect_radial(WhirlpoolSkia *renderer, float x, float y, float width,
+                                     float height, float radius, float r, float g, float b, float a,
+                                     float cr, float cg, float cb, float ca);
+// A polygon filled with a linear gradient: `gradient` holds `gradient_length`
+// bytes of little-endian floats, a slant and then x, r, g, b, a per stop
+// (increasing x). A stop's x is measured from `left` along the row `bottom`;
+// the colour at (x, y) is the gradient's at x - slant * (bottom - y), so
+// isolines lean. Every stop's alpha is scaled by `opacity`.
+void whirlpool_skia_draw_polygon_gradient(WhirlpoolSkia *renderer, const float *points,
+                                          size_t point_count, const uint8_t *gradient,
+                                          size_t gradient_length, float left, float bottom,
+                                          float opacity);
 void whirlpool_skia_draw_polygon(WhirlpoolSkia *renderer, const float *points,
                                  size_t point_count, float r, float g, float b, float a);
 // `family` names a font family (length 0: the default typeface).
@@ -27,8 +45,15 @@ void whirlpool_skia_draw_text(WhirlpoolSkia *renderer, const char *family, size_
                               float x, float y, float size,
                               float r, float g, float b, float a,
                               int anchor, int middle);
+// Draws nothing until the icon has loaded, which happens on a worker thread.
 void whirlpool_skia_draw_icon(WhirlpoolSkia *renderer, const char *source, size_t length,
                               float x, float y, float width, float height, float opacity);
+void whirlpool_skia_set_icon_wake(WhirlpoolSkia *renderer, WhirlpoolSkiaIconWake wake,
+                                  void *context);
+// If the last frame met icons still loading, wait until every requested icon
+// has loaded and return 1 (draw again to show them); otherwise return 0.
+// For offline rendering (tests, previews), never a live render loop.
+int whirlpool_skia_wait_icons(WhirlpoolSkia *renderer);
 float whirlpool_skia_measure_text(WhirlpoolSkia *renderer, const char *family, size_t family_length,
                                   const char *text, size_t length, float size);
 size_t whirlpool_skia_fit_text(WhirlpoolSkia *renderer, const char *family, size_t family_length,

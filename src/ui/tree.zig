@@ -271,7 +271,7 @@ pub const Scene = struct {
         const stored = self.lookupNodeMut(handle) orelse return error.StaleNode;
         try properties.validate(stored.kind, value);
         switch (value) {
-            inline .text, .icon_source, .font_family => |requested, tag| {
+            inline .text, .icon_source, .font_family, .gradient => |requested, tag| {
                 if (owned_bytes == null and !std.mem.eql(u8, @field(stored.properties.fields, @tagName(tag)), requested)) {
                     return error.InvalidValue;
                 }

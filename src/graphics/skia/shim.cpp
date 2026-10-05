@@ -2,12 +2,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
+#include <deque>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <cstdlib>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -23,7 +27,9 @@
 #include "core/SkData.h"
 #include "core/SkImage.h"
 #include "core/SkImageInfo.h"
+#include "core/SkMatrix.h"
 #include "core/SkPaint.h"
+#include "effects/SkGradient.h"
 #include "core/SkPath.h"
 #include "core/SkSamplingOptions.h"
 #include "core/SkSurface.h"
@@ -230,11 +236,21 @@ struct WhirlpoolSkia {
     sk_sp<SkFontMgr> font_manager;
     sk_sp<SkTypeface> default_typeface;
     sk_sp<GrDirectContext> gpu_context;
+    // Icons this renderer has drawn, or found unreadable (null).
     std::unordered_map<std::string, sk_sp<SkImage>> icon_cache;
+    // Called from the icon store's worker when an icon this renderer drew
+    // while it was loading is ready (see icon_image).
+    WhirlpoolSkiaIconWake icon_wake = nullptr;
+    void *icon_wake_context = nullptr;
+    // Whether the frame being drawn met an icon still loading.
+    bool icons_pending = false;
     std::unordered_map<std::string, CachedText> text_cache;
     // Typefaces by requested family name, resolved once each.
     std::unordered_map<std::string, sk_sp<SkTypeface>> families;
 };
+
+static void retain_icons();
+static void release_icons(WhirlpoolSkia *renderer);
 
 static SkImageInfo frame_info(const WhirlpoolSkia *renderer) {
     return SkImageInfo::Make(renderer->width, renderer->height,
@@ -318,6 +334,7 @@ extern "C" WhirlpoolSkia *whirlpool_skia_create(int bgra) {
         delete renderer;
         return nullptr;
     }
+    retain_icons();
     return renderer;
 }
 
@@ -374,11 +391,13 @@ extern "C" WhirlpoolSkia *whirlpool_skia_create_vulkan(
         delete renderer;
         return nullptr;
     }
+    retain_icons();
     return renderer;
 }
 
 extern "C" void whirlpool_skia_destroy(WhirlpoolSkia *renderer) {
     if (!renderer) return;
+    release_icons(renderer);
     renderer->canvas = nullptr;
     renderer->surface.reset();
     renderer->gpu_context.reset();
@@ -391,6 +410,7 @@ extern "C" int whirlpool_skia_begin_vulkan(
         uint32_t format, uint32_t layout, uint32_t queue_family) {
     if (!renderer || !renderer->gpu_context || !image || !memory ||
         width == 0 || height == 0) return 1;
+    renderer->icons_pending = false;
     renderer->surface.reset();
     GrVkImageInfo image_info{};
     image_info.fImage = static_cast<VkImage>(image);
@@ -423,6 +443,7 @@ extern "C" int whirlpool_skia_begin_vulkan(
 
 extern "C" int whirlpool_skia_begin(WhirlpoolSkia *renderer, uint32_t width, uint32_t height) {
     if (!renderer || width == 0 || height == 0) return 1;
+    renderer->icons_pending = false;
     if (renderer->width != width || renderer->height != height || !renderer->surface) {
         renderer->width = width;
         renderer->height = height;
@@ -455,6 +476,33 @@ extern "C" void whirlpool_skia_draw_rect(WhirlpoolSkia *renderer,
         renderer->canvas->drawRect(rect, paint);
 }
 
+extern "C" void whirlpool_skia_draw_rect_radial(WhirlpoolSkia *renderer,
+                                                 float x, float y, float width, float height,
+                                                 float radius, float r, float g, float b, float a,
+                                                 float cr, float cg, float cb, float ca) {
+    if (!renderer || !renderer->canvas || width <= 0 || height <= 0) return;
+    const SkColor4f colors[2] = {SkColor4f{cr, cg, cb, ca}, SkColor4f{r, g, b, a}};
+    SkGradient::Interpolation interpolation;
+    // Premultiplied, so a transparent end fades instead of greying.
+    interpolation.fInPremul = SkGradient::Interpolation::InPremul::kYes;
+    const SkGradient gradient(SkGradient::Colors(SkSpan<const SkColor4f>(colors, 2), SkTileMode::kClamp),
+                              interpolation);
+    // A unit circle at the centre, stretched so the corners reach the edge.
+    const float reach = 1.41421356f;
+    const SkMatrix local = SkMatrix::Translate(x + width / 2, y + height / 2) *
+                           SkMatrix::Scale(width / 2 * reach, height / 2 * reach);
+    SkPaint paint;
+    paint.setAntiAlias(true);
+    // A gentle gradient spans few 8-bit steps; dithering hides the bands.
+    paint.setDither(true);
+    paint.setShader(SkShaders::RadialGradient(SkPoint{0, 0}, 1, gradient, &local));
+    const SkRect rect = SkRect::MakeXYWH(x, y, width, height);
+    if (radius > 0)
+        renderer->canvas->drawRoundRect(rect, radius, radius, paint);
+    else
+        renderer->canvas->drawRect(rect, paint);
+}
+
 // Polygons and polygon clips carry at most this many vertices (the retained
 // UI's limit).
 constexpr size_t kMaxPolygonPoints = 16;
@@ -472,6 +520,67 @@ extern "C" void whirlpool_skia_draw_polygon(WhirlpoolSkia *renderer,
     SkPaint paint;
     paint.setAntiAlias(true);
     paint.setColor4f(SkColor4f{r, g, b, a}, nullptr);
+    renderer->canvas->drawPath(path, paint);
+}
+
+static constexpr size_t kMaxGradientStops = 64;
+
+static float read_float(const uint8_t *bytes) {
+    // Little-endian, as the UI encodes it; this is every target we build.
+    float value;
+    std::memcpy(&value, bytes, sizeof value);
+    return value;
+}
+
+extern "C" void whirlpool_skia_draw_polygon_gradient(WhirlpoolSkia *renderer,
+                                                        const float *points, size_t point_count,
+                                                        const uint8_t *gradient, size_t gradient_length,
+                                                        float left, float bottom, float opacity) {
+    if (!renderer || !renderer->canvas || !points || !gradient ||
+        point_count < 3 || point_count > kMaxPolygonPoints) return;
+    constexpr size_t header = 4, stride = 20;
+    if (gradient_length < header + stride || (gradient_length - header) % stride != 0) return;
+    const size_t count = std::min((gradient_length - header) / stride, kMaxGradientStops);
+    const float slant = read_float(gradient);
+    SkColor4f colors[kMaxGradientStops];
+    float xs[kMaxGradientStops];
+    for (size_t index = 0; index < count; ++index) {
+        const uint8_t *stop = gradient + header + index * stride;
+        xs[index] = read_float(stop);
+        colors[index] = SkColor4f{read_float(stop + 4), read_float(stop + 8),
+                                  read_float(stop + 12), read_float(stop + 16) * opacity};
+    }
+
+    SkPoint vertices[kMaxPolygonPoints];
+    for (size_t index = 0; index < point_count; ++index)
+        vertices[index] = SkPoint::Make(points[index * 2], points[index * 2 + 1]);
+    const SkPath path = SkPath::Polygon(SkSpan<const SkPoint>(vertices, point_count), true);
+    SkPaint paint;
+    paint.setAntiAlias(true);
+    const float first = xs[0], last = xs[count - 1];
+    if (count == 1 || last - first < 1e-3f) {
+        paint.setColor4f(colors[count - 1], nullptr);
+        renderer->canvas->drawPath(path, paint);
+        return;
+    }
+    float positions[kMaxGradientStops];
+    for (size_t index = 0; index < count; ++index)
+        positions[index] = (xs[index] - first) / (last - first);
+    SkGradient::Interpolation interpolation;
+    // Premultiplied, so a transparent stop fades instead of greying.
+    interpolation.fInPremul = SkGradient::Interpolation::InPremul::kYes;
+    const SkGradient description(
+        SkGradient::Colors(SkSpan<const SkColor4f>(colors, count),
+                           SkSpan<const float>(positions, count), SkTileMode::kClamp),
+        interpolation);
+    // The gradient runs along x in its own space; the local matrix leans it,
+    // taking (u, v) to (u + slant * (bottom - v), v), so the colour at the
+    // bottom's x holds along a line rising `slant` pixels right per pixel up.
+    const SkPoint ends[2] = {SkPoint::Make(left + first, 0), SkPoint::Make(left + last, 0)};
+    const SkMatrix lean = SkMatrix::MakeAll(1, -slant, slant * bottom, 0, 1, 0, 0, 0, 1);
+    // Gentle gradients span few 8-bit steps; dithering hides the bands.
+    paint.setDither(true);
+    paint.setShader(SkShaders::LinearGradient(ends, description, &lean));
     renderer->canvas->drawPath(path, paint);
 }
 
@@ -618,12 +727,25 @@ static bool ends_with_case_insensitive(const std::string& value, const char *suf
     return true;
 }
 
-static sk_sp<SkImage> load_svg_icon(const std::string& path) {
+// Icons are read and rasterized off the render path. Drawing an icon that is
+// not loaded yet asks the icon store for it and draws nothing; the store's
+// worker thread decodes it to CPU pixels, then calls the wake of every
+// renderer that asked, so its owner renders again. Each renderer wraps ready
+// pixels in its own SkImage, on its own thread, the next time it draws one.
+
+// Decoded pixels, premultiplied N32; no data means the icon could not be read.
+struct IconPixels {
+    sk_sp<SkData> data;
+    SkImageInfo info;
+    size_t row_bytes = 0;
+};
+
+static IconPixels load_svg_icon(const std::string& path) {
     GError *error = nullptr;
     RsvgHandle *handle = rsvg_handle_new_from_file(path.c_str(), &error);
     if (!handle) {
         if (error) g_error_free(error);
-        return nullptr;
+        return {};
     }
     constexpr int raster_size = 64;
     cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
@@ -636,7 +758,7 @@ static sk_sp<SkImage> load_svg_icon(const std::string& path) {
     if (!rendered || cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
         if (error) g_error_free(error);
         cairo_surface_destroy(surface);
-        return nullptr;
+        return {};
     }
     cairo_surface_flush(surface);
     const size_t stride = static_cast<size_t>(cairo_image_surface_get_stride(surface));
@@ -644,17 +766,154 @@ static sk_sp<SkImage> load_svg_icon(const std::string& path) {
                                        stride * raster_size);
     cairo_surface_destroy(surface);
     if (error) g_error_free(error);
-    if (!pixels) return nullptr;
-    const auto info = SkImageInfo::MakeN32Premul(raster_size, raster_size);
-    return SkImages::RasterFromData(info, std::move(pixels), stride);
+    if (!pixels) return {};
+    return {std::move(pixels), SkImageInfo::MakeN32Premul(raster_size, raster_size), stride};
 }
 
-static sk_sp<SkImage> load_icon(const std::string& path) {
+static IconPixels load_icon(const std::string& path) {
     if (ends_with_case_insensitive(path, ".svg") ||
         ends_with_case_insensitive(path, ".svgz"))
         return load_svg_icon(path);
     auto encoded = SkData::MakeFromFileName(path.c_str());
-    return encoded ? SkImages::DeferredFromEncodedData(std::move(encoded)) : nullptr;
+    if (!encoded) return {};
+    // Decoded here in full, so drawing never decodes lazily.
+    auto image = SkImages::DeferredFromEncodedData(std::move(encoded));
+    if (!image || image->width() <= 0 || image->height() <= 0) return {};
+    const auto info = SkImageInfo::MakeN32Premul(image->width(), image->height());
+    const size_t row_bytes = info.minRowBytes();
+    auto pixels = SkData::MakeUninitialized(info.computeByteSize(row_bytes));
+    if (!pixels || !image->readPixels(nullptr, info, pixels->writable_data(), row_bytes, 0, 0,
+                                      SkImage::kDisallow_CachingHint))
+        return {};
+    return {std::move(pixels), info, row_bytes};
+}
+
+struct IconStore {
+    enum class State { pending, ready, failed };
+    struct Entry {
+        State state = State::pending;
+        IconPixels pixels;
+        // Renderers that drew the icon while it was pending, to wake.
+        std::vector<WhirlpoolSkia *> waiting;
+    };
+    std::mutex mutex;
+    std::condition_variable work;
+    std::condition_variable settled;
+    std::unordered_map<std::string, Entry> entries;
+    std::deque<std::string> queue;
+    std::thread worker;
+    // A worker runs while `epoch` is the one it started in.
+    uint64_t epoch = 0;
+    // Requests the worker has taken and not finished.
+    size_t loading = 0;
+    size_t renderers = 0;
+};
+
+// Never destroyed, so no static destructor can run while a renderer lives.
+static IconStore& icon_store() {
+    static IconStore *store = new IconStore();
+    return *store;
+}
+
+static void icon_worker(IconStore *store, uint64_t epoch) {
+    std::unique_lock<std::mutex> lock(store->mutex);
+    for (;;) {
+        store->work.wait(lock, [&] { return store->epoch != epoch || !store->queue.empty(); });
+        if (store->epoch != epoch) return;
+        std::string path = std::move(store->queue.front());
+        store->queue.pop_front();
+        store->loading++;
+        lock.unlock();
+        IconPixels pixels = load_icon(path);
+        lock.lock();
+        store->loading--;
+        auto found = store->entries.find(path);
+        if (found != store->entries.end() && found->second.state == IconStore::State::pending) {
+            auto& entry = found->second;
+            entry.state = pixels.data ? IconStore::State::ready : IconStore::State::failed;
+            entry.pixels = std::move(pixels);
+            // Called under the store's lock, so no renderer can be destroyed
+            // meanwhile: a wake must not call back into the store.
+            for (auto *renderer : entry.waiting)
+                if (renderer->icon_wake) renderer->icon_wake(renderer->icon_wake_context);
+            entry.waiting.clear();
+        }
+        if (store->queue.empty() && store->loading == 0) store->settled.notify_all();
+    }
+}
+
+static void retain_icons() {
+    auto& store = icon_store();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    store.renderers++;
+}
+
+// The last renderer stops the worker; requests still pending are forgotten,
+// so a later renderer asks for them afresh.
+static void release_icons(WhirlpoolSkia *renderer) {
+    auto& store = icon_store();
+    std::thread finished;
+    {
+        std::lock_guard<std::mutex> lock(store.mutex);
+        for (auto& [path, entry] : store.entries)
+            entry.waiting.erase(std::remove(entry.waiting.begin(), entry.waiting.end(), renderer),
+                                entry.waiting.end());
+        if (--store.renderers == 0 && store.worker.joinable()) {
+            store.epoch++;
+            store.work.notify_all();
+            finished = std::move(store.worker);
+            store.queue.clear();
+            for (auto it = store.entries.begin(); it != store.entries.end();)
+                it = it->second.state == IconStore::State::pending ? store.entries.erase(it) : std::next(it);
+            store.settled.notify_all();
+        }
+    }
+    if (finished.joinable()) finished.join();
+}
+
+// The icon at `path` for this renderer, or null while it loads (or if it
+// cannot be read). Never reads a file.
+static sk_sp<SkImage> icon_image(WhirlpoolSkia *renderer, const std::string& path) {
+    auto cached = renderer->icon_cache.find(path);
+    if (cached != renderer->icon_cache.end()) return cached->second;
+    auto& store = icon_store();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    auto [found, inserted] = store.entries.try_emplace(path);
+    auto& entry = found->second;
+    if (entry.state == IconStore::State::pending) {
+        if (inserted) {
+            store.queue.push_back(path);
+            if (!store.worker.joinable()) store.worker = std::thread(icon_worker, &store, store.epoch);
+            store.work.notify_one();
+        }
+        if (std::find(entry.waiting.begin(), entry.waiting.end(), renderer) == entry.waiting.end())
+            entry.waiting.push_back(renderer);
+        renderer->icons_pending = true;
+        return nullptr;
+    }
+    sk_sp<SkImage> image;
+    if (entry.state == IconStore::State::ready)
+        image = SkImages::RasterFromData(entry.pixels.info, entry.pixels.data, entry.pixels.row_bytes);
+    renderer->icon_cache.emplace(path, image);
+    return image;
+}
+
+extern "C" void whirlpool_skia_set_icon_wake(WhirlpoolSkia *renderer,
+                                               WhirlpoolSkiaIconWake wake, void *context) {
+    if (!renderer) return;
+    auto& store = icon_store();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    renderer->icon_wake = wake;
+    renderer->icon_wake_context = context;
+}
+
+extern "C" int whirlpool_skia_wait_icons(WhirlpoolSkia *renderer) {
+    if (!renderer || !renderer->icons_pending) return 0;
+    auto& store = icon_store();
+    std::unique_lock<std::mutex> lock(store.mutex);
+    store.settled.wait(lock, [&] { return store.queue.empty() && store.loading == 0; });
+    renderer->icons_pending = false;
+    return 1;
 }
 
 extern "C" void whirlpool_skia_draw_icon(WhirlpoolSkia *renderer,
@@ -663,11 +922,7 @@ extern "C" void whirlpool_skia_draw_icon(WhirlpoolSkia *renderer,
                                             float opacity) {
     if (!renderer || !renderer->canvas || !source || length == 0 ||
         width <= 0 || height <= 0 || opacity <= 0) return;
-    const std::string key(source, length);
-    auto found = renderer->icon_cache.find(key);
-    if (found == renderer->icon_cache.end())
-        found = renderer->icon_cache.emplace(key, load_icon(key)).first;
-    const auto& image = found->second;
+    const auto image = icon_image(renderer, std::string(source, length));
     if (!image || image->width() <= 0 || image->height() <= 0) return;
 
     const float scale = std::min(width / image->width(), height / image->height());

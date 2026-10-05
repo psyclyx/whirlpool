@@ -5,8 +5,8 @@
 //! Containers affect geometry but never become operations. Offsets are applied
 //! here, not in layout, so moving a subtree costs one walk and no relayout.
 //!
-//! The draw list borrows text and icon bytes from the scene: render it before
-//! the scene is next mutated.
+//! The draw list borrows text, icon and gradient bytes from the scene: render
+//! it before the scene is next mutated.
 
 const std = @import("std");
 const ui = @import("whirlpool-ui");
@@ -92,10 +92,18 @@ const Lowerer = struct {
                 .rect = toRect(box),
                 .radius = p.radius,
                 .color = colorWithOpacity(p.fill, opacity),
+                .center = if (p.fill_center) |center| colorWithOpacity(center, opacity) else null,
             } }),
             .polygon => if (box.width > 0 and box.height > 0 and p.points.len >= 3) try self.emit(.{ .polygon = .{
                 .points = place(p.points, box),
                 .color = colorWithOpacity(p.fill, opacity),
+                // Borrowed from the scene, as text is.
+                .gradient = if (p.gradient.len != 0) .{
+                    .stops = p.gradient,
+                    .left = box.x,
+                    .bottom = box.y + box.height,
+                    .opacity = opacity,
+                } else null,
             } }),
             .text => if (p.text.len != 0) try self.text(handle, box, opacity),
             .icon => if (p.icon_source.len != 0 and box.width > 0 and box.height > 0) try self.emit(.{ .icon = .{
@@ -227,7 +235,7 @@ const Fixture = struct {
         for (values) |value| {
             const bytes: ?[]u8 = switch (value) {
                 .text => |item| try testing.allocator.dupe(u8, item),
-                .icon_source, .font_family => |item| try testing.allocator.dupe(u8, item),
+                .icon_source, .font_family, .gradient => |item| try testing.allocator.dupe(u8, item),
                 else => null,
             };
             try self.scene.applyProperty(handle, value, bytes);
