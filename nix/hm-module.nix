@@ -42,9 +42,9 @@ in
 
     configFile = lib.mkOption {
       type = lib.types.path;
-      default = "${cfg.package}/share/whirlpool/config/whirlpool.lua";
-      defaultText = lib.literalExpression ''"''${cfg.package}/share/whirlpool/config/whirlpool.lua"'';
-      description = "Whirlpool Lua configuration file.";
+      default = "${cfg.package.config}/whirlpool.lua";
+      defaultText = lib.literalExpression ''"''${cfg.package.config}/whirlpool.lua"'';
+      description = "Whirlpool Lua configuration file. Modules in its directory (the default's `lib/`) are found by `require`.";
     };
 
     modules = lib.mkOption {

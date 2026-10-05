@@ -370,8 +370,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // LLVM for every artifact: Zig 0.16's own x86_64 backend (its Debug
+    // default) passes C functions the floats that spill onto the stack in
+    // the wrong places, and the Skia shim takes many.
+    const use_llvm = true;
     const exe = b.addExecutable(.{
         .name = "whirlpool",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -384,17 +389,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
-    b.installDirectory(.{
-        .source_dir = b.path("lua"),
-        .install_dir = .prefix,
-        .install_subdir = "share/whirlpool/lua",
-        .exclude_extensions = &.{"zig"},
-    });
-    b.installDirectory(.{
-        .source_dir = b.path("config"),
-        .install_dir = .prefix,
-        .install_subdir = "share/whirlpool/config",
-    });
+    // The Lua library is plain files; packaging can install it separately, so
+    // changing it does not rebuild Zig.
+    if (b.option(bool, "install-lua", "Install the Lua library (default: true)") orelse true) {
+        b.installDirectory(.{
+            .source_dir = b.path("lua"),
+            .install_dir = .prefix,
+            .install_subdir = "share/whirlpool/lua",
+            .exclude_extensions = &.{"zig"},
+        });
+    }
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
@@ -403,6 +407,7 @@ pub fn build(b: *std.Build) void {
 
     const shell_bench = b.addExecutable(.{
         .name = "whirlpool-shell-bench",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench_shell.zig"),
             .target = target,
@@ -420,6 +425,7 @@ pub fn build(b: *std.Build) void {
 
     const shell_preview = b.addExecutable(.{
         .name = "whirlpool-shell-preview",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/shell_preview.zig"),
             .target = target,
@@ -468,14 +474,15 @@ pub fn build(b: *std.Build) void {
         app_river,
         app_layer_shell,
     }) |module| {
-        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module, .use_llvm = use_llvm })).step);
     }
     inline for (.{ graphics, dmabuf_allocator }) |module| {
-        const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = module }));
+        const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = module, .use_llvm = use_llvm }));
         test_step.dependOn(&run_tests.step);
         graphics_test_step.dependOn(&run_tests.step);
     }
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/script/lua_vm.zig"),
             .target = target,
@@ -487,26 +494,27 @@ pub fn build(b: *std.Build) void {
     check.dependOn(&exe.step);
 }
 
-/// Build the C++ ABI membrane with the same pkg-config/g++ discipline used
-/// by the weft application. Only the C ABI in shim.h crosses into Zig.
+/// Build the C++ ABI membrane. Only the C ABI in shim.h crosses into Zig.
 fn addSkia(b: *std.Build, module: *std.Build.Module) void {
-    const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", "skia" });
-    const fontconfig_cflags = b.run(&.{ "pkg-config", "--cflags-only-I", "fontconfig" });
-    const librsvg_cflags = b.run(&.{ "pkg-config", "--cflags-only-I", "librsvg-2.0" });
-    const libstdcpp = std.mem.trim(u8, b.run(&.{ "g++", "-print-file-name=libstdc++.so" }), " \t\r\n");
-    const compile = b.addSystemCommand(&.{ "g++", "-std=c++17", "-c", "-O2", "-fPIC", "-fno-rtti", "-fno-exceptions" });
-    var tokens = std.mem.tokenizeAny(u8, cflags, " \t\r\n");
-    while (tokens.next()) |token| compile.addArg(b.dupe(token));
-    var fontconfig_tokens = std.mem.tokenizeAny(u8, fontconfig_cflags, " \t\r\n");
-    while (fontconfig_tokens.next()) |token| compile.addArg(b.dupe(token));
-    var librsvg_tokens = std.mem.tokenizeAny(u8, librsvg_cflags, " \t\r\n");
-    while (librsvg_tokens.next()) |token| compile.addArg(b.dupe(token));
-    compile.addFileArg(b.path("src/graphics/skia/shim.cpp"));
-    compile.addArg("-o");
-    const object = compile.addOutputFileArg("whirlpool_skia_shim.o");
-    module.addObjectFile(object);
-    module.linkSystemLibrary("skia", .{});
-    module.linkSystemLibrary("fontconfig", .{});
+    // Skia is compiled by Zig as a static library against Zig's libc++ (see
+    // nix/packages/whirlpool-skia.nix), and so is this shim: one C++
+    // toolchain and runtime throughout.
+    module.link_libcpp = true;
+    var flags = std.ArrayList([]const u8).empty;
+    flags.appendSlice(b.allocator, &.{ "-std=c++17", "-fno-rtti", "-fno-exceptions" }) catch @panic("OOM");
+    for ([_][]const u8{ "skia", "fontconfig", "librsvg-2.0" }) |package| {
+        const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", package });
+        var tokens = std.mem.tokenizeAny(u8, cflags, " \t\r\n");
+        while (tokens.next()) |token| flags.append(b.allocator, b.dupe(token)) catch @panic("OOM");
+    }
+    module.addCSourceFile(.{
+        .file = b.path("src/graphics/skia/shim.cpp"),
+        .flags = flags.items,
+        .language = .cpp,
+    });
+    module.linkSystemLibrary("skia", .{ .preferred_link_mode = .static });
+    // What a static Skia leaves to be linked.
+    for ([_][]const u8{ "fontconfig", "freetype2", "libpng", "libwebp", "libwebpmux", "libwebpdemux", "libjpeg", "zlib", "expat" }) |library|
+        module.linkSystemLibrary(library, .{});
     module.linkSystemLibrary("rsvg-2", .{});
-    module.addObjectFile(.{ .cwd_relative = libstdcpp });
 }

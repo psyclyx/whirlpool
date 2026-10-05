@@ -38,7 +38,7 @@ in
     whirlpoolNested = finalPkgs.writeShellScriptBin "whirlpool-nested" ''
       set -eu
 
-      config="''${WHIRLPOOL_CONFIG:-${basePackages.whirlpool}/share/whirlpool/config/whirlpool.lua}"
+      config="''${WHIRLPOOL_CONFIG:-${basePackages.whirlpool.config}/whirlpool.lua}"
       while [ "$#" -gt 0 ]; do
         case "$1" in
           --config)

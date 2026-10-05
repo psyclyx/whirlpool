@@ -9,13 +9,12 @@
   pkg-config,
   shellcheck,
   shfmt,
-  skia,
-  stdenv,
   wayland,
   wayland-protocols,
   wayland-scanner,
   vulkan-headers,
   vulkan-loader,
+  whirlpool-skia,
   zig_0_16,
 }:
 mkShell {
@@ -34,8 +33,7 @@ mkShell {
     wayland-scanner
     vulkan-headers
     vulkan-loader
-    skia
-    stdenv.cc.cc.lib
+    whirlpool-skia
     zig_0_16
   ];
 }
