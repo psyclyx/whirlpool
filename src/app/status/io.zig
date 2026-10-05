@@ -1,8 +1,8 @@
-//! Cumulative I/O byte counters for the thing a filesystem lives on.
+//! Cumulative I/O byte counters for the block devices a filesystem lives on.
 //!
-//! A ZFS pool reports its own totals; any other filesystem is attributed to
-//! the block device it is mounted from. Rates are derived by the caller from
-//! successive readings (see rate.zig).
+//! A ZFS pool is attributed to its leaf devices (OpenZFS no longer keeps a
+//! per-pool `io` kstat), so its figures are physical traffic: redundancy,
+//! scrubs and resilvers included. Rates are derived by whoever draws them.
 
 const std = @import("std");
 
@@ -33,24 +33,6 @@ pub fn parseDiskstats(diskstats: []const u8, device: []const u8) ?Counters {
     return null;
 }
 
-/// `/proc/spl/kstat/zfs/<pool>/io`: a header line, a line of column names
-/// (`nread nwritten reads writes ...`), and a line of values.
-pub fn parseZfsPoolIo(kstat: []const u8) ?Counters {
-    var lines = std.mem.splitScalar(u8, kstat, '\n');
-    while (lines.next()) |line| {
-        var names = std.mem.tokenizeAny(u8, line, " \t");
-        const first = names.next() orelse continue;
-        if (!std.mem.eql(u8, first, "nread")) continue;
-        const values_line = lines.next() orelse return null;
-        var values = std.mem.tokenizeAny(u8, values_line, " \t");
-        const read = std.fmt.parseUnsigned(u64, values.next() orelse return null, 10) catch return null;
-        _ = names.next(); // nwritten is the second column in both lines
-        const written = std.fmt.parseUnsigned(u64, values.next() orelse return null, 10) catch return null;
-        return .{ .read = read, .written = written };
-    }
-    return null;
-}
-
 test "diskstats attributes a filesystem to the device it is mounted from" {
     const stats =
         \\ 259       0 nvme0n1 100 0 2000 0 50 0 4000 0 0 0 0
@@ -65,15 +47,3 @@ test "diskstats attributes a filesystem to the device it is mounted from" {
     try std.testing.expectEqual(@as(?Counters, null), parseDiskstats(stats, "sdz"));
 }
 
-test "zfs pool io reads the kstat value row" {
-    const kstat =
-        \\21 3 0x01 1 80 3428913648 12345678901234
-        \\nread    nwritten reads    writes   wtime    wlentime wupdate  rtime    rlentime rupdate  wcnt     rcnt
-        \\5000000 7000000  120      340      0        0        0        0        0        0        0        0
-        \\
-    ;
-    const counters = parseZfsPoolIo(kstat).?;
-    try std.testing.expectEqual(@as(u64, 5_000_000), counters.read);
-    try std.testing.expectEqual(@as(u64, 7_000_000), counters.written);
-    try std.testing.expectEqual(@as(?Counters, null), parseZfsPoolIo("nothing useful\n"));
-}

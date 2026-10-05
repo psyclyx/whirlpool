@@ -11,12 +11,18 @@
 //! ticks, so a consumer can place a sample at `now - t` exactly.
 //!
 //! Consumers copy encoded samples out under the service lock; no file, pipe,
-//! process, or timer wait ever happens on a consumer's thread.
+//! process, or timer wait ever happens on a consumer's thread. Sources that
+//! can be told about changes listen rather than poll: audio follows
+//! `pactl subscribe`, and the GPU is read from `nvidia-smi`'s own loop, each
+//! blocking on a pipe in its own task.
 
 const std = @import("std");
 const collectors = @import("collectors.zig");
+const hwmon = @import("hwmon.zig");
+const addresses = @import("addresses.zig");
+const stream = @import("stream.zig");
 
-pub const Kind = enum { cpu, memory, network, disks, audio, battery, command };
+pub const Kind = enum { cpu, memory, network, disks, sensors, gpu, audio, battery, command };
 
 pub const Spec = struct {
     name: []const u8,
@@ -31,18 +37,30 @@ pub const max_sources = 32;
 pub const max_samples = 256;
 pub const max_fields = 10;
 pub const max_disks = collectors.max_disks;
+pub const max_sensors = hwmon.max_sensors;
 const max_text = 4096;
-/// How often a disks source looks again for which filesystems to report.
+/// How often a disks or sensors source looks again for what to report.
 const disk_discovery_ms = 30_000;
+/// How often a network source looks again at addresses (they change rarely).
+const address_ms = 5_000;
+/// How long a listening source waits before starting its program again, when
+/// it exited or could not start.
+const restart_ms = 5_000;
 
 /// Field names of each kind's samples, in `Sample.fields` order.
 fn fieldNames(kind: Kind) []const []const u8 {
     return switch (kind) {
-        .cpu => &.{ "busy", "percent" },
+        // Busy cores' worth, percent of the whole; clock speed in MHz, the
+        // average over cores and the fastest core.
+        .cpu => &.{ "busy", "percent", "mhz", "mhz_max" },
         .memory => &.{ "total", "used", "cache", "arc", "free", "swap_total", "swap_used", "zswap_stored", "zswap_compressed" },
         .network => &.{ "rx", "tx" },
         // Per disk: cumulative bytes read and written, two fields each.
         .disks => &.{},
+        // Per sensor: °C, one field each.
+        .sensors => &.{},
+        // Percent busy, °C, memory used and total (bytes), watts.
+        .gpu => &.{ "busy", "temperature", "memory_used", "memory_total", "power" },
         .audio => &.{ "percent", "muted" },
         .battery => &.{ "present", "percent", "charging", "on_ac" },
         .command => &.{},
@@ -69,8 +87,14 @@ const Source = struct {
     cpu_cores: [collectors.max_cpu_count]f32 = [_]f32{0} ** collectors.max_cpu_count,
     interface: [64]u8 = undefined,
     interface_len: usize = 0,
+    address: addresses.Address = .{},
+    address6: addresses.Address = .{},
+    tunnels: [addresses.max_tunnels]addresses.Address = undefined,
+    tunnel_count: usize = 0,
     disks: [max_disks]collectors.Disk = undefined,
     disk_count: usize = 0,
+    sensors: [max_sensors]hwmon.Sensor = undefined,
+    sensor_count: usize = 0,
     text: [max_text]u8 = undefined,
     text_len: usize = 0,
     ok: bool = true,
@@ -233,8 +257,14 @@ pub const Service = struct {
                 error.Canceled => return error.Canceled,
                 else => {},
             };
-            try std.Io.sleep(self.io, .fromMilliseconds(source.every_ms), .awake);
+            // A listener only returns when its program ended or never started.
+            const pause = if (listens(source.kind)) @max(source.every_ms, restart_ms) else source.every_ms;
+            try std.Io.sleep(self.io, .fromMilliseconds(pause), .awake);
         }
+    }
+
+    fn listens(kind: Kind) bool {
+        return kind == .audio or kind == .gpu;
     }
 
     /// What a source's task carries between samples.
@@ -242,6 +272,7 @@ pub const Service = struct {
         cpu: ?collectors.CpuRead = null,
         interface: [64]u8 = undefined,
         interface_len: usize = 0,
+        addresses_ms: ?f64 = null,
         disks_found_ms: ?f64 = null,
     };
 
@@ -260,6 +291,9 @@ pub const Service = struct {
                     sample.fields[0] += busy;
                 }
                 sample.fields[1] = collectors.utilization(previous.aggregate, current.aggregate) * 100;
+                const frequency = collectors.readCpuFrequency(self.io, count);
+                sample.fields[2] = frequency.average_mhz;
+                sample.fields[3] = frequency.max_mhz;
                 self.lock();
                 source.cpu_count = @intCast(count);
                 source.cpu_cores = cores;
@@ -288,7 +322,24 @@ pub const Service = struct {
                 var sample = Sample{ .t = self.now() };
                 sample.fields[0] = @floatFromInt(counters.rx);
                 sample.fields[1] = @floatFromInt(counters.tx);
+                const look = state.addresses_ms == null or sample.t - state.addresses_ms.? >= address_ms;
+                var address: addresses.Address = undefined;
+                var address6: addresses.Address = undefined;
+                var tunnels: [addresses.max_tunnels]addresses.Address = undefined;
+                var tunnel_count: usize = 0;
+                if (look) {
+                    state.addresses_ms = sample.t;
+                    address = addresses.read(state.interface[0..state.interface_len]);
+                    address6 = addresses.readIpv6(self.io, state.interface[0..state.interface_len]);
+                    tunnel_count = addresses.tunnels(self.io, &tunnels);
+                }
                 self.lock();
+                if (look) {
+                    source.address = address;
+                    source.address6 = address6;
+                    source.tunnels = tunnels;
+                    source.tunnel_count = tunnel_count;
+                }
                 const renamed = !std.mem.eql(u8, source.interface[0..source.interface_len], state.interface[0..state.interface_len]);
                 if (renamed) {
                     // Another interface's counters do not continue this one's.
@@ -306,7 +357,7 @@ pub const Service = struct {
                     const count = try collectors.discoverDisks(self.allocator, self.io, &disks);
                     state.disks_found_ms = at;
                     self.lock();
-                    const same = count == source.disk_count and (for (disks[0..count], source.disks[0..count]) |a, b| {
+                    const same = count == source.disk_count and (for (disks[0..count], source.disks[0..count]) |*a, *b| {
                         if (!std.mem.eql(u8, a.group.keySlice(), b.group.keySlice())) break false;
                     } else true);
                     // Sizes change in place; a different set of disks starts afresh.
@@ -321,8 +372,10 @@ pub const Service = struct {
                 const targets = source.disks;
                 self.unlock();
                 var sample = Sample{ .t = self.now() };
-                for (targets[0..count], 0..) |disk, index| {
-                    const counters = collectors.readDiskCounters(self.io, disk.target) orelse continue;
+                var buffer: [64 * 1024]u8 = undefined;
+                const diskstats = try collectors.readDiskstats(self.io, &buffer);
+                for (targets[0..count], 0..) |*disk, index| {
+                    const counters = collectors.diskCounters(diskstats, disk) orelse continue;
                     sample.fields[index * 2] = @floatFromInt(counters.read);
                     sample.fields[index * 2 + 1] = @floatFromInt(counters.written);
                 }
@@ -330,16 +383,50 @@ pub const Service = struct {
                 if (source.disk_count == count) source.push(sample);
                 self.publish();
             },
-            .audio => {
-                const output = try collectors.command(self.allocator, self.io, &.{ "wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@" });
-                defer self.allocator.free(output);
-                const audio = collectors.parseAudio(output) orelse return;
-                var sample = Sample{ .t = self.now() };
-                sample.fields[0] = @floatFromInt(audio.percent);
-                sample.fields[1] = @floatFromInt(@intFromBool(audio.muted));
+            .sensors => {
+                const at = self.now();
+                if (state.disks_found_ms == null or at - state.disks_found_ms.? >= disk_discovery_ms) {
+                    var sensors: [max_sensors]hwmon.Sensor = undefined;
+                    const count = hwmon.discover(self.io, &sensors);
+                    state.disks_found_ms = at;
+                    self.lock();
+                    const same = count == source.sensor_count and (for (sensors[0..count], source.sensors[0..count]) |*a, *b| {
+                        if (!std.mem.eql(u8, a.inputSlice(), b.inputSlice())) break false;
+                    } else true);
+                    if (!same) source.clear();
+                    source.sensors = sensors;
+                    source.sensor_count = count;
+                    source.revision +%= 1;
+                    self.publish();
+                }
                 self.lock();
-                source.push(sample);
+                const count = source.sensor_count;
+                const sensors = source.sensors;
+                self.unlock();
+                var sample = Sample{ .t = self.now() };
+                for (sensors[0..count], 0..) |*sensor, index| sample.fields[index] = hwmon.read(self.io, sensor) orelse 0;
+                self.lock();
+                if (source.sensor_count == count) source.push(sample);
                 self.publish();
+            },
+            .gpu => {
+                var period: [24]u8 = undefined;
+                const every = std.fmt.bufPrint(&period, "--loop-ms={d}", .{source.every_ms}) catch unreachable;
+                var listener = GpuListener{ .service = self, .source = source };
+                try stream.lines(self.io, &.{
+                    "nvidia-smi",
+                    "--id=0",
+                    "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw",
+                    "--format=csv,noheader,nounits",
+                    every,
+                }, &listener);
+            },
+            .audio => {
+                // Read once, then again whenever a sink or the default sink
+                // changes.
+                var listener = AudioListener{ .service = self, .source = source };
+                try listener.read();
+                try stream.lines(self.io, &.{ "pactl", "subscribe" }, &listener);
             },
             .battery => {
                 const battery = try collectors.readBattery(self.io);
@@ -372,13 +459,71 @@ pub const Service = struct {
     }
 };
 
+const AudioListener = struct {
+    service: *Service,
+    source: *Source,
+
+    fn read(self: *AudioListener) !void {
+        const service = self.service;
+        const volume = try collectors.command(service.allocator, service.io, &.{ "pactl", "get-sink-volume", "@DEFAULT_SINK@" });
+        defer service.allocator.free(volume);
+        const mute = try collectors.command(service.allocator, service.io, &.{ "pactl", "get-sink-mute", "@DEFAULT_SINK@" });
+        defer service.allocator.free(mute);
+        const percent = collectors.parsePactlVolume(volume) orelse return;
+        var sample = Sample{ .t = service.now() };
+        sample.fields[0] = @floatFromInt(percent);
+        sample.fields[1] = @floatFromInt(@intFromBool(collectors.parsePactlMute(mute)));
+        service.lock();
+        self.source.push(sample);
+        service.publish();
+    }
+
+    /// `Event 'change' on sink #56`; `on server` when the default changes.
+    /// Streams (sink-input) and sources do not move the sink's volume.
+    pub fn line(self: *AudioListener, text: []const u8) !void {
+        if (std.mem.indexOf(u8, text, " on sink #") == null and std.mem.indexOf(u8, text, " on server") == null) return;
+        self.read() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {},
+        };
+    }
+};
+
+const GpuListener = struct {
+    service: *Service,
+    source: *Source,
+
+    pub fn line(self: *GpuListener, text: []const u8) !void {
+        const gpu = collectors.parseGpu(text) orelse return;
+        var sample = Sample{ .t = self.service.now() };
+        sample.fields[0] = gpu.busy;
+        sample.fields[1] = gpu.temperature;
+        sample.fields[2] = gpu.memory_used;
+        sample.fields[3] = gpu.memory_total;
+        sample.fields[4] = gpu.power;
+        self.service.lock();
+        self.source.push(sample);
+        self.service.publish();
+    }
+};
+
 /// One source as a script value: an object holding `t` (sample times) and a
 /// series per field, plus each kind's latest non-series state:
-///   cpu      busy (cores' worth), percent; count, cores (latest % per core)
+///   cpu      busy (cores' worth), percent, mhz (average clock), mhz_max;
+///            count, cores (latest % per core)
 ///   memory   total, used, cache, arc, free, swap_*, zswap_* (bytes)
-///   network  rx, tx (cumulative bytes); interface
-///   disks    disks = { { label, total, used, avail, read, write } } where read
-///            and write are cumulative-bytes series against the shared `t`
+///   network  rx, tx (cumulative bytes); interface, address (its IPv4, or
+///            empty), address6 (its stable global IPv6, or empty), tunnels =
+///            { { interface, address } } (WireGuard, tun)
+///   disks    disks = { { label, total, used, avail, read, write, devices,
+///            state, data_errors } } where read and write are cumulative-bytes
+///            series against the shared `t`, devices the kernel names of the
+///            block devices it is on, state a pool's health (else empty)
+///   sensors  sensors = { { label, kind, critical, temperature } }: kind is
+///            cpu, gpu or drive (labelled by kernel name, e.g. nvme0), critical
+///            the chip's limit in °C (0 if none), temperature a °C series
+///   gpu      busy (%), temperature (°C), memory_used, memory_total (bytes),
+///            power (W)
 ///   audio    percent, muted (0/1)
 ///   battery  present, percent, charging, on_ac (0/1)
 ///   command  text (latest output, trimmed), ok
@@ -399,11 +544,33 @@ fn encodeSource(comptime Value: type, arena: std.mem.Allocator, source: *const S
             try fields.append(arena, .{ .key = "count", .value = .{ .number = @floatFromInt(source.cpu_count) } });
             try fields.append(arena, .{ .key = "cores", .value = .{ .array = cores } });
         },
-        .network => try fields.append(arena, .{ .key = "interface", .value = .{ .string = try arena.dupe(u8, source.interface[0..source.interface_len]) } }),
+        .network => {
+            try fields.append(arena, .{ .key = "interface", .value = .{ .string = try arena.dupe(u8, source.interface[0..source.interface_len]) } });
+            try fields.append(arena, .{ .key = "address", .value = .{ .string = try arena.dupe(u8, source.address.textSlice()) } });
+            try fields.append(arena, .{ .key = "address6", .value = .{ .string = try arena.dupe(u8, source.address6.textSlice()) } });
+            const tunnels = try arena.alloc(Value, source.tunnel_count);
+            for (tunnels, source.tunnels[0..source.tunnel_count]) |*item, *tunnel| item.* = .{ .object = try arena.dupe(Value.Field, &.{
+                .{ .key = "interface", .value = .{ .string = try arena.dupe(u8, tunnel.interfaceSlice()) } },
+                .{ .key = "address", .value = .{ .string = try arena.dupe(u8, tunnel.textSlice()) } },
+            }) };
+            try fields.append(arena, .{ .key = "tunnels", .value = .{ .array = tunnels } });
+        },
+        .sensors => {
+            const sensors = try arena.alloc(Value, source.sensor_count);
+            for (sensors, source.sensors[0..source.sensor_count], 0..) |*item, *sensor, index| item.* = .{ .object = try arena.dupe(Value.Field, &.{
+                .{ .key = "label", .value = .{ .string = try arena.dupe(u8, sensor.labelSlice()) } },
+                .{ .key = "kind", .value = .{ .string = @tagName(sensor.kind) } },
+                .{ .key = "critical", .value = .{ .number = sensor.critical } },
+                .{ .key = "temperature", .value = try series(Value, arena, source, index) },
+            }) };
+            try fields.append(arena, .{ .key = "sensors", .value = .{ .array = sensors } });
+        },
         .disks => {
             const disks = try arena.alloc(Value, source.disk_count);
-            for (disks, source.disks[0..source.disk_count], 0..) |*item, disk, index| {
+            for (disks, source.disks[0..source.disk_count], 0..) |*item, *disk, index| {
                 const group = disk.group;
+                const devices = try arena.alloc(Value, disk.device_count);
+                for (devices, disk.deviceSlice()) |*name, *device| name.* = .{ .string = try arena.dupe(u8, device.slice()) };
                 const entry = try arena.dupe(Value.Field, &.{
                     .{ .key = "label", .value = .{ .string = try arena.dupe(u8, group.labelSlice()) } },
                     .{ .key = "total", .value = .{ .number = @floatFromInt(group.total) } },
@@ -411,6 +578,9 @@ fn encodeSource(comptime Value: type, arena: std.mem.Allocator, source: *const S
                     .{ .key = "avail", .value = .{ .number = @floatFromInt(group.avail) } },
                     .{ .key = "read", .value = try series(Value, arena, source, index * 2) },
                     .{ .key = "write", .value = try series(Value, arena, source, index * 2 + 1) },
+                    .{ .key = "devices", .value = .{ .array = devices } },
+                    .{ .key = "state", .value = .{ .string = try arena.dupe(u8, disk.stateSlice()) } },
+                    .{ .key = "data_errors", .value = .{ .number = @floatFromInt(disk.data_errors) } },
                 });
                 item.* = .{ .object = entry };
             }
@@ -420,7 +590,7 @@ fn encodeSource(comptime Value: type, arena: std.mem.Allocator, source: *const S
             try fields.append(arena, .{ .key = "text", .value = .{ .string = try arena.dupe(u8, source.text[0..source.text_len]) } });
             try fields.append(arena, .{ .key = "ok", .value = .{ .boolean = source.ok } });
         },
-        .memory, .audio, .battery => {},
+        .memory, .gpu, .audio, .battery => {},
     }
     return .{ .object = try fields.toOwnedSlice(arena) };
 }
@@ -477,4 +647,6 @@ test "sources encode as timestamped series with named fields" {
 
 test {
     _ = collectors;
+    _ = hwmon;
+    _ = addresses;
 }

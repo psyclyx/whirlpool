@@ -151,23 +151,6 @@ pub fn parseMemory(meminfo: []const u8, arc: u64) !Memory {
     };
 }
 
-/// Where a filesystem's I/O counters live.
-pub const IoTarget = struct {
-    kind: enum { none, zfs_pool, block_device } = .none,
-    name: [64]u8 = undefined,
-    len: u8 = 0,
-
-    pub fn nameSlice(self: *const IoTarget) []const u8 {
-        return self.name[0..self.len];
-    }
-};
-
-
-pub fn copyName(target: *[64]u8, source: []const u8) u8 {
-    const count = @min(target.len, source.len);
-    @memcpy(target[0..count], source[0..count]);
-    return @intCast(count);
-}
 
 pub fn readDefaultInterface(io: std.Io, buffer: []u8) ![]const u8 {
     var route_buffer: [4096]u8 = undefined;
@@ -287,20 +270,6 @@ pub fn readBattery(io: std.Io) !Battery {
     return battery;
 }
 
-pub const Audio = struct { percent: u8, muted: bool };
-
-/// The default sink's volume, from `wpctl` output.
-pub fn parseAudio(output: []const u8) ?Audio {
-    const marker = "Volume:";
-    const start = (std.mem.indexOf(u8, output, marker) orelse return null) + marker.len;
-    var fields = std.mem.tokenizeAny(u8, output[start..], " \t\r\n");
-    const volume = std.fmt.parseFloat(f64, fields.next() orelse return null) catch return null;
-    return .{
-        .percent = @intFromFloat(@min(100.0, @max(0.0, volume * 100.0 + 0.5))),
-        .muted = std.mem.indexOf(u8, output, "[MUTED]") != null,
-    };
-}
-
 /// Run `argv` and return its standard output; a nonzero exit is an error.
 pub fn command(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
     const result = try std.process.run(allocator, io, .{
@@ -320,10 +289,26 @@ pub fn command(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u
 
 pub const max_disks = storage.max_groups;
 
-/// One filesystem worth reporting, and where its I/O counters live.
+/// One filesystem worth reporting: its space, the block devices its traffic
+/// goes to (a pool's leaf devices, or the one device a filesystem is mounted
+/// from), and, for a pool, its health.
 pub const Disk = struct {
     group: storage.Group,
-    target: IoTarget,
+    devices: [storage.max_devices]storage.DeviceName = undefined,
+    device_count: u8 = 0,
+    /// `ONLINE`, `DEGRADED`, ...; empty for anything but a pool.
+    state: [16]u8 = undefined,
+    state_len: u8 = 0,
+    /// Files the pool knows to be damaged.
+    data_errors: u32 = 0,
+
+    pub fn deviceSlice(self: *const Disk) []const storage.DeviceName {
+        return self.devices[0..self.device_count];
+    }
+
+    pub fn stateSlice(self: *const Disk) []const u8 {
+        return self.state[0..self.state_len];
+    }
 };
 
 /// Find the filesystems worth reporting and size each from what owns its space.
@@ -348,62 +333,141 @@ pub fn discoverDisks(allocator: std.mem.Allocator, io: std.Io, disks: *[max_disk
         defer allocator.free(output);
         total = storage.applyZfsList(output, &groups, count);
     } else |_| {}
+    // Which devices each pool's traffic goes to, and its health.
+    var pools: [storage.max_groups]storage.PoolStatus = undefined;
+    var pool_count: usize = 0;
+    if (command(allocator, io, &.{ "zpool", "status", "-LP" })) |output| {
+        defer allocator.free(output);
+        pool_count = storage.parseZpoolStatus(output, &pools);
+    } else |_| {}
     const kept = storage.finalize(groups[0..total]);
-    for (groups[0..kept], 0..) |group, index| disks[index] = .{ .group = group, .target = ioTarget(io, group) };
+    for (groups[0..kept], 0..) |group, index| {
+        var disk = Disk{ .group = group };
+        switch (group.kind) {
+            .zfs => for (pools[0..pool_count]) |*pool| {
+                if (!std.mem.eql(u8, pool.nameSlice(), group.keySlice())) continue;
+                disk.devices = pool.devices;
+                disk.device_count = pool.device_count;
+                disk.state = pool.state;
+                disk.state_len = pool.state_len;
+                disk.data_errors = pool.data_errors;
+            },
+            .block => if (blockDevice(io, group.keySlice())) |device| {
+                disk.devices[0] = device;
+                disk.device_count = 1;
+            },
+        }
+        disks[index] = disk;
+    }
     return kept;
 }
 
-/// Which counters describe a filesystem's traffic.
-fn ioTarget(io: std.Io, group: storage.Group) IoTarget {
-    var target = IoTarget{};
-    switch (group.kind) {
-        .zfs => {
-            target.kind = .zfs_pool;
-            target.len = copyName(&target.name, group.keySlice());
-        },
-        .block => {
-            var name = group.keySlice();
-            var resolved: [128]u8 = undefined;
-            if (std.mem.startsWith(u8, name, "/dev/mapper/") or std.mem.startsWith(u8, name, "/dev/disk/")) {
-                // Names like /dev/mapper/root are symlinks to /dev/dm-N.
-                if (std.Io.Dir.cwd().readLink(io, name, &resolved)) |length| {
-                    name = resolved[0..length];
-                } else |_| return target;
-            }
-            const slash = std.mem.lastIndexOfScalar(u8, name, '/') orelse return target;
-            target.kind = .block_device;
-            target.len = copyName(&target.name, name[slash + 1 ..]);
-        },
+/// The kernel name of the device a filesystem is mounted from: names like
+/// /dev/mapper/root are symlinks to /dev/dm-N.
+fn blockDevice(io: std.Io, source: []const u8) ?storage.DeviceName {
+    var resolved: [128]u8 = undefined;
+    var name = source;
+    if (std.mem.startsWith(u8, name, "/dev/mapper/") or std.mem.startsWith(u8, name, "/dev/disk/")) {
+        const length = std.Io.Dir.cwd().readLink(io, name, &resolved) catch return null;
+        name = resolved[0..length];
     }
-    return target;
+    if (!std.mem.startsWith(u8, name, "/dev/") and std.mem.indexOfScalar(u8, name, '/') != null) return null;
+    return storage.DeviceName.from(name);
 }
 
-/// Cumulative bytes read and written for a disk.
-pub fn readDiskCounters(io: std.Io, target: IoTarget) ?io_mod.Counters {
-    switch (target.kind) {
-        .none => return null,
-        .zfs_pool => {
-            var path: [128]u8 = undefined;
-            const location = std.fmt.bufPrint(&path, "/proc/spl/kstat/zfs/{s}/io", .{target.nameSlice()}) catch return null;
-            var buffer: [4096]u8 = undefined;
-            const data = std.Io.Dir.cwd().readFile(io, location, &buffer) catch return null;
-            return io_mod.parseZfsPoolIo(data);
-        },
-        .block_device => {
-            var buffer: [64 * 1024]u8 = undefined;
-            const data = std.Io.Dir.cwd().readFile(io, "/proc/diskstats", &buffer) catch return null;
-            return io_mod.parseDiskstats(data, target.nameSlice());
-        },
+/// Cumulative bytes read and written for a disk: the sum over its devices,
+/// from `diskstats` (the text of /proc/diskstats, read once for all disks).
+pub fn diskCounters(diskstats: []const u8, disk: *const Disk) ?io_mod.Counters {
+    var total = io_mod.Counters{ .read = 0, .written = 0 };
+    var found = false;
+    for (disk.deviceSlice()) |*device| {
+        const counters = io_mod.parseDiskstats(diskstats, device.slice()) orelse continue;
+        total.read +|= counters.read;
+        total.written +|= counters.written;
+        found = true;
     }
+    return if (found) total else null;
 }
 
-test "audio volume and mute come from wpctl's output" {
-    try std.testing.expectEqual(Audio{ .percent = 45, .muted = false }, parseAudio("Volume: 0.45\n").?);
-    try std.testing.expectEqual(Audio{ .percent = 100, .muted = true }, parseAudio("Volume: 1.20 [MUTED]\n").?);
-    try std.testing.expect(parseAudio("nothing") == null);
+pub fn readDiskstats(io: std.Io, buffer: []u8) ![]u8 {
+    return std.Io.Dir.cwd().readFile(io, "/proc/diskstats", buffer);
 }
 
 test {
     _ = storage;
     _ = io_mod;
+}
+
+pub const Gpu = struct { busy: f64 = 0, temperature: f64 = 0, memory_used: f64 = 0, memory_total: f64 = 0, power: f64 = 0 };
+
+/// One line of `nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,
+/// memory.used,memory.total,power.draw --format=csv,noheader,nounits`.
+/// Memory is reported in MiB; a field the card does not report (`[N/A]`)
+/// reads as 0.
+pub fn parseGpu(line: []const u8) ?Gpu {
+    var values: [5]f64 = undefined;
+    var fields = std.mem.splitScalar(u8, line, ',');
+    for (&values) |*value| {
+        const field = std.mem.trim(u8, fields.next() orelse return null, " ");
+        value.* = std.fmt.parseFloat(f64, field) catch 0;
+    }
+    const mib = 1024 * 1024;
+    return .{ .busy = values[0], .temperature = values[1], .memory_used = values[2] * mib, .memory_total = values[3] * mib, .power = values[4] };
+}
+
+test "gpu figures come from nvidia-smi's csv" {
+    const gpu = parseGpu("36, 61, 2727, 24576, 122.16").?;
+    try std.testing.expectEqual(@as(f64, 36), gpu.busy);
+    try std.testing.expectEqual(@as(f64, 61), gpu.temperature);
+    try std.testing.expectEqual(@as(f64, 24576 * 1024 * 1024), gpu.memory_total);
+    try std.testing.expectEqual(@as(f64, 0), parseGpu("5, 40, 100, 200, [N/A]").?.power);
+    try std.testing.expect(parseGpu("garbage") == null);
+}
+
+pub const CpuFrequency = struct { average_mhz: f64 = 0, max_mhz: f64 = 0 };
+
+/// Each core's clock from cpufreq: the measured average over the last tick
+/// (`cpuinfo_avg_freq`, from APERF/MPERF) where the kernel has it, else the
+/// governor's current setting. Averaged and maximised over `count` cores.
+pub fn readCpuFrequency(io: std.Io, count: usize) CpuFrequency {
+    var result = CpuFrequency{};
+    var total: f64 = 0;
+    var read: usize = 0;
+    for (0..count) |core| {
+        var path: [80]u8 = undefined;
+        var value: [32]u8 = undefined;
+        const khz = for ([_][]const u8{ "cpuinfo_avg_freq", "scaling_cur_freq" }) |file| {
+            const location = std.fmt.bufPrint(&path, "/sys/devices/system/cpu/cpu{d}/cpufreq/{s}", .{ core, file }) catch break null;
+            const text = std.Io.Dir.cwd().readFile(io, location, &value) catch continue;
+            break std.fmt.parseUnsigned(u64, std.mem.trim(u8, text, " \n"), 10) catch continue;
+        } else null;
+        const mhz = @as(f64, @floatFromInt(khz orelse continue)) / 1000;
+        total += mhz;
+        read += 1;
+        result.max_mhz = @max(result.max_mhz, mhz);
+    }
+    if (read > 0) result.average_mhz = total / @as(f64, @floatFromInt(read));
+    return result;
+}
+
+/// The default sink's volume, from `pactl get-sink-volume` ("Volume:
+/// front-left: 22734 /  35% / -27.59 dB, ..."): the first channel's percent.
+pub fn parsePactlVolume(output: []const u8) ?u16 {
+    const percent = std.mem.indexOfScalar(u8, output, '%') orelse return null;
+    var start = percent;
+    while (start > 0 and std.ascii.isDigit(output[start - 1])) start -= 1;
+    return std.fmt.parseUnsigned(u16, output[start..percent], 10) catch null;
+}
+
+/// Whether `pactl get-sink-mute` says "Mute: yes".
+pub fn parsePactlMute(output: []const u8) bool {
+    return std.mem.indexOf(u8, output, "Mute: yes") != null;
+}
+
+test "pactl reports the sink's volume and mute" {
+    try std.testing.expectEqual(@as(?u16, 35), parsePactlVolume("Volume: front-left: 22734 /  35% / -27.59 dB,   front-right: 22734 /  35% / -27.59 dB\n        balance 0.00\n"));
+    try std.testing.expectEqual(@as(?u16, 150), parsePactlVolume("Volume: mono: 98304 / 150% / 10.57 dB\n"));
+    try std.testing.expect(parsePactlVolume("nothing") == null);
+    try std.testing.expect(parsePactlMute("Mute: yes\n"));
+    try std.testing.expect(!parsePactlMute("Mute: no\n"));
 }

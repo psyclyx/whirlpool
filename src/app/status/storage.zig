@@ -264,3 +264,118 @@ test "root sorts first, then largest, and tiny filesystems are dropped" {
     try std.testing.expectEqualStrings("tank", groups[1].labelSlice());
     try std.testing.expectEqualStrings("bulk", groups[2].labelSlice());
 }
+
+pub const max_devices = 8;
+
+/// A device name as the kernel calls it (`nvme1n1p3`), short enough for
+/// /proc/diskstats.
+pub const DeviceName = struct {
+    bytes: [32]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn slice(self: *const DeviceName) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn from(path: []const u8) DeviceName {
+        var name = DeviceName{};
+        name.len = copyInto(32, &name.bytes, baseName(path));
+        return name;
+    }
+};
+
+/// One pool as `zpool status -LP` describes it: its health, its leaf devices
+/// (where its traffic shows in /proc/diskstats), and how many files it knows
+/// to be damaged.
+pub const PoolStatus = struct {
+    name: [64]u8 = undefined,
+    name_len: u8 = 0,
+    state: [16]u8 = undefined,
+    state_len: u8 = 0,
+    devices: [max_devices]DeviceName = undefined,
+    device_count: u8 = 0,
+    data_errors: u32 = 0,
+
+    pub fn nameSlice(self: *const PoolStatus) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    pub fn stateSlice(self: *const PoolStatus) []const u8 {
+        return self.state[0..self.state_len];
+    }
+};
+
+/// Parse `zpool status -LP` (paths resolved, so leaves are /dev/<kernel name>).
+/// Returns how many pools were described.
+pub fn parseZpoolStatus(output: []const u8, pools: []PoolStatus) usize {
+    var count: usize = 0;
+    var current: ?*PoolStatus = null;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t");
+        if (std.mem.startsWith(u8, line, "pool:")) {
+            if (count == pools.len) {
+                current = null;
+                continue;
+            }
+            pools[count] = .{};
+            current = &pools[count];
+            count += 1;
+            current.?.name_len = copyInto(64, &current.?.name, std.mem.trim(u8, line["pool:".len..], " "));
+            continue;
+        }
+        const pool = current orelse continue;
+        if (std.mem.startsWith(u8, line, "state:")) {
+            pool.state_len = copyInto(16, &pool.state, std.mem.trim(u8, line["state:".len..], " "));
+        } else if (std.mem.startsWith(u8, line, "errors:")) {
+            var words = std.mem.tokenizeScalar(u8, line["errors:".len..], ' ');
+            pool.data_errors = std.fmt.parseUnsigned(u32, words.next() orelse "", 10) catch 0;
+        } else if (std.mem.startsWith(u8, line, "/dev/")) {
+            if (pool.device_count == max_devices) continue;
+            const end = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+            pool.devices[pool.device_count] = DeviceName.from(line[0..end]);
+            pool.device_count += 1;
+        }
+    }
+    return count;
+}
+
+test "zpool status names each pool's health, leaf devices and damaged files" {
+    var pools: [4]PoolStatus = undefined;
+    const count = parseZpoolStatus(
+        \\  pool: rpool
+        \\ state: ONLINE
+        \\status: One or more devices has experienced an error resulting in data
+        \\    corruption.  Applications may be affected.
+        \\config:
+        \\
+        \\    NAME              STATE     READ WRITE CKSUM
+        \\    rpool             ONLINE       0     0     0
+        \\      /dev/nvme1n1p3  ONLINE       0     0     0
+        \\
+        \\errors: 1 data errors, use '-v' for a list
+        \\
+        \\  pool: tank
+        \\ state: DEGRADED
+        \\config:
+        \\
+        \\    NAME           STATE     READ WRITE CKSUM
+        \\    tank           DEGRADED     0     0     0
+        \\      mirror-0     DEGRADED     0     0     0
+        \\        /dev/sda1  ONLINE       0     0     0
+        \\        /dev/sdb1  FAULTED      0     0     0
+        \\
+        \\errors: No known data errors
+        \\
+    , &pools);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("rpool", pools[0].nameSlice());
+    try std.testing.expectEqualStrings("ONLINE", pools[0].stateSlice());
+    try std.testing.expectEqual(@as(u32, 1), pools[0].data_errors);
+    try std.testing.expectEqual(@as(u8, 1), pools[0].device_count);
+    try std.testing.expectEqualStrings("nvme1n1p3", pools[0].devices[0].slice());
+    try std.testing.expectEqualStrings("DEGRADED", pools[1].stateSlice());
+    try std.testing.expectEqual(@as(u32, 0), pools[1].data_errors);
+    try std.testing.expectEqual(@as(u8, 2), pools[1].device_count);
+    try std.testing.expectEqualStrings("sdb1", pools[1].devices[1].slice());
+}
