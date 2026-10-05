@@ -15,11 +15,19 @@ const types = host.types;
 
 pub const Hooks = struct {
     context: ?*anyopaque = null,
-    shell_created: ?*const fn (?*anyopaque, types.OutputId, *wayland.client.river.ShellSurfaceV1, *wayland.client.wl.Surface) anyerror!void = null,
+    /// A shell for an output: which of the output's shells it is (`slot`,
+    /// the configuration's order), its role and surface.
+    shell_created: ?*const fn (?*anyopaque, types.OutputId, u8, *wayland.client.river.ShellSurfaceV1, *wayland.client.wl.Surface) anyerror!void = null,
     shell_retire: ?*const fn (?*anyopaque, types.OutputId, types.ShellSurfaceId) anyerror!RetirementStatus = null,
     decoration_created: ?*const fn (?*anyopaque, types.WindowId, types.DecorationId, *wayland.client.river.DecorationV1, *wayland.client.wl.Surface) anyerror!void = null,
     decoration_retire: ?*const fn (?*anyopaque, types.WindowId, types.DecorationId, bool) anyerror!RetirementStatus = null,
+    /// A surface drawn on a layout mark: its name, and the size of the mark.
+    mark_created: ?*const fn (?*anyopaque, []const u8, types.ShellSurfaceId, *wayland.client.wl.Surface, types.Size) anyerror!void = null,
+    mark_retire: ?*const fn (?*anyopaque, types.ShellSurfaceId) anyerror!RetirementStatus = null,
 };
+
+/// A layout mark on an output that has a surface to draw it.
+pub const DesiredMark = struct { output: types.OutputId, name: world.MarkName, extent: types.Size };
 
 pub const RetirementStatus = enum { pending_release, release_safe };
 pub const ShellVisitor = *const fn (?*anyopaque, types.OutputId, types.ShellSurfaceId) anyerror!void;
@@ -29,10 +37,25 @@ const RecordState = enum { active, retiring };
 const ShellRecord = struct {
     output: *wayland.client.river.OutputV1,
     output_id: types.OutputId,
+    slot: u8,
     extent: types.Size,
     role: *wayland.client.river.ShellSurfaceV1,
     surface: *wayland.client.wl.Surface,
     state: RecordState = .active,
+};
+
+const MarkRecord = struct {
+    output: types.OutputId,
+    name: world.MarkName,
+    extent: types.Size,
+    role: *wayland.client.river.ShellSurfaceV1,
+    node: *wayland.client.river.NodeV1,
+    state: RecordState = .active,
+
+    fn draws(self: *const MarkRecord, mark: DesiredMark) bool {
+        return self.output.value == mark.output.value and
+            std.mem.eql(u8, self.name.slice(), mark.name.slice());
+    }
 };
 
 const DecorationRecord = struct {
@@ -121,7 +144,10 @@ pub const Runtime = struct {
     hooks: Hooks,
     shells: std.ArrayList(ShellRecord) = .empty,
     decorations: std.ArrayList(DecorationRecord) = .empty,
+    marks: std.ArrayList(MarkRecord) = .empty,
     decoration_lifetime: DecorationLifetime,
+    /// How many shells each output has (see `live.max_output_shells`).
+    shell_slots: u8 = 1,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -141,8 +167,9 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) !void {
-        if (self.shells.items.len != 0 or self.decorations.items.len != 0)
+        if (self.shells.items.len != 0 or self.decorations.items.len != 0 or self.marks.items.len != 0)
             return error.RolesStillRetained;
+        self.marks.deinit(self.allocator);
         self.decoration_lifetime.deinit();
         self.decorations.deinit(self.allocator);
         self.shells.deinit(self.allocator);
@@ -152,17 +179,23 @@ pub const Runtime = struct {
     /// Drop bookkeeping after transport loss. The manager remains the owner
     /// of generated proxies and abandons them after this runtime is gone.
     pub fn abandon(self: *Runtime) void {
+        self.marks.deinit(self.allocator);
         self.decoration_lifetime.deinit();
         self.decorations.deinit(self.allocator);
         self.shells.deinit(self.allocator);
         self.* = undefined;
     }
 
+    /// Every live shell surface: each output's, and those drawn on marks.
     pub fn forEachShell(self: *const Runtime, context: ?*anyopaque, visit: ShellVisitor) !void {
         for (self.shells.items) |record| {
             if (record.state != .active) continue;
             const shell_id = try self.adapter.objects.shellSurfaceId(record.role);
             try visit(context, record.output_id, shell_id);
+        }
+        for (self.marks.items) |record| {
+            if (record.state != .active) continue;
+            try visit(context, record.output, try self.adapter.objects.shellSurfaceId(record.role));
         }
     }
 
@@ -174,6 +207,24 @@ pub const Runtime = struct {
 
     pub fn outputForSurface(self: *const Runtime, surface: *wayland.client.wl.Surface) ?types.OutputId {
         for (self.shells.items) |record| if (record.surface == surface) return record.output_id;
+        return null;
+    }
+
+    /// The output shell drawing on `surface`.
+    pub fn shellForSurface(self: *const Runtime, surface: *wayland.client.wl.Surface) ?types.ShellSurfaceId {
+        for (self.shells.items) |record| if (record.state == .active and record.surface == surface)
+            return self.adapter.objects.shellSurfaceId(record.role) catch null;
+        return null;
+    }
+
+    pub fn decorationForSurface(self: *const Runtime, surface: *wayland.client.wl.Surface) ?types.DecorationId {
+        for (self.decorations.items) |record| if (record.state == .active and record.surface == surface) return record.id;
+        return null;
+    }
+
+    /// The window a decoration belongs to.
+    pub fn windowForDecoration(self: *const Runtime, decoration: types.DecorationId) ?types.WindowId {
+        for (self.decorations.items) |record| if (record.state == .active and record.id.value == decoration.value) return record.window;
         return null;
     }
 
@@ -233,8 +284,9 @@ pub const Runtime = struct {
         for (self.manager.outputs.items) |output| {
             const output_id = try self.adapter.objects.outputId(output);
             const extent = (try self.adapter.objects.outputSize(output_id)) orelse continue;
-            if (self.findActiveShell(output)) |record| {
-                if (record.state == .active and shellExtentChanged(record.extent, extent)) {
+            for (self.shells.items) |*record| {
+                if (record.output != output or record.state != .active) continue;
+                if (shellExtentChanged(record.extent, extent)) {
                     const role_index = self.managerShellIndex(record.role) orelse
                         return error.RoleOwnershipLost;
                     try self.manager.requestOutputShellRoleRetirement(role_index);
@@ -262,33 +314,117 @@ pub const Runtime = struct {
         }
 
         for (self.manager.outputs.items) |output| {
-            // Create the replacement while the retiring role still owns its
-            // protocol objects. Besides minimizing the uncovered interval,
-            // this prevents a compositor from mistaking an allocator-reused
-            // shell identity for an unchanged render-list entry.
-            if (self.findActiveShell(output) != null) continue;
-            const output_id = try self.adapter.objects.outputId(output);
-            // Output identity arrives before its dimensions. Creating the role
-            // in that interval would force presentation to guess a buffer size.
-            const extent = (try self.adapter.objects.outputSize(output_id)) orelse continue;
-            const role_index = try self.manager.createOutputShellRole(self.compositor, output);
-            const role = self.manager.output_shell_roles.items[role_index];
-            self.shells.append(self.allocator, .{
-                .output = output,
-                .output_id = output_id,
-                .extent = extent,
-                .role = role.shell_surface,
-                .surface = role.surface,
-            }) catch |err| {
-                self.rollbackShell(role_index);
-                return err;
-            };
-            if (self.hooks.shell_created) |hook| hook(self.hooks.context, output_id, role.shell_surface, role.surface) catch |err| {
-                _ = self.shells.pop();
-                self.rollbackShell(role_index);
-                return err;
-            };
+            var slot: u8 = 0;
+            while (slot < self.shell_slots) : (slot += 1) {
+                // Create the replacement while the retiring role still owns its
+                // protocol objects. Besides minimizing the uncovered interval,
+                // this prevents a compositor from mistaking an allocator-reused
+                // shell identity for an unchanged render-list entry.
+                if (self.findActiveShell(output, slot) != null) continue;
+                const output_id = try self.adapter.objects.outputId(output);
+                // Output identity arrives before its dimensions. Creating the role
+                // in that interval would force presentation to guess a buffer size.
+                const extent = (try self.adapter.objects.outputSize(output_id)) orelse continue;
+                const role_index = try self.manager.createOutputShellRole(self.compositor, output, slot);
+                const role = self.manager.output_shell_roles.items[role_index];
+                self.shells.append(self.allocator, .{
+                    .output = output,
+                    .output_id = output_id,
+                    .slot = slot,
+                    .extent = extent,
+                    .role = role.shell_surface,
+                    .surface = role.surface,
+                }) catch |err| {
+                    self.rollbackShell(role_index);
+                    return err;
+                };
+                if (self.hooks.shell_created) |hook| hook(self.hooks.context, output_id, slot, role.shell_surface, role.surface) catch |err| {
+                    _ = self.shells.pop();
+                    self.rollbackShell(role_index);
+                    return err;
+                };
+            }
         }
+    }
+
+    /// Give each mark in `desired` a surface sized to it, from the post-dispatch
+    /// safe point; retire those whose mark is gone or has changed size (a
+    /// buffer is never resized in place). Returns whether any was created: a
+    /// new surface is positioned by the next render.
+    pub fn reconcileMarks(self: *Runtime, desired: []const DesiredMark) !bool {
+        for (self.marks.items) |*record| {
+            if (record.state != .active) continue;
+            const kept = for (desired) |mark| {
+                if (record.draws(mark)) break std.meta.eql(record.extent, mark.extent);
+            } else false;
+            if (kept) continue;
+            record.state = .retiring;
+            self.adapter.removeMarkNode(record.output, record.name);
+            const manager_index = self.managerShellIndex(record.role) orelse return error.RoleOwnershipLost;
+            try self.manager.requestOutputShellRoleRetirement(manager_index);
+        }
+        var index: usize = 0;
+        while (index < self.marks.items.len) {
+            if (self.marks.items[index].state == .retiring and try self.advanceMarkRetirement(index)) continue;
+            index += 1;
+        }
+        var created = false;
+        for (desired) |mark| {
+            const present = for (self.marks.items) |*record| {
+                if (record.state == .active and record.draws(mark)) break true;
+            } else false;
+            if (present) continue;
+            try self.createMark(mark);
+            created = true;
+        }
+        return created;
+    }
+
+    fn createMark(self: *Runtime, mark: DesiredMark) !void {
+        const output = try self.adapter.objects.outputProxy(mark.output);
+        const index = try self.manager.createMarkShellRole(self.compositor, output);
+        const role = self.manager.output_shell_roles.items[index];
+        const shell_id = self.adapter.objects.shellSurfaceId(role.shell_surface) catch |err| {
+            self.rollbackShell(index);
+            return err;
+        };
+        const node = self.adapter.objects.bindShellNode(world.live_objects.proxyRef(role.node)) catch |err| {
+            self.rollbackShell(index);
+            return err;
+        };
+        self.marks.append(self.allocator, .{
+            .output = mark.output,
+            .name = mark.name,
+            .extent = mark.extent,
+            .role = role.shell_surface,
+            .node = role.node,
+        }) catch |err| {
+            _ = self.adapter.objects.unbindShellNode(world.live_objects.proxyRef(role.node)) catch {};
+            self.rollbackShell(index);
+            return err;
+        };
+        if (self.hooks.mark_created) |hook| hook(self.hooks.context, mark.name.slice(), shell_id, role.surface, mark.extent) catch |err| {
+            _ = self.marks.pop();
+            _ = self.adapter.objects.unbindShellNode(world.live_objects.proxyRef(role.node)) catch {};
+            self.rollbackShell(index);
+            return err;
+        };
+        try self.adapter.setMarkNode(mark.output, mark.name, node);
+    }
+
+    fn advanceMarkRetirement(self: *Runtime, index: usize) !bool {
+        const record = self.marks.items[index];
+        const shell_id = try self.adapter.objects.shellSurfaceId(record.role);
+        const status = if (self.hooks.mark_retire) |hook|
+            try hook(self.hooks.context, shell_id)
+        else
+            RetirementStatus.release_safe;
+        if (status == .pending_release) return false;
+        const manager_index = self.managerShellIndex(record.role) orelse return error.RoleOwnershipLost;
+        _ = self.adapter.objects.unbindShellNode(world.live_objects.proxyRef(record.node)) catch {};
+        try self.manager.finishOutputShellRoleRetirement(manager_index);
+        _ = self.marks.orderedRemove(index);
+        return true;
     }
 
     fn createDecoration(raw: ?*anyopaque, window: types.WindowId) !void {
@@ -385,9 +521,9 @@ pub const Runtime = struct {
         self.manager.finishDecorationRoleRetirement(index) catch {};
     }
 
-    fn findActiveShell(self: *const Runtime, output: *wayland.client.river.OutputV1) ?*const ShellRecord {
+    fn findActiveShell(self: *const Runtime, output: *wayland.client.river.OutputV1, slot: u8) ?*const ShellRecord {
         for (self.shells.items) |*shell|
-            if (shell.output == output and shell.state == .active) return shell;
+            if (shell.output == output and shell.slot == slot and shell.state == .active) return shell;
         return null;
     }
 

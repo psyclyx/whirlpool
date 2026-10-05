@@ -49,19 +49,17 @@ installed stdlib algorithm and can be replaced without changing Zig. Its
 strips, main/cross-axis mapping, axis reversal, focus traversal, insertion
 policy, logical container focus, marks, and two-dimensional camera state are
 retained Lua data. The bar consumes the controller's presentation data rather
-than reconstructing a second model in Zig: each strip is a group,
-floating/fullscreen/scratchpad windows have distinct groups, and an insertion
-indicator identifies the destination for a new window. Whirlpool has no strip,
-group, or layout-node identity and no structural command. It validates only
+than reconstructing a second model in Zig: each strip is a group, and
+floating/fullscreen/scratchpad windows have distinct groups. Whirlpool has no
+strip, group, or layout-node identity and no structural command. It validates only
 concrete host mechanisms such as focusing or closing a window, activating a
 tag, changing a window's protocol state, or assigning a window to a tag and
 output. Presentation has one logical `focused` item whether that item is a leaf
 or group; it has no second selection model.
 
 Projected presentation items may be ordinary flow items or zero-advance
-overlays anchored at a flow boundary. The sample uses that generic distinction
-for group and insertion lines, so moving a structural marker cannot change
-window-item geometry. The host also reports exact leading and trailing clipped
+overlays anchored at a flow boundary. The sample marks group boundaries as
+overlays; its bar draws them as the spacing between windows. The host also reports exact leading and trailing clipped
 pixel counts; Lua decides how those amounts become edge fades.
 
 Time-dependent layouts use the same boundary. Zig adds a monotonic timestamp
@@ -98,8 +96,10 @@ Lua module loaded with `require`. Every Lua state (configuration, layout, each
 surface) has the same `package.path`: the standard library
 (`<prefix>/share/whirlpool/lua`) first, so a configuration named
 `whirlpool.lua` cannot shadow it; then the configuration's directory
-(`lib/bar.lua` beside it is `lib.bar`); then the installed example library
-(`<prefix>/share/whirlpool/config`), which a configuration may build on.
+(`lib/bar.lua` beside it is `lib.bar`); then directories listed in
+`WHIRLPOOL_MODULES`. The example configuration is not installed with
+Whirlpool; Nix exposes it as `whirlpool.config`, a directory holding
+`whirlpool.lua` and its `lib/`.
 Nothing is read until it is required.
 
 Layouts and surfaces run in their own Lua states, so a configuration names
@@ -108,10 +108,15 @@ them by module and passes options as plain data.
 Every service a surface receives is an object of named fields, delivered to the
 handler registered for its name: `desktop` (tags and the layout's projected
 items with window metadata), `decoration`, `frame` (`now`), `pointer` (one
-event per value), and one service per registered source. A surface answers with
-actions (`surface.act("layout", ...)`, `surface.act("spawn", ...)`); the host
-knows nothing about what a surface draws, where its buttons are, or how it
-scrolls.
+event per value, to whichever shell or decoration has the pointer), and one
+service per registered source. A surface answers with actions
+(`surface.act("layout", ...)`, `surface.act("spawn", ...)`, and from a
+decoration while a button is held on it, `surface.act("pointer-operation",
+name, args...)`, which hands the pointer to River and reports its motion to the
+layout action `name` as `name <window> <dx> <dy> move|drop|cancel args...`,
+the right button cancelling); the host knows nothing
+about what a surface draws, where its buttons are, how it scrolls, or what
+dragging it means.
 
 Sources are measured by host tasks at their own period and delivered as
 timestamped series on the same clock as frame ticks: `t` plus one array per

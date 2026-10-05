@@ -39,7 +39,7 @@ pub const Runtime = struct {
         self.instructions = 0;
         try self.vm.setInstructionHook(instructionHook, &self, limits.hook_granularity);
         defer self.vm.clearInstructionHook();
-        try self.vm.run(chunk.items, "=whirlpool.layout.provider");
+        try self.vm.runReporting(chunk.items, "=whirlpool.layout.provider");
         return self;
     }
 
@@ -60,7 +60,7 @@ pub const Runtime = struct {
         self.instructions = 0;
         try self.vm.setInstructionHook(instructionHook, self, self.limits.hook_granularity);
         defer self.vm.clearInstructionHook();
-        try self.vm.call(1, 1);
+        try self.vm.callReporting(1, 1);
         return parsePlans(allocator, &self.vm, snapshot, output, self.limits.max_entries);
     }
 
@@ -83,7 +83,7 @@ pub const Runtime = struct {
         self.instructions = 0;
         try self.vm.setInstructionHook(instructionHook, self, self.limits.hook_granularity);
         defer self.vm.clearInstructionHook();
-        try self.vm.call(2, 1);
+        try self.vm.callReporting(2, 1);
         var parsed = script.IntentBatch.init(self.allocator, intents.limit - intents.count());
         defer parsed.deinit();
         try parseActionIntents(&self.vm, snapshot, &parsed);
@@ -257,6 +257,7 @@ fn parseProjection(allocator: std.mem.Allocator, vm: *script.lua_vm.Vm, snapshot
             .width = width,
             .overlay = try optionalBoolField(vm, -1, "overlay", false),
             .action = try script.layout_projection.Label.init(try optionalStringField(vm, -1, "action", "")),
+            .key = try script.layout_projection.Label.init(try optionalStringField(vm, -1, "key", "")),
             .args = action_args.values,
             .arg_count = action_args.len,
         });
@@ -284,7 +285,13 @@ fn pushSnapshot(vm: *script.lua_vm.Vm, snapshot: *const wm.WorldView, selected_o
     vm.setField(-2, "output");
     vm.createTable(0, 2);
     try setId(vm, "id", output.active_tag.raw());
-    if (snapshot.focusedWindow()) |focused| try setId(vm, "focused_window", focused.raw()) else setNil(vm, "focused_window");
+    // Only a window on this tag counts: seat focus on another output's window
+    // is not this tag's to frame.
+    const focused_here: ?wm.WindowId = if (snapshot.focusedWindow()) |focused| blk: {
+        const window = snapshot.getWindow(focused) orelse break :blk null;
+        break :blk if (window.tag == output.active_tag) focused else null;
+    } else null;
+    if (focused_here) |focused| try setId(vm, "focused_window", focused.raw()) else setNil(vm, "focused_window");
     vm.setField(-2, "tag");
 
     vm.createTable(@intCast(snapshot.liveOutputCount()), 0);
@@ -390,7 +397,34 @@ fn parsePlans(allocator: std.mem.Allocator, vm: *script.lua_vm.Vm, snapshot: *co
         vm.setTop(base + 1);
     }
     vm.setTop(base);
+    try parseMarks(allocator, vm, &plans.render);
     return plans;
+}
+
+/// `marks`, optional: `{ { name = "...", rect = { x, y, width, height }, z = n }, ... }`.
+fn parseMarks(allocator: std.mem.Allocator, vm: *script.lua_vm.Vm, render: *wm.RenderPlan) !void {
+    const base: c_int = @intCast(vm.stackDepth());
+    defer vm.setTop(base);
+    vm.getField(-1, "marks");
+    switch (vm.luaType(-1)) {
+        .nil => return,
+        .table => {},
+        else => return error.InvalidLayoutPlan,
+    }
+    const count = vm.rawLength(-1);
+    if (count > wm.RenderPlan.max_marks) return error.InvalidLayoutPlan;
+    try render.marks.ensureTotalCapacity(allocator, count);
+    for (0..count) |index| {
+        vm.rawGetInteger(-1, @intCast(index + 1));
+        const rect = try rectField(vm, -1, "rect");
+        if (rect.width == 0 or rect.height == 0) return error.InvalidLayoutPlan;
+        render.marks.appendAssumeCapacity(.{
+            .name = wm.layout.Mark.Name.init(try stringField(vm, -1, "name")) catch return error.InvalidLayoutPlan,
+            .rect = rect,
+            .z_index = try optionalIntegerField(i32, vm, -1, "z", 0),
+        });
+        vm.setTop(base + 1);
+    }
 }
 
 fn liveId(comptime T: type, vm: *script.lua_vm.Vm, snapshot: *const wm.WorldView, index: c_int, comptime name: [:0]const u8) !T {
@@ -744,18 +778,18 @@ fn layoutRound(world: *wm.World, runtime: *Runtime, outputs: []const wm.OutputId
     for (outputs) |output| {
         var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0);
         defer plans.deinit();
-        for (plans.manage.dimensions.items) |proposal| {
+        // Entries and proposals are parallel; windows proposed nothing
+        // (floating ones) keep their size.
+        for (plans.manage.dimensions.items, plans.render.entries.items) |proposal, entry| {
             const size = proposal.size orelse continue;
             round.sizes[round.len] = size;
+            round.screens[round.len] = entry.screen;
             updates[update_count] = .{
                 .window = proposal.window,
                 .size = .{ .width = @max(10, size.width / 10 * 10), .height = @max(20, size.height / 20 * 20) },
             };
             update_count += 1;
             round.len += 1;
-        }
-        for (plans.render.entries.items, round.len - plans.manage.dimensions.items.len..) |entry, i| {
-            if (i < round.len) round.screens[i] = entry.screen;
         }
     }
     for (updates[0..update_count]) |update| {
@@ -1048,6 +1082,694 @@ test "focusing past a monitor's edge continues onto the neighbouring monitor" {
     try std.testing.expectEqual(@as(?wm.WindowId, desk.windows[0]), desk.world.focusedWindow());
 }
 
+test "when the focused window goes away on its own, focus passes to its neighbour" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var windows: [3]wm.WindowId = undefined;
+    for (&windows) |*window| {
+        window.* = try desk_world.createWindow(.{ .tag = tag });
+        try desk_world.manageWindow(window.*);
+    }
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = windows[2] } }});
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+
+    // The last of three columns closes: its left neighbour, not the first column.
+    _ = try desk_world.applyAtomically(&.{.{ .window = .{ .destroy = windows[2] } }});
+    try std.testing.expectEqual(@as(?wm.WindowId, null), desk_world.focusedWindow());
+    try dispatchAction(&desk_world, &fixture.runtime, &outputs, "focus-successor");
+    try std.testing.expectEqual(@as(?wm.WindowId, windows[1]), desk_world.focusedWindow());
+}
+
+fn plannedPlacement(world: *const wm.World, runtime: *Runtime, output: wm.OutputId, window: wm.WindowId) !wm.Placement {
+    const snapshot = world.view();
+    var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0);
+    defer plans.deinit();
+    for (plans.manage.dimensions.items) |item| if (item.window == window) return item.placement;
+    return error.WindowNotPlanned;
+}
+
+fn plannedScreen(world: *const wm.World, runtime: *Runtime, output: wm.OutputId, window: wm.WindowId) !wm.Rect {
+    const snapshot = world.view();
+    var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, 0);
+    defer plans.deinit();
+    for (plans.render.entries.items) |entry| if (entry.window == window) return entry.screen;
+    return error.WindowNotPlanned;
+}
+
+test "a dialog whose parent arrives after it first appears floats, unless placed otherwise" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const output = try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect });
+    // As River windows arrive: placed by the layout, not by the host.
+    const dialog = try desk_world.createWindow(.{ .tag = tag, .placement = .unplaced });
+    try desk_world.manageWindow(dialog);
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    try std.testing.expectEqual(wm.Placement.tiled, try plannedPlacement(&desk_world, &fixture.runtime, output, dialog));
+
+    _ = try desk_world.applyAtomically(&.{.{ .window = .{ .set_transient = .{ .window = dialog, .transient = true } } }});
+    try std.testing.expectEqual(wm.Placement.floating, try plannedPlacement(&desk_world, &fixture.runtime, output, dialog));
+
+    // Tiled by hand, it stays tiled whatever it says of itself.
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = dialog } }});
+    try dispatchAction(&desk_world, &fixture.runtime, &.{output}, "toggle-float");
+    try std.testing.expectEqual(wm.Placement.tiled, try plannedPlacement(&desk_world, &fixture.runtime, output, dialog));
+    _ = try desk_world.applyAtomically(&.{.{ .window = .{ .update_sizing = .{
+        .window = dialog,
+        .hints = .{ .min = .{ .width = 300, .height = 200 }, .max = .{ .width = 300, .height = 200 } },
+        .actual = null,
+        .proposed = null,
+    } } }});
+    try std.testing.expectEqual(wm.Placement.tiled, try plannedPlacement(&desk_world, &fixture.runtime, output, dialog));
+}
+
+/// The tiled arrangement as the layout projects it: window ids in tree order,
+/// with 0 opening and 1 closing each strip or group.
+fn arrangement(world: *const wm.World, runtime: *Runtime, output: wm.OutputId, buffer: []u64) ![]u64 {
+    const snapshot = world.view();
+    var projection = (try runtime.project(std.testing.allocator, &snapshot, output)) orelse return error.ExpectedProjection;
+    defer projection.deinit();
+    var len: usize = 0;
+    for (projection.items.items) |item| {
+        const style = item.style.slice();
+        const value: u64 = if (item.window) |window| window.raw() else if (std.mem.eql(u8, style, "group-open")) 0 else if (std.mem.eql(u8, style, "group-close")) 1 else continue;
+        buffer[len] = value;
+        len += 1;
+    }
+    return buffer[0..len];
+}
+
+/// A window opening as River opens them: unplaced, and focused at once.
+fn openWindow(world: *wm.World, tag: wm.TagId) !wm.WindowId {
+    const window = try world.createWindow(.{ .tag = tag, .placement = .unplaced });
+    try world.manageWindow(window);
+    _ = try world.applyAtomically(&.{.{ .focus = .{ .window = window } }});
+    return window;
+}
+
+test "a window tiled only by guess waits for its first answer, so a parentless dialog never takes a column" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    var buffer: [16]u64 = undefined;
+    const editor = try openWindow(&desk_world, tag);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    const placed = [_]u64{ 0, editor.raw(), 1 };
+    try std.testing.expectEqualSlices(u64, &placed, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+
+    // As River announces it: no hints yet, focused at once.
+    const dialog = try openWindow(&desk_world, tag);
+    const snapshot = desk_world.view();
+    var plans = try fixture.runtime.buildAt(std.testing.allocator, &snapshot, outputs[0], 0);
+    defer plans.deinit();
+    var proposed = false;
+    for (plans.render.entries.items, plans.manage.dimensions.items) |entry, dimensions| if (entry.window == dialog) {
+        try std.testing.expect(!entry.visible);
+        proposed = dimensions.size != null;
+    };
+    try std.testing.expect(proposed);
+    try std.testing.expectEqualSlices(u64, &placed, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+
+    // Its answer: a size of its own, fixed. It floats (the projection's
+    // float group), and the strip never changed.
+    _ = try desk_world.applyAtomically(&.{.{ .window = .{ .update_sizing = .{
+        .window = dialog,
+        .hints = .{ .min = .{ .width = 300, .height = 247 }, .max = .{ .width = 300, .height = 247 } },
+        .actual = .{ .width = 300, .height = 247 },
+        .proposed = null,
+    } } }});
+    try std.testing.expectEqual(wm.Placement.floating, try plannedPlacement(&desk_world, &fixture.runtime, outputs[0], dialog));
+    try std.testing.expectEqualSlices(u64, &.{ 0, editor.raw(), 1, 0, dialog.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+
+    // An ordinary window answers with the size it was given and takes its
+    // column, before the window focused when it appeared.
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = editor } }});
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    const terminal = try openWindow(&desk_world, tag);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    try std.testing.expectEqualSlices(u64, &.{ 0, terminal.raw(), editor.raw(), 1, 0, dialog.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+}
+
+test "a new window opens just before the focused one, at its level" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    var buffer: [16]u64 = undefined;
+
+    // As columns: each opens before the one focused when it appeared.
+    const first = try openWindow(&desk_world, tag);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    const second = try openWindow(&desk_world, tag);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = first } }});
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    const third = try openWindow(&desk_world, tag);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    try std.testing.expectEqualSlices(u64, &.{ 0, second.raw(), third.raw(), first.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+
+    // Inside a group: the new window joins the group, before the focused one.
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = first } }});
+    try dispatchAction(&desk_world, &fixture.runtime, &outputs, "absorb-left");
+    const fourth = try openWindow(&desk_world, tag);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    try std.testing.expectEqualSlices(u64, &.{ 0, second.raw(), 0, third.raw(), fourth.raw(), first.raw(), 1, 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+}
+
+fn drag(world: *wm.World, runtime: *Runtime, outputs: []const wm.OutputId, window: wm.WindowId, dx: i32, dy: i32, phase: []const u8) !void {
+    var snapshot = world.view();
+    var intents = script.IntentBatch.init(std.testing.allocator, 8);
+    defer intents.deinit();
+    var id: [24]u8 = undefined;
+    var x: [16]u8 = undefined;
+    var y: [16]u8 = undefined;
+    try runtime.beginActions();
+    errdefer runtime.finishActions(false) catch {};
+    try runtime.handleAction(&snapshot, outputs[0], "drag-window", &.{
+        try std.fmt.bufPrint(&id, "{d}", .{window.raw()}),
+        try std.fmt.bufPrint(&x, "{d}", .{dx}),
+        try std.fmt.bufPrint(&y, "{d}", .{dy}),
+        phase,
+        "300",
+        "14",
+    }, &intents);
+    try runtime.finishActions(true);
+    for (intents.intents.items) |intent| _ = try world.applyAtomically(&.{intent.toCommand()});
+    const after = world.view();
+    for (outputs) |output| {
+        var plans = try runtime.buildAt(std.testing.allocator, &after, output, 0);
+        plans.deinit();
+    }
+}
+
+fn threeColumns(world: *wm.World, runtime: *Runtime, outputs: []const wm.OutputId, tag: wm.TagId) ![3]wm.WindowId {
+    // Each opens before the last: a, b, c from left to right.
+    const c = try openWindow(world, tag);
+    _ = try layoutRound(world, runtime, outputs);
+    const b = try openWindow(world, tag);
+    _ = try layoutRound(world, runtime, outputs);
+    const a = try openWindow(world, tag);
+    _ = try layoutRound(world, runtime, outputs);
+    // Placed once it has answered; then on screen, where a drag starts.
+    _ = try layoutRound(world, runtime, outputs);
+    return .{ a, b, c };
+}
+
+test "a tiled window dragged by its title bar takes each place the pointer reaches" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    var buffer: [16]u64 = undefined;
+    const a, const b, const c = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    try std.testing.expectEqualSlices(u64, &.{ 0, a.raw(), b.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    const start = try plannedScreen(&desk_world, &fixture.runtime, outputs[0], a);
+
+    // Still over its own tile: nothing moves; the window follows the pointer.
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 200, 30, "move");
+    try std.testing.expectEqualSlices(u64, &.{ 0, a.raw(), b.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    const dragged = try plannedScreen(&desk_world, &fixture.runtime, outputs[0], a);
+    try std.testing.expectEqual(start.x + 200, dragged.x);
+    try std.testing.expectEqual(start.y + 30, dragged.y);
+    // The place it would land is marked, just under it, the size of its tile.
+    {
+        const snapshot = desk_world.view();
+        var plans = try fixture.runtime.buildAt(std.testing.allocator, &snapshot, outputs[0], 0);
+        defer plans.deinit();
+        try std.testing.expectEqual(@as(usize, 1), plans.render.marks.items.len);
+        const mark = plans.render.marks.items[0];
+        try std.testing.expectEqualStrings("drop", mark.name.slice());
+        try std.testing.expect(mark.rect.x < start.x and mark.rect.x + @as(i32, @intCast(mark.rect.width)) > start.x);
+        for (plans.render.entries.items) |entry| {
+            if (entry.window == a) try std.testing.expect(entry.z_index > mark.z_index) else try std.testing.expect(entry.z_index < mark.z_index);
+        }
+    }
+
+    // The pointer is at x = 304 + dx; b's tile spans 620..1228, c's 1236..1844.
+    // b's leading quarter: before b, where a already is.
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 400, 30, "move");
+    try std.testing.expectEqualSlices(u64, &.{ 0, a.raw(), b.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    // b's trailing quarter: after b.
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 800, 30, "move");
+    try std.testing.expectEqualSlices(u64, &.{ 0, b.raw(), a.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 1500, 30, "move");
+    try std.testing.expectEqualSlices(u64, &.{ 0, b.raw(), c.raw(), a.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    // Back a little, still over its new place: no flip back.
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 1450, 30, "drop");
+    try std.testing.expectEqualSlices(u64, &.{ 0, b.raw(), c.raw(), a.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    // Dropped: no more mark.
+    const snapshot = desk_world.view();
+    var plans = try fixture.runtime.buildAt(std.testing.allocator, &snapshot, outputs[0], 0);
+    defer plans.deinit();
+    try std.testing.expectEqual(@as(usize, 0), plans.render.marks.items.len);
+}
+
+test "a drag cancelled with the right button puts everything back" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    var buffer: [16]u64 = undefined;
+    const a, const b, const c = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 1500, 30, "move");
+    try std.testing.expectEqualSlices(u64, &.{ 0, b.raw(), c.raw(), a.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 1500, 30, "cancel");
+    try std.testing.expectEqualSlices(u64, &.{ 0, a.raw(), b.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    // And a new drag starts afresh.
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 800, 30, "drop");
+    try std.testing.expectEqualSlices(u64, &.{ 0, b.raw(), a.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+}
+
+fn screenAt(world: *const wm.World, runtime: *Runtime, output: wm.OutputId, window: wm.WindowId, now: f64) !wm.Rect {
+    const snapshot = world.view();
+    var plans = try runtime.buildAt(std.testing.allocator, &snapshot, output, now);
+    defer plans.deinit();
+    for (plans.render.entries.items) |entry| if (entry.window == window) return entry.screen;
+    return error.WindowNotPlanned;
+}
+
+test "when the focused window moves, the camera follows a little later" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const a, const b, _ = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = b } }});
+    const before = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 1000);
+
+    // b moves to the third column, off screen: the camera must follow it.
+    var snapshot = desk_world.view();
+    var intents = script.IntentBatch.init(std.testing.allocator, 8);
+    defer intents.deinit();
+    try fixture.runtime.beginActions();
+    try fixture.runtime.handleAction(&snapshot, outputs[0], "swap-right", &.{}, &intents);
+    try fixture.runtime.finishActions(true);
+    _ = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 2000);
+    // a did not move in the layout: only the camera moves it on screen. Within
+    // the lag it has not started; after it, it has gone the whole way.
+    try std.testing.expectEqual(before.x, (try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 2045)).x);
+    try std.testing.expect((try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 2500)).x < before.x);
+}
+
+test "a window moved to another strip leaves first; the gap closes after it" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const a, const b, _ = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = a } }});
+    const before = try screenAt(&desk_world, &fixture.runtime, outputs[0], b, 1000);
+
+    // a moves down into a strip of its own; b, beside it, closes the gap.
+    var snapshot = desk_world.view();
+    var intents = script.IntentBatch.init(std.testing.allocator, 8);
+    defer intents.deinit();
+    try fixture.runtime.beginActions();
+    try fixture.runtime.handleAction(&snapshot, outputs[0], "swap-down", &.{}, &intents);
+    try fixture.runtime.finishActions(true);
+    _ = try screenAt(&desk_world, &fixture.runtime, outputs[0], b, 2000);
+    try std.testing.expectEqual(before.x, (try screenAt(&desk_world, &fixture.runtime, outputs[0], b, 2045)).x);
+    try std.testing.expect((try screenAt(&desk_world, &fixture.runtime, outputs[0], b, 2500)).x < before.x);
+}
+
+test "a drag held near a monitor's edge pans that way" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const a, const b, _ = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    // Pointer at x = 304 + 940 = 1244, within the right edge zone; it then holds still.
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 940, 0, "move");
+    const first = try screenAt(&desk_world, &fixture.runtime, outputs[0], b, 1000);
+    const later = try screenAt(&desk_world, &fixture.runtime, outputs[0], b, 1100);
+    try std.testing.expect(later.x < first.x);
+}
+
+fn act(world: *wm.World, runtime: *Runtime, outputs: []const wm.OutputId, name: []const u8) !void {
+    var snapshot = world.view();
+    var intents = script.IntentBatch.init(std.testing.allocator, 8);
+    defer intents.deinit();
+    try runtime.beginActions();
+    errdefer runtime.finishActions(false) catch {};
+    try runtime.handleAction(&snapshot, outputs[0], name, &.{}, &intents);
+    try runtime.finishActions(true);
+    for (intents.intents.items) |intent| _ = try world.applyAtomically(&.{intent.toCommand()});
+    _ = try layoutRound(world, runtime, outputs);
+}
+
+test "a window dropped on the middle of another stacks with it, shrunk to its half while it hovers" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    var buffer: [16]u64 = undefined;
+    const a, const b, const c = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    const tile = try plannedScreen(&desk_world, &fixture.runtime, outputs[0], b);
+
+    // The middle of b (x = 904), its upper half: a would go above b.
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 600, 30, "move");
+    try std.testing.expectEqualSlices(u64, &.{ 0, a.raw(), b.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    {
+        const snapshot = desk_world.view();
+        var plans = try fixture.runtime.buildAt(std.testing.allocator, &snapshot, outputs[0], 0);
+        defer plans.deinit();
+        const mark = plans.render.marks.items[0];
+        try std.testing.expectEqualStrings("drop", mark.name.slice());
+        try std.testing.expect(mark.rect.height < tile.height / 2 + 40 and mark.rect.y < tile.y + 10);
+        // a takes the slot's size, and b makes room for it rather than
+        // being drawn over.
+        for (plans.manage.dimensions.items) |proposal| if (proposal.window == a or proposal.window == b)
+            try std.testing.expect(proposal.size.?.height < tile.height / 2 + 10);
+    }
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 600, 30, "drop");
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, a.raw(), b.raw(), 1, c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+}
+
+test "a window dropped into an existing stack joins it" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    var buffer: [16]u64 = undefined;
+    const a, const b, const c = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = a } }});
+    try act(&desk_world, &fixture.runtime, &outputs, "absorb-right");
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, a.raw(), b.raw(), 1, c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    // c onto the middle of the stack's lower window, its lower half. At rest
+    // b's tile is 608x350 at (4, 362) and c's title bar is grabbed at
+    // (920, 18): to (308, 624).
+    try drag(&desk_world, &fixture.runtime, &outputs, c, -612, 606, "move");
+    try drag(&desk_world, &fixture.runtime, &outputs, c, -612, 606, "drop");
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, a.raw(), b.raw(), c.raw(), 1, 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+}
+
+test "a proposed stack on a tile of odd height still proposes whole sizes" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    // 719 high: tiles of odd height, whose halves are not whole.
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 719 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const a, const b, _ = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 600, 30, "move");
+    const snapshot = desk_world.view();
+    var plans = try fixture.runtime.buildAt(std.testing.allocator, &snapshot, outputs[0], 0);
+    defer plans.deinit();
+    try std.testing.expect(plans.render.marks.items.len >= 1);
+    _ = b;
+}
+
+test "a window held at the bottom edge moves to a new row there, under the pointer" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    var buffer: [16]u64 = undefined;
+    const a, const b, const c = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+
+    // Pointer at y = 18 + 650 = 668: within reach of the bottom edge. Until
+    // the dwell, a mark says what holding will do; nothing has moved.
+    try drag(&desk_world, &fixture.runtime, &outputs, a, 0, 650, "move");
+    {
+        const snapshot = desk_world.view();
+        var plans = try fixture.runtime.buildAt(std.testing.allocator, &snapshot, outputs[0], 100);
+        defer plans.deinit();
+        var shift = false;
+        for (plans.render.marks.items) |mark| shift = shift or std.mem.eql(u8, mark.name.slice(), "shift");
+        try std.testing.expect(shift);
+    }
+    try std.testing.expectEqualSlices(u64, &.{ 0, a.raw(), b.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    _ = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 600);
+    try std.testing.expectEqualSlices(u64, &.{ 0, b.raw(), c.raw(), 1, 0, a.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+}
+
+test "focus moves to the window beside, not to where the column last had focus" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const a, const b, const c = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = c } }});
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    const d = try openWindow(&desk_world, tag);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    // Two stacked columns: a over b, and d over c.
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = a } }});
+    try act(&desk_world, &fixture.runtime, &outputs, "absorb-right");
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = d } }});
+    try act(&desk_world, &fixture.runtime, &outputs, "absorb-right");
+    // The right column last had focus on its upper window.
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = d } }});
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    const lower_left = if ((try plannedScreen(&desk_world, &fixture.runtime, outputs[0], a)).y > (try plannedScreen(&desk_world, &fixture.runtime, outputs[0], b)).y) a else b;
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = lower_left } }});
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    try act(&desk_world, &fixture.runtime, &outputs, "focus-right");
+    const focused = desk_world.focusedWindow().?;
+    try std.testing.expect(focused == c or focused == d);
+    try std.testing.expectEqual((try plannedScreen(&desk_world, &fixture.runtime, outputs[0], lower_left)).y, (try plannedScreen(&desk_world, &fixture.runtime, outputs[0], focused)).y);
+}
+
+test "every row on an output scrolls together" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const a, const b, const c = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = c } }});
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    const d = try openWindow(&desk_world, tag);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    // a alone in a row below; b, d, c in the row above, c past the edge.
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = a } }});
+    try act(&desk_world, &fixture.runtime, &outputs, "swap-down");
+    _ = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 10000);
+    const a_before = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 11000);
+    const b_before = try screenAt(&desk_world, &fixture.runtime, outputs[0], b, 11000);
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = c } }});
+    _ = try screenAt(&desk_world, &fixture.runtime, outputs[0], c, 12000);
+    const a_after = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 13000);
+    const b_after = try screenAt(&desk_world, &fixture.runtime, outputs[0], b, 13000);
+    try std.testing.expect(b_after.x < b_before.x);
+    try std.testing.expectEqual(b_before.x - b_after.x, a_before.x - a_after.x);
+    _ = d;
+}
+
+test "panning moves the view a window that way and holds it until recentred" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const a, _, _ = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = a } }});
+    const home = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 1000);
+
+    try act(&desk_world, &fixture.runtime, &outputs, "pan-right");
+    _ = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 2000);
+    const panned = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 3000);
+    try std.testing.expect(panned.x < home.x);
+    // Held, though the focused window is now partly out of view.
+    try std.testing.expectEqual(panned.x, (try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 4000)).x);
+
+    try act(&desk_world, &fixture.runtime, &outputs, "recenter");
+    _ = try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 5000);
+    try std.testing.expectEqual(home.x, (try screenAt(&desk_world, &fixture.runtime, outputs[0], a, 6000)).x);
+}
+
+fn actWith(world: *wm.World, runtime: *Runtime, outputs: []const wm.OutputId, name: []const u8, args: []const []const u8) !void {
+    var snapshot = world.view();
+    var intents = script.IntentBatch.init(std.testing.allocator, 8);
+    defer intents.deinit();
+    try runtime.beginActions();
+    errdefer runtime.finishActions(false) catch {};
+    try runtime.handleAction(&snapshot, outputs[0], name, args, &intents);
+    try runtime.finishActions(true);
+    _ = try layoutRound(world, runtime, outputs);
+}
+
+/// The key a projected item gives for `window` (`window:<id>`) or the first
+/// group or row (`node:<id>`, `strip:<id>`) with that prefix.
+fn projectedKey(world: *const wm.World, runtime: *Runtime, output: wm.OutputId, prefix: []const u8, buffer: []u8) ![]const u8 {
+    const snapshot = world.view();
+    var projection = (try runtime.project(std.testing.allocator, &snapshot, output)) orelse return error.ExpectedProjection;
+    defer projection.deinit();
+    for (projection.items.items) |item| if (std.mem.startsWith(u8, item.key.slice(), prefix)) {
+        @memcpy(buffer[0..item.key.len], item.key.slice());
+        return buffer[0..item.key.len];
+    };
+    return error.KeyNotProjected;
+}
+
+test "a window placed by a projected item's key goes there, in its row or group" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    var buffer: [16]u64 = undefined;
+    var key: [64]u8 = undefined;
+    var id: [24]u8 = undefined;
+    const a, const b, const c = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+    const a_id = try std.fmt.bufPrint(&id, "{d}", .{a.raw()});
+
+    // After c, by c's key.
+    var c_key: [32]u8 = undefined;
+    const c_name = try std.fmt.bufPrint(&c_key, "window:{d}", .{c.raw()});
+    try actWith(&desk_world, &fixture.runtime, &outputs, "place-window", &.{ a_id, "after", c_name });
+    try std.testing.expectEqualSlices(u64, &.{ 0, b.raw(), c.raw(), a.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+
+    // First in the row.
+    const row = try projectedKey(&desk_world, &fixture.runtime, outputs[0], "strip:", &key);
+    try actWith(&desk_world, &fixture.runtime, &outputs, "place-window", &.{ a_id, "first", row });
+    try std.testing.expectEqualSlices(u64, &.{ 0, a.raw(), b.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+
+    // Stack b with a, then put c last in that stack.
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = a } }});
+    try act(&desk_world, &fixture.runtime, &outputs, "absorb-right");
+    const stack = try projectedKey(&desk_world, &fixture.runtime, outputs[0], "node:", &key);
+    var c_id: [24]u8 = undefined;
+    try actWith(&desk_world, &fixture.runtime, &outputs, "place-window", &.{ try std.fmt.bufPrint(&c_id, "{d}", .{c.raw()}), "last", stack });
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, a.raw(), b.raw(), c.raw(), 1, 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+
+    // Out of a stack of two, placed against that stack: the stack dissolves
+    // and the window goes beside what remains of it.
+    try actWith(&desk_world, &fixture.runtime, &outputs, "place-window", &.{ try std.fmt.bufPrint(&c_id, "{d}", .{c.raw()}), "after", stack });
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, a.raw(), b.raw(), 1, c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+    const pair = try projectedKey(&desk_world, &fixture.runtime, outputs[0], "node:", &key);
+    try actWith(&desk_world, &fixture.runtime, &outputs, "place-window", &.{ a_id, "first", pair });
+    try std.testing.expectEqualSlices(u64, &.{ 0, a.raw(), b.raw(), c.raw(), 1 }, try arrangement(&desk_world, &fixture.runtime, outputs[0], &buffer));
+}
+
+test "a floating window dragged by its title bar moves with the pointer" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    const dialog = try desk_world.createWindow(.{
+        .tag = tag,
+        .placement = .unplaced,
+        .transient = true,
+        .floating_geometry = .{ .x = 100, .y = 100, .width = 300, .height = 200 },
+    });
+    try desk_world.manageWindow(dialog);
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    _ = try plannedPlacement(&desk_world, &fixture.runtime, outputs[0], dialog);
+
+    try drag(&desk_world, &fixture.runtime, &outputs, dialog, 50, -20, "move");
+    try drag(&desk_world, &fixture.runtime, &outputs, dialog, 80, 40, "drop");
+    try std.testing.expectEqual(wm.Rect{ .x = 180, .y = 140, .width = 300, .height = 200 }, desk_world.getWindow(dialog).?.floating_geometry);
+    try std.testing.expectEqual(wm.Placement.floating, try plannedPlacement(&desk_world, &fixture.runtime, outputs[0], dialog));
+}
+
+test "a closed window's focus goes to the window taking its place, then up its tree" {
+    var desk_world = wm.World.init(std.testing.allocator);
+    defer desk_world.deinit();
+    const tag = try desk_world.createTag();
+    const rect: wm.Rect = .{ .x = 0, .y = 0, .width = 1280, .height = 720 };
+    const outputs = [_]wm.OutputId{try desk_world.createOutput(.{ .active_tag = tag, .bounds = rect, .usable = rect })};
+    var fixture = try scrollingRuntime();
+    defer std.testing.allocator.free(fixture.source);
+    defer fixture.runtime.deinit();
+    const a, const b, const c = try threeColumns(&desk_world, &fixture.runtime, &outputs, tag);
+
+    // The middle column closes: the one sliding into its place, c.
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = b } }});
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    _ = try desk_world.applyAtomically(&.{.{ .window = .{ .destroy = b } }});
+    try dispatchAction(&desk_world, &fixture.runtime, &outputs, "focus-successor");
+    try std.testing.expectEqual(@as(?wm.WindowId, c), desk_world.focusedWindow());
+
+    // a stacked over c; a closes: its partner in the stack, before any column.
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = a } }});
+    try act(&desk_world, &fixture.runtime, &outputs, "absorb-right");
+    const d = try openWindow(&desk_world, tag);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    _ = try desk_world.applyAtomically(&.{.{ .focus = .{ .window = a } }});
+    _ = try layoutRound(&desk_world, &fixture.runtime, &outputs);
+    _ = try desk_world.applyAtomically(&.{.{ .window = .{ .destroy = a } }});
+    try dispatchAction(&desk_world, &fixture.runtime, &outputs, "focus-successor");
+    try std.testing.expectEqual(@as(?wm.WindowId, c), desk_world.focusedWindow());
+    _ = d;
+}
+
 test "actions run on the focused monitor even when it has no window" {
     var desk: Desk = undefined;
     try gappedDesk(&desk);
@@ -1200,7 +1922,7 @@ test "layout state saved by one runtime rebuilds the same arrangement in another
     defer std.testing.allocator.free(one.source);
     defer one.runtime.deinit();
     _ = try layoutRound(&first.world, &one.runtime, &first.output);
-    try dispatchAction(&first.world, &one.runtime, &first.output, "absorb-right");
+    try dispatchAction(&first.world, &one.runtime, &first.output, "absorb-left");
     _ = try layoutRound(&first.world, &one.runtime, &first.output);
     const arranged = try layoutRound(&first.world, &one.runtime, &first.output);
 

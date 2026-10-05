@@ -26,6 +26,32 @@ pub const RenderEntry = struct {
     /// Provider-defined stacking order; larger values are presented above lower values.
     z_index: i32 = 0,
 };
+/// A named place on an output the layout wants a surface drawn on (a
+/// surface configured with `placement = "mark"` and that name), stacked
+/// among the windows by `z_index`. The layout means nothing more by it.
+pub const Mark = struct {
+    name: Name,
+    rect: types.Rect,
+    z_index: i32 = 0,
+
+    pub const Name = struct {
+        bytes: [max_len]u8 = undefined,
+        len: u8 = 0,
+
+        pub const max_len = 32;
+
+        pub fn init(text: []const u8) !Name {
+            if (text.len == 0 or text.len > max_len) return error.InvalidMarkName;
+            var result = Name{ .len = @intCast(text.len) };
+            @memcpy(result.bytes[0..text.len], text);
+            return result;
+        }
+
+        pub fn slice(self: *const Name) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
+};
 pub const PlanContext = struct { allocator: std.mem.Allocator, epoch: u64, output: ids.OutputId };
 pub const ManagePlan = struct {
     context: PlanContext,
@@ -42,9 +68,13 @@ pub const ManagePlan = struct {
 pub const RenderPlan = struct {
     context: PlanContext,
     entries: std.ArrayList(RenderEntry) = .empty,
+    marks: std.ArrayList(Mark) = .empty,
+
+    pub const max_marks = 8;
 
     pub fn deinit(self: *RenderPlan) void {
         self.entries.deinit(self.context.allocator);
+        self.marks.deinit(self.context.allocator);
     }
 
     pub fn entrySlice(self: *const RenderPlan) []const RenderEntry {

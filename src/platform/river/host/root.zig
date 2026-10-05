@@ -133,10 +133,49 @@ const PendingLayoutAction = struct {
         self.* = undefined;
     }
 };
+/// Shells per output (see `ShellPlacement`).
+pub const max_output_shells = live.max_output_shells;
+
+pub const ShellRect = struct { x: i32, y: i32, width: i32, height: i32 };
+
+/// Where one of an output's shells sits: against its top or bottom edge,
+/// `margin` from it, `width` wide and centred (0: the output's width),
+/// `height` tall (0: the output's height).
+pub const ShellPlacement = struct {
+    bottom: bool = false,
+    width: u32 = 0,
+    height: u32 = 0,
+    margin: u32 = 0,
+
+    /// Its rectangle on an output at `origin` of `size`.
+    pub fn rect(self: ShellPlacement, origin: types.Point, size: types.Size) ShellRect {
+        const width: i32 = if (self.width == 0) size.width else @min(size.width, std.math.cast(i32, self.width) orelse size.width);
+        const height: i32 = if (self.height == 0) size.height else @min(size.height, std.math.cast(i32, self.height) orelse size.height);
+        const margin: i32 = std.math.cast(i32, self.margin) orelse 0;
+        return .{
+            .x = origin.x + @divTrunc(size.width - width, 2),
+            .y = if (self.bottom) origin.y + size.height - height - margin else origin.y + margin,
+            .width = width,
+            .height = height,
+        };
+    }
+};
+
+test "a shell sits against its edge, centred when narrower than the output" {
+    const output_origin = types.Point{ .x = 100, .y = 50 };
+    const output_size = types.Size{ .width = 1000, .height = 800 };
+    const bar = (ShellPlacement{ .bottom = true, .height = 38 }).rect(output_origin, output_size);
+    try std.testing.expectEqual(ShellRect{ .x = 100, .y = 812, .width = 1000, .height = 38 }, bar);
+    const popup = (ShellPlacement{ .width = 320, .height = 120, .margin = 80 }).rect(output_origin, output_size);
+    try std.testing.expectEqual(ShellRect{ .x = 440, .y = 130, .width = 320, .height = 120 }, popup);
+}
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     adapter: world.Adapter,
     options: Options,
+    /// Each of an output's shells' placement, by slot.
+    shell_placements: [live.max_output_shells]ShellPlacement = [_]ShellPlacement{.{}} ** live.max_output_shells,
     driver: ?Driver = null,
     manager: ?*live.Manager = null,
     boundary: Boundary = .none,
@@ -222,6 +261,12 @@ pub const Runtime = struct {
 
     /// Queue one opaque controller action for the next transaction boundary.
     pub fn queueLayoutAction(self: *Runtime, output: wm.OutputId, name: []const u8, args: []const []const u8) !void {
+        try self.appendLayoutAction(output, name, args);
+        self.manage_dirty_requested = true;
+    }
+
+    /// Queue a controller action for the transaction boundary already underway.
+    pub fn appendLayoutAction(self: *Runtime, output: wm.OutputId, name: []const u8, args: []const []const u8) !void {
         self.assertValid();
         if (self.layout_actions.items.len >= self.options.max_intents) return error.IntentLimitExceeded;
         var owned = PendingLayoutAction{
@@ -241,7 +286,6 @@ pub const Runtime = struct {
             initialized += 1;
         }
         try self.layout_actions.append(self.allocator, owned);
-        self.manage_dirty_requested = true;
         self.assertValid();
     }
 
@@ -251,6 +295,33 @@ pub const Runtime = struct {
         self.assertValid();
         self.manage_dirty_requested = true;
         self.assertValid();
+    }
+
+    /// Start reported pointer operation `action` on the window under the
+    /// pointer, the layout action told `args` and then where on the window's
+    /// title bar it was taken (as a decoration's `pointer-operation` is).
+    pub fn beginPointerOperationUnderPointer(self: *Runtime, action: []const u8, args: []const []const u8) !void {
+        const hover = self.adapter.hovered() orelse return;
+        const window = self.adapter.objects.wmWindowId(hover.window) catch return;
+        const screen = self.windowScreen(window) orelse return;
+        const chrome = self.windowChrome(window) orelse return;
+        var x_buffer: [16]u8 = undefined;
+        var y_buffer: [16]u8 = undefined;
+        var all: [8][]const u8 = undefined;
+        if (args.len + 2 > all.len) return error.TooManyArguments;
+        for (args, 0..) |arg, index| all[index] = arg;
+        all[args.len] = try std.fmt.bufPrint(&x_buffer, "{d}", .{hover.pointer.x - screen.x + chrome.border_width});
+        all[args.len + 1] = try std.fmt.bufPrint(&y_buffer, "{d}", .{hover.pointer.y - screen.y + chrome.border_width + chrome.decoration_height});
+        try self.adapter.beginReportedPointerOperation(hover.window, action, all[0 .. args.len + 2]);
+    }
+
+    /// Where `window` is on screen, as last laid out.
+    pub fn windowScreen(self: *const Runtime, window: wm.WindowId) ?wm.Rect {
+        const frames = &(self.frames orelse return null);
+        for (frames.frames()) |frame| for (frame.plans.render.entries.items) |entry| {
+            if (entry.window == window) return entry.screen;
+        };
+        return null;
     }
 
     pub fn windowChrome(self: *const Runtime, window: wm.WindowId) ?WindowChrome {
@@ -481,6 +552,7 @@ pub const Runtime = struct {
         // else would ever take it off screen. State it here; the delta below
         // makes it a single request when the window first disappears.
         try self.appendHiddenTagWindows(&operations);
+        try self.appendMarks(frames, &operations);
         // Send only what River does not already hold (see render_delta.zig).
         var changed = std.ArrayList(types.RenderOperation).empty;
         defer changed.deinit(self.allocator);
@@ -555,11 +627,15 @@ pub const Runtime = struct {
         return @ptrCast(@alignCast(raw orelse unreachable));
     }
 
-    fn resolveShellPosition(raw: ?*anyopaque, output: *wayland.client.river.OutputV1) ?live.ShellPosition {
+    fn resolveShellPosition(raw: ?*anyopaque, output: *wayland.client.river.OutputV1, slot: u8) ?live.ShellPosition {
         const self: *Runtime = @ptrCast(@alignCast(raw orelse return null));
         const id = self.adapter.objects.outputId(output) catch return null;
-        const position = (self.adapter.objects.outputs.get(id) orelse return null).position orelse return null;
-        return .{ .x = position.x, .y = position.y };
+        const record = self.adapter.objects.outputs.get(id) orelse return null;
+        const position = record.position orelse return null;
+        const size = record.dimensions orelse return null;
+        if (slot >= self.shell_placements.len) return null;
+        const rect = self.shell_placements[slot].rect(.{ .x = position.x, .y = position.y }, size);
+        return .{ .x = rect.x, .y = rect.y };
     }
 
     fn resolveDecorationPosition(raw: ?*anyopaque, window: *wayland.client.river.WindowV1) ?live.DecorationPosition {
@@ -568,6 +644,28 @@ pub const Runtime = struct {
         const wm_window = (self.adapter.objects.windows.get(live_window) orelse return null).wm_id orelse return null;
         const chrome = self.windowChrome(wm_window) orelse return null;
         return live.decorationPosition(chrome.decoration_height, chrome.border_width) catch null;
+    }
+
+    /// Each layout mark with a surface: its node at the mark, stacked above the
+    /// highest window of its output below it. After every frame's own
+    /// stacking, which would otherwise move windows past it.
+    fn appendMarks(self: *Runtime, frames: *const world.FrameSet, operations: *std.ArrayList(types.RenderOperation)) !void {
+        for (frames.frames()) |frame| for (frame.plans.render.marks.items) |mark| {
+            const node = self.adapter.markNode(frame.output, mark.name.slice()) orelse continue;
+            try operations.append(self.allocator, .{ .set_position = .{ .node = node, .position = .{ .x = mark.rect.x, .y = mark.rect.y } } });
+            var below: ?types.NodeId = null;
+            var below_z: i32 = std.math.minInt(i32);
+            for (frame.plans.render.entries.items) |entry| {
+                if (entry.z_index >= mark.z_index or entry.z_index < below_z) continue;
+                const window = self.adapter.objects.wm_to_window.get(entry.window) orelse continue;
+                below = (self.adapter.objects.windows.get(window) orelse continue).node;
+                below_z = entry.z_index;
+            }
+            try operations.append(self.allocator, if (below) |other|
+                .{ .place_above = .{ .node = node, .other = other } }
+            else
+                .{ .place_bottom = node });
+        };
     }
 
     fn appendHiddenTagWindows(self: *const Runtime, operations: *std.ArrayList(types.RenderOperation)) !void {

@@ -18,23 +18,12 @@ wp.layout("lib.scrolling", {
   widths = { 0.25, 1 / 3, 0.5, 2 / 3, 0.75, 1 },
 })
 
--- What the bar measures. Plots cover 12 s of history; `keep = 0` keeps only
--- the latest sample.
-wp.source("cpu", { every = 500, keep = 16000 })
-wp.source("network", { every = 500, keep = 20000 })
-wp.source("disks", { every = 1000, keep = 8000 })
-wp.source("memory", { every = 2000, keep = 0 })
-wp.source("audio", { every = 500, keep = 0 })
-wp.source("battery", { every = 10000, keep = 0 })
+-- What the bar measures (see lib/sources.lua for each source's period).
+require("lib.sources").register()
 
 -- The bar's options (see `defaults` in lib/bar.lua for all of them).
 local bar = {
   height = 38,
-  network = {
-    -- Colour the usual 80% of traffic (with 25% headroom) on the normal ramp;
-    -- bursts climb a second ramp, fully bright at 20x that.
-    scale = { floor = 1024 * 1024, percentile = 0.8, headroom = 1.25, peak_range = 20 },
-  },
 }
 
 wp.surface("bar", {
@@ -48,10 +37,27 @@ wp.surface("bar-portable", {
   edge = "bottom", height = bar.height, exclusive_zone = bar.height,
   content = "lib.bar", options = bar,
 })
+-- The volume popup, near the top of each output; above the bar, and only
+-- there while it shows.
+wp.surface("osd", {
+  provider = "river", role = "shell", placement = "all-outputs",
+  edge = "top", margin = 80, width = 320, height = 120, input = false,
+  content = "lib.osd",
+})
 wp.surface("titles", {
   provider = "river", role = "decoration", placement = "windows",
   edge = "top", height = 28,
   content = "lib.decorator",
+})
+-- Where a dragged window will land: drawn on the layout's `drop` mark; and
+-- along an edge where holding it moves it to the next row, its `shift` mark.
+wp.surface("drop", {
+  provider = "river", role = "shell", placement = "mark", mark = "drop",
+  content = "lib.drop",
+})
+wp.surface("shift", {
+  provider = "river", role = "shell", placement = "mark", mark = "shift",
+  content = "lib.drop",
 })
 
 -- Programs
@@ -79,6 +85,19 @@ wp.bind(super, "space", act("cycle-container-mode"))
 wp.bind(super, "t", act("cycle-container-mode"))
 wp.bind(super, "Tab", act("focus-tab-next"))
 wp.bind(super_shift, "Tab", act("focus-tab-prev"))
+
+-- The view: Super+arrows move it a window (or a row) that way, and keep it
+-- there until focus moves; Super+C brings it back to the focused window.
+wp.bind(super, "Left", act("pan-left"))
+wp.bind(super, "Right", act("pan-right"))
+wp.bind(super, "Up", act("pan-up"))
+wp.bind(super, "Down", act("pan-down"))
+wp.bind(super, "c", act("recenter"))
+
+-- Pointer: Super+drag moves a window from anywhere on it; Super+right-click
+-- brings the view back to the focused window.
+wp.bind(super, "pointer:left", wp.pointer_operation("drag-window"))
+wp.bind(super, "pointer:right", act("recenter"))
 
 -- Sizes and states
 wp.bind(super, "r", act("cycle-width"))

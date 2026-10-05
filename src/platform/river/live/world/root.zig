@@ -122,6 +122,9 @@ pub const ManageCycle = struct {
 pub const ManageDraft = struct {
     revision: u64,
     facts: ?staged_facts.ManageBatch,
+    /// The output whose focused window was destroyed in this cycle, leaving
+    /// nothing focused: the layout chooses where focus goes next.
+    focus_lost: ?wm.OutputId = null,
 
     pub fn deinit(self: *ManageDraft) void {
         if (self.facts) |*facts| facts.deinit();
@@ -144,9 +147,15 @@ pub const RenderCycle = struct {
 pub const LayerFocus = live_objects.LayerFocus;
 pub const ObjectCounts = live_objects.Counts;
 
+pub const MarkName = wm.layout.Mark.Name;
+
+/// The node drawing each layout mark that has a surface, by output and name.
+pub const MarkNode = struct { output: types.OutputId, name: MarkName, node: types.NodeId };
+
 pub const Adapter = struct {
     allocator: std.mem.Allocator,
     options: Options,
+    mark_nodes: std.ArrayList(MarkNode) = .empty,
     world: wm.World,
     staged: staged_facts.StagedFacts,
     objects: live_objects.Registry,
@@ -178,12 +187,32 @@ pub const Adapter = struct {
     /// accidental Wayland requests through this adapter.
     pub fn deinit(self: *Adapter) void {
         if (self.restored) |*value| value.deinit();
+        self.mark_nodes.deinit(self.allocator);
         self.pointer_actions.deinit();
         self.input_queue.deinit();
         self.objects.deinit();
         self.staged.deinit();
         self.world.deinit();
         self.* = undefined;
+    }
+
+    pub fn setMarkNode(self: *Adapter, output: types.OutputId, name: MarkName, node: types.NodeId) !void {
+        self.removeMarkNode(output, name);
+        try self.mark_nodes.append(self.allocator, .{ .output = output, .name = name, .node = node });
+    }
+
+    pub fn removeMarkNode(self: *Adapter, output: types.OutputId, name: MarkName) void {
+        for (self.mark_nodes.items, 0..) |entry, index| {
+            if (entry.output.value != output.value or !std.mem.eql(u8, entry.name.slice(), name.slice())) continue;
+            _ = self.mark_nodes.swapRemove(index);
+            return;
+        }
+    }
+
+    pub fn markNode(self: *const Adapter, output: types.OutputId, name: []const u8) ?types.NodeId {
+        for (self.mark_nodes.items) |entry|
+            if (entry.output.value == output.value and std.mem.eql(u8, entry.name.slice(), name)) return entry.node;
+        return null;
     }
 
     /// Load the previous session's window membership (tags and focus). Text that
@@ -375,20 +404,118 @@ pub const Adapter = struct {
         record.confirmed_minimum = .{ .width = 0, .height = 0 };
     }
 
+    /// Start a pointer operation on `window` whose motion goes to the layout
+    /// action `action` (see `takePointerOperationReport`) instead of moving the
+    /// window. Uses the first seat: the caller does not say which seat.
+    /// `args` follow the motion when the action is told of it.
+    pub fn beginReportedPointerOperation(self: *Adapter, window: types.WindowId, action: []const u8, args: []const []const u8) !void {
+        try self.requireHealthy();
+        if (!self.objects.windows.contains(window)) return error.UnknownWindow;
+        if (args.len > live_objects.PointerOperation.max_reported_args) return error.TooManyArguments;
+        var operation = live_objects.PointerOperation{
+            .window = window,
+            .kind = .reported,
+            .action = try live_objects.ActionName.init(action),
+            .arg_count = @intCast(args.len),
+        };
+        for (args, 0..) |arg, index| operation.args[index] = try live_objects.ActionName.init(arg);
+        var iterator = self.objects.seats.iterator();
+        const seat = iterator.next() orelse return;
+        if (seat.value_ptr.operation != null) return;
+        seat.value_ptr.operation = operation;
+    }
+
+    pub const Hover = struct { window: types.WindowId, pointer: types.Point };
+
+    /// The window under a seat's pointer, and where the pointer is.
+    pub fn hovered(self: *const Adapter) ?Hover {
+        var iterator = self.objects.seats.iterator();
+        while (iterator.next()) |entry| {
+            const window = entry.value_ptr.hovered orelse continue;
+            const pointer = entry.value_ptr.pointer orelse continue;
+            if (!self.objects.windows.contains(window)) continue;
+            return .{ .window = window, .pointer = pointer };
+        }
+        return null;
+    }
+
+    /// The binding that cancels a reported operation on `seat` while it runs.
+    pub fn setOperationCancelBinding(self: *Adapter, seat: types.SeatId, binding: types.PointerBindingId) !void {
+        const record = self.objects.seats.getPtr(seat) orelse return error.UnknownSeat;
+        if (self.objects.maps.pointer_bindings.proxyFor(binding) == null) return error.UnknownPointerBinding;
+        record.cancel_binding = binding;
+    }
+
+    /// Every pointer button came up while one of our surfaces still had the
+    /// pointer, so River had not taken a reported operation over and will not
+    /// report the release itself.
+    pub fn releaseReportedPointerOperations(self: *Adapter) void {
+        var iterator = self.objects.seats.iterator();
+        while (iterator.next()) |entry| if (entry.value_ptr.operation) |*operation| {
+            if (operation.kind != .reported) continue;
+            if (operation.start_pending) {
+                entry.value_ptr.operation = null;
+            } else {
+                operation.end_pending = true;
+                operation.unreported = true;
+            }
+        };
+    }
+
+    pub const OperationReport = struct {
+        window: types.WindowId,
+        /// Borrowed until the next manage cycle, as is `args`.
+        action: []const u8,
+        args: []const live_objects.ActionName,
+        total: types.Point,
+        phase: Phase,
+
+        pub const Phase = enum { move, drop, cancel };
+    };
+
+    /// A reported operation's motion or release not yet passed on.
+    pub fn takePointerOperationReport(self: *Adapter) ?OperationReport {
+        var iterator = self.objects.seats.iterator();
+        while (iterator.next()) |entry| if (entry.value_ptr.operation) |*operation| {
+            if (operation.kind != .reported or !operation.unreported) continue;
+            operation.unreported = false;
+            return .{
+                .window = operation.window,
+                .action = operation.action.slice(),
+                .args = operation.args[0..operation.arg_count],
+                .total = operation.last_delta,
+                .phase = if (operation.cancelled) .cancel else if (operation.end_pending) .drop else .move,
+            };
+        };
+        return null;
+    }
+
     pub fn appendPointerOperationRequests(self: *const Adapter, operations: *std.ArrayList(types.ManageOperation)) !void {
         var iterator = self.objects.seats.iterator();
-        while (iterator.next()) |entry| if (entry.value_ptr.operation) |operation| {
-            if (operation.start_pending) try operations.append(self.allocator, .{ .op_start_pointer = entry.key_ptr.* });
-            if (operation.end_pending) try operations.append(self.allocator, .{ .op_end = entry.key_ptr.* });
-        };
+        while (iterator.next()) |entry| {
+            const record = entry.value_ptr;
+            if (record.operation) |operation| {
+                if (operation.start_pending) try operations.append(self.allocator, .{ .op_start_pointer = entry.key_ptr.* });
+                if (operation.end_pending) try operations.append(self.allocator, .{ .op_end = entry.key_ptr.* });
+            }
+            if (record.cancel_binding) |binding| if (record.cancellable() != record.cancel_enabled)
+                try operations.append(self.allocator, if (record.cancellable())
+                    .{ .pointer_binding_enable = binding }
+                else
+                    .{ .pointer_binding_disable = binding });
+        }
     }
 
     pub fn commitPointerOperationRequests(self: *Adapter) void {
         var iterator = self.objects.seats.iterator();
-        while (iterator.next()) |entry| if (entry.value_ptr.operation) |*operation| {
-            operation.start_pending = false;
-            if (operation.end_pending) entry.value_ptr.operation = null;
-        };
+        while (iterator.next()) |entry| {
+            const record = entry.value_ptr;
+            if (record.cancel_binding != null) record.cancel_enabled = record.cancellable();
+            if (record.operation) |*operation| {
+                operation.start_pending = false;
+                if (operation.end_pending) record.operation = null;
+            }
+        }
     }
 
     /// Bring River's keyboard focus into agreement with the WM model. Focus
@@ -487,6 +614,8 @@ pub const Adapter = struct {
         errdefer facts.deinit();
 
         for (facts.facts()) |fact| try self.validateManageFact(fact);
+        const focused_before = self.world.focusedWindow();
+        const output_before = self.world.focusedOutput();
         reconcile.run(self, facts.facts()) catch |err| {
             self.poisoned = true;
             return err;
@@ -498,7 +627,16 @@ pub const Adapter = struct {
 
         self.revision +%= 1;
         if (self.revision == 0) self.revision = 1;
-        return .{ .revision = self.revision, .facts = facts };
+        const focus_lost = if (focused_before) |window|
+            self.world.getWindow(window) == null and self.world.focusedWindow() == null and
+                output_before != null and self.world.getOutput(output_before.?) != null
+        else
+            false;
+        return .{
+            .revision = self.revision,
+            .facts = facts,
+            .focus_lost = if (focus_lost) output_before else null,
+        };
     }
 
     /// Apply policy only through the WM's atomic semantic command boundary.
@@ -575,6 +713,15 @@ pub const Adapter = struct {
     pub fn stagePointerBindingIntent(self: *Adapter, id: types.PointerBindingId, pressed: bool) !void {
         try self.requireHealthy();
         if (self.objects.maps.pointer_bindings.proxyFor(id) == null) return error.UnknownPointerBinding;
+        var seats = self.objects.seats.iterator();
+        while (seats.next()) |entry| if (entry.value_ptr.cancel_binding) |binding| if (binding.value == id.value) {
+            if (!pressed or !entry.value_ptr.cancellable()) return;
+            const operation = &entry.value_ptr.operation.?;
+            operation.cancelled = true;
+            operation.end_pending = true;
+            operation.unreported = true;
+            return;
+        };
         if (pressed) try self.input_queue.append(.{ .action = self.pointer_actions.get(id) orelse .focus, .source = .{ .pointer_binding = id } });
     }
 
@@ -623,7 +770,15 @@ pub const Adapter = struct {
             const output_record = self.objects.outputs.get(river_output) orelse continue;
             const output = output_record.wm_id orelse continue;
             const build_layout = config.build_layout orelse return error.MissingLayoutProvider;
-            const layout_plans = try build_layout(config.layout_context, self.allocator, &snapshot, output, config.monotonic_ms);
+            // A layout that fails leaves this output as River has it, for this
+            // frame: one mistake in a configuration must not end the session.
+            const layout_plans = build_layout(config.layout_context, self.allocator, &snapshot, output, config.monotonic_ms) catch |err| blk: {
+                std.log.err("layout failed on output {d}: {s}", .{ output.raw(), @errorName(err) });
+                break :blk wm.LayoutPlans{
+                    .manage = .{ .context = .{ .allocator = self.allocator, .epoch = epoch, .output = output } },
+                    .render = .{ .context = .{ .allocator = self.allocator, .epoch = epoch, .output = output } },
+                };
+            };
             var plans = try composition.translateFrame(self.allocator, layout_plans, self.hostResolver());
             errdefer plans.deinit();
             if (plans.epoch != epoch or plans.manage.context.epoch != plans.render.context.epoch)
@@ -852,6 +1007,100 @@ test "seat focus requests follow world focus and are edge triggered" {
     try adapter.appendSeatFocusRequests(&operations);
     try std.testing.expectEqual(@as(usize, 1), operations.items.len);
     try std.testing.expectEqual(first, operations.items[0].focus_window.window);
+}
+
+test "a reported pointer operation tells its action the total motion once per cycle and never forces floating" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+    const seat_ref = fakeRef(0xf200);
+    const seat = try adapter.objects.bindSeat(seat_ref);
+    const window = try adapter.objects.bindWindow(fakeRef(0xf220), fakeRef(0xf221));
+
+    var operations = std.ArrayList(types.ManageOperation).empty;
+    defer operations.deinit(std.testing.allocator);
+
+    // Every button came up before River was asked to start it: it never starts.
+    try adapter.beginReportedPointerOperation(window, "drag-window", &.{});
+    adapter.releaseReportedPointerOperations();
+    try adapter.appendPointerOperationRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 0), operations.items.len);
+
+    try adapter.beginReportedPointerOperation(window, "drag-window", &.{});
+    try adapter.appendPointerOperationRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 1), operations.items.len);
+    try std.testing.expectEqual(seat, operations.items[0].op_start_pointer);
+    adapter.commitPointerOperationRequests();
+    try std.testing.expectEqual(@as(?wm.Placement, null), adapter.objects.windows.get(window).?.requested_placement);
+
+    try events.onSeat(&adapter, @ptrFromInt(seat_ref.value), .{ .op_delta = .{ .dx = 10, .dy = 5 } });
+    try events.onSeat(&adapter, @ptrFromInt(seat_ref.value), .{ .op_delta = .{ .dx = 30, .dy = 40 } });
+    const moved = adapter.takePointerOperationReport().?;
+    try std.testing.expectEqualStrings("drag-window", moved.action);
+    try std.testing.expectEqual(types.Point{ .x = 30, .y = 40 }, moved.total);
+    try std.testing.expectEqual(Adapter.OperationReport.Phase.move, moved.phase);
+    try std.testing.expectEqual(@as(?Adapter.OperationReport, null), adapter.takePointerOperationReport());
+
+    try events.onSeat(&adapter, @ptrFromInt(seat_ref.value), .{ .op_release = {} });
+    try std.testing.expectEqual(Adapter.OperationReport.Phase.drop, adapter.takePointerOperationReport().?.phase);
+    operations.clearRetainingCapacity();
+    try adapter.appendPointerOperationRequests(&operations);
+    try std.testing.expectEqual(seat, operations.items[0].op_end);
+    adapter.commitPointerOperationRequests();
+    try std.testing.expectEqual(@as(?live_objects.PointerOperation, null), adapter.objects.seats.get(seat).?.operation);
+}
+
+test "the right button cancels a reported pointer operation, and is bound only while one runs" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+    const seat = try adapter.objects.bindSeat(fakeRef(0xf300));
+    const window = try adapter.objects.bindWindow(fakeRef(0xf320), fakeRef(0xf321));
+    const binding = try adapter.objects.bindPointerBinding(fakeRef(0xf330));
+    try adapter.setOperationCancelBinding(seat, binding);
+
+    var operations = std.ArrayList(types.ManageOperation).empty;
+    defer operations.deinit(std.testing.allocator);
+    try adapter.appendPointerOperationRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 0), operations.items.len);
+
+    try adapter.beginReportedPointerOperation(window, "drag-window", &.{ "12", "7" });
+    try adapter.appendPointerOperationRequests(&operations);
+    try std.testing.expectEqual(seat, operations.items[0].op_start_pointer);
+    try std.testing.expectEqual(binding, operations.items[1].pointer_binding_enable);
+    adapter.commitPointerOperationRequests();
+
+    try adapter.stagePointerBindingIntent(binding, true);
+    const cancelled = adapter.takePointerOperationReport().?;
+    try std.testing.expectEqual(Adapter.OperationReport.Phase.cancel, cancelled.phase);
+    try std.testing.expectEqual(@as(usize, 2), cancelled.args.len);
+    try std.testing.expectEqualStrings("7", cancelled.args[1].slice());
+    // A cancelling press is not also an input intent.
+    try std.testing.expectEqual(@as(usize, 0), adapter.input_queue.count());
+
+    operations.clearRetainingCapacity();
+    try adapter.appendPointerOperationRequests(&operations);
+    try std.testing.expectEqual(seat, operations.items[0].op_end);
+    try std.testing.expectEqual(binding, operations.items[1].pointer_binding_disable);
+    adapter.commitPointerOperationRequests();
+    operations.clearRetainingCapacity();
+    try adapter.appendPointerOperationRequests(&operations);
+    try std.testing.expectEqual(@as(usize, 0), operations.items.len);
+}
+
+test "the window under the pointer and where the pointer is come from River's seat events" {
+    var adapter = Adapter.init(std.testing.allocator, .{});
+    defer adapter.deinit();
+    const seat_ref = fakeRef(0xf400);
+    _ = try adapter.objects.bindSeat(seat_ref);
+    const window_ref = fakeRef(0xf420);
+    const window = try adapter.objects.bindWindow(window_ref, fakeRef(0xf421));
+    try std.testing.expectEqual(@as(?Adapter.Hover, null), adapter.hovered());
+    try events.onSeat(&adapter, @ptrFromInt(seat_ref.value), .{ .pointer_enter = .{ .window = @ptrFromInt(window_ref.value) } });
+    try events.onSeat(&adapter, @ptrFromInt(seat_ref.value), .{ .pointer_position = .{ .x = 120, .y = 45 } });
+    const hover = adapter.hovered().?;
+    try std.testing.expectEqual(window, hover.window);
+    try std.testing.expectEqual(types.Point{ .x = 120, .y = 45 }, hover.pointer);
+    try events.onSeat(&adapter, @ptrFromInt(seat_ref.value), .{ .pointer_leave = {} });
+    try std.testing.expectEqual(@as(?Adapter.Hover, null), adapter.hovered());
 }
 
 test "fake River facts reconcile a WM world and compose one immutable frame epoch" {

@@ -9,6 +9,7 @@ const configured_actions = @import("actions.zig");
 /// Collect input, configured actions, and policy output into one atomic batch.
 pub fn run(runtime: anytype, draft: anytype) !void {
     try consumeInput(runtime);
+    if (draft.focus_lost) |output| try runtime.appendLayoutAction(output, "focus-successor", &.{});
 
     var policy_intents = script.IntentBatch.init(runtime.allocator, runtime.options.max_intents);
     defer policy_intents.deinit();
@@ -41,6 +42,7 @@ pub fn run(runtime: anytype, draft: anytype) !void {
                 &policy_intents,
                 runtime.options.spawn,
                 if (runtime.options.layout) |layout| layout.action else null,
+                .{ .context = @ptrCast(runtime), .run = beginPointerOperation(@TypeOf(runtime)) },
             ) catch |err| {
                 std.log.warn("configured layout action failed: {s}", .{@errorName(err)});
                 runtime.stats.policy_failures += 1;
@@ -109,6 +111,15 @@ pub fn run(runtime: anytype, draft: anytype) !void {
     action_batch = null;
 }
 
+fn beginPointerOperation(comptime RuntimePointer: type) *const fn (?*anyopaque, []const u8, []const []const u8) anyerror!void {
+    return struct {
+        fn run(raw: ?*anyopaque, action: []const u8, args: []const []const u8) anyerror!void {
+            const runtime: RuntimePointer = @ptrCast(@alignCast(raw orelse return error.MissingRuntime));
+            try runtime.beginPointerOperationUnderPointer(action, args);
+        }
+    }.run;
+}
+
 fn finishActionBatchChecked(hook: configured_actions.Layout, commit: bool) !void {
     return (hook.finish orelse return error.IncompleteLayoutActionTransaction)(hook.context, commit);
 }
@@ -129,6 +140,26 @@ fn consumeInput(runtime: anytype) !void {
         };
     }
     std.debug.assert(runtime.queued_intents.count() <= runtime.options.max_intents);
+    while (runtime.adapter.takePointerOperationReport()) |report| try reportPointerOperation(runtime, report);
+}
+
+/// A reported pointer operation goes to its layout action as `<action>
+/// <window> <dx> <dy> move|drop|cancel <args...>`: the pointer's total motion
+/// since it began; "drop" once the buttons are released, "cancel" if the
+/// right button was pressed first; then the arguments it was started with.
+fn reportPointerOperation(runtime: anytype, report: anytype) !void {
+    const window = runtime.adapter.objects.wmWindowId(report.window) catch return;
+    const output = runtime.adapter.worldView().windowOutput(window) orelse return;
+    var id_buffer: [24]u8 = undefined;
+    var x_buffer: [16]u8 = undefined;
+    var y_buffer: [16]u8 = undefined;
+    var args: [4 + 4][]const u8 = undefined;
+    args[0] = try std.fmt.bufPrint(&id_buffer, "{d}", .{window.raw()});
+    args[1] = try std.fmt.bufPrint(&x_buffer, "{d}", .{report.total.x});
+    args[2] = try std.fmt.bufPrint(&y_buffer, "{d}", .{report.total.y});
+    args[3] = @tagName(report.phase);
+    for (report.args, 4..) |arg, index| args[index] = arg.slice();
+    try runtime.appendLayoutAction(output, report.action, args[0 .. 4 + report.args.len]);
 }
 
 fn translateInput(runtime: anytype, intent: world.input_intents.Intent) !?script.Intent {

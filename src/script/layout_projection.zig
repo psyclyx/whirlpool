@@ -27,6 +27,9 @@ pub const Label = struct {
 };
 
 pub const Item = struct {
+    /// What the item stands for, in the layout's own terms; a surface hands it
+    /// back in actions (e.g. to say where a dragged window goes).
+    key: Label = .{},
     style: Label = .{},
     text: Label = .{},
     detail: Label = .{},

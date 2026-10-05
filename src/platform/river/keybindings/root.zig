@@ -1,4 +1,5 @@
-//! River XKB binding ownership for a loaded Whirlpool program.
+//! River key (XKB) and pointer-button binding ownership for a loaded
+//! Whirlpool program.
 
 const std = @import("std");
 const wayland = @import("wayland");
@@ -14,13 +15,22 @@ pub const Runtime = struct {
     xkb_version: u32 = 0,
     seats: std.ArrayList(SeatEntry) = .empty,
     entries: std.ArrayList(Entry) = .empty,
+    pointer_entries: std.ArrayList(PointerEntry) = .empty,
     pending_actions: std.ArrayList(usize) = .empty,
+    /// A pointer-operation binding's button came up since last asked.
+    pointer_released: bool = false,
     desired_mode: []const u8 = script.config.default_mode,
     mode_change_pending: bool = true,
     listener_error: ?anyerror = null,
 
     const Entry = struct {
         proxy: *wayland.client.river.XkbBindingV1,
+        action_index: usize,
+        enabled: bool = false,
+    };
+
+    const PointerEntry = struct {
+        proxy: *wayland.client.river.PointerBindingV1,
         action_index: usize,
         enabled: bool = false,
     };
@@ -76,6 +86,8 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         for (self.entries.items) |entry| entry.proxy.destroy();
         self.entries.deinit(self.allocator);
+        for (self.pointer_entries.items) |entry| entry.proxy.destroy();
+        self.pointer_entries.deinit(self.allocator);
         for (self.seats.items) |seat| seat.proxy.destroy();
         self.seats.deinit(self.allocator);
         self.pending_actions.deinit(self.allocator);
@@ -98,6 +110,13 @@ pub const Runtime = struct {
         }
         for (self.bindings, 0..) |binding, action_index| {
             const modifiers: wayland.client.river.SeatV1.Modifiers = @bitCast(binding.modifiers);
+            if (binding.button != 0) {
+                const proxy = try seat.getPointerBinding(binding.button, modifiers);
+                errdefer proxy.destroy();
+                proxy.setListener(*Runtime, onPointerBindingEvent, self);
+                try self.pointer_entries.append(self.allocator, .{ .proxy = proxy, .action_index = action_index });
+                continue;
+            }
             const proxy = try xkb.getXkbBinding(seat, binding.keysym, modifiers);
             errdefer proxy.destroy();
             proxy.setListener(*Runtime, onBindingEvent, self);
@@ -110,6 +129,13 @@ pub const Runtime = struct {
     pub fn applyPendingMode(self: *Runtime) !void {
         var changed: usize = 0;
         for (self.entries.items) |*entry| {
+            const should_enable = std.mem.eql(u8, self.bindings[entry.action_index].mode, self.desired_mode);
+            if (should_enable == entry.enabled) continue;
+            if (should_enable) entry.proxy.enable() else entry.proxy.disable();
+            entry.enabled = should_enable;
+            changed += 1;
+        }
+        for (self.pointer_entries.items) |*entry| {
             const should_enable = std.mem.eql(u8, self.bindings[entry.action_index].mode, self.desired_mode);
             if (should_enable == entry.enabled) continue;
             if (should_enable) entry.proxy.enable() else entry.proxy.disable();
@@ -129,6 +155,13 @@ pub const Runtime = struct {
 
     pub fn hasPendingModeChange(self: *const Runtime) bool {
         return self.mode_change_pending;
+    }
+
+    /// Whether a pointer-operation binding's button came up since last asked:
+    /// an operation River had not yet started must not wait for its release.
+    pub fn takePointerRelease(self: *Runtime) bool {
+        defer self.pointer_released = false;
+        return self.pointer_released;
     }
 
     pub fn takeActions(self: *Runtime) ![]usize {
@@ -169,6 +202,24 @@ pub const Runtime = struct {
                 };
             },
             .released, .stop_repeat => {},
+        }
+    }
+
+    fn onPointerBindingEvent(
+        binding: *wayland.client.river.PointerBindingV1,
+        event: wayland.client.river.PointerBindingV1.Event,
+        raw: *Runtime,
+    ) void {
+        const action_index = for (raw.pointer_entries.items) |entry| {
+            if (entry.proxy == binding) break entry.action_index;
+        } else return;
+        switch (event) {
+            .pressed => raw.stageBinding(action_index) catch |err| {
+                raw.listener_error = err;
+            },
+            .released => if (raw.bindings[action_index].action == .pointer_operation) {
+                raw.pointer_released = true;
+            },
         }
     }
 

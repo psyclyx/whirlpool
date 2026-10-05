@@ -9,6 +9,20 @@ local min_root_width, max_root_width = 0.05, 4
 -- (`options.widths`).
 local widths = { 0.25, 1 / 3, 0.5, 2 / 3, 0.75, 1 }
 local animation_duration_ms = 180
+-- When the focused window itself moves, the camera follows this much later, so
+-- the window is seen to move rather than everything else around it.
+local camera_lag_ms = 90
+-- When a window moves to another strip, the strip it left closes the gap this
+-- much later, once it has gone, while the strip it joins makes room at once.
+local stagger_ms = 90
+-- Above every other window: the one being dragged by its title bar.
+local dragged_z = 100000
+-- While dragging, the pointer held this close to a monitor's edge (having
+-- moved towards it) acts after `edge_dwell_ms`, and again sooner each time it
+-- stays, down to `edge_repeat_min_ms`: along the rows the view steps one
+-- window that way; across them the window moves to the next row.
+local edge_zone = 64
+local edge_dwell_ms, edge_repeat_min_ms = 450, 150
 local main_axis, main_reverse, cross_reverse = "horizontal", false, false
 
 local model = {
@@ -227,16 +241,26 @@ local function remove_window(window)
   local leaf = node(model.window_nodes[window])
   if leaf then detach(leaf.id); model.nodes[leaf.id] = nil end
   model.window_nodes[window], model.windows[window] = nil, nil
+  if model.screens then model.screens[window] = nil end
+  if model.drag and model.drag.window == window then model.drag = nil end
   for name, mark in pairs(model.marks) do if mark.anchor_window == window then model.marks[name] = nil end end
 end
-local function current_insertion(state, focused_window)
-  local strip, index = state.current, #state.current.roots + 1
-  local root = containing_root(focused_window and model.window_nodes[focused_window])
-  if root then
-    local owner, candidate, _, root_index = root_location(root.id)
-    if owner == state then strip, index = candidate, root_index + 1 end
-  end
-  return strip, index
+-- A new tiled window opens just before `anchor_window`, at its level: beside
+-- it in its group, or as a column before its column. Without an anchor in this
+-- tag's strips it opens at the end of the current strip.
+local function insert_new(state, leaf_id, anchor_window)
+  local anchor = node(anchor_window and model.window_nodes[anchor_window])
+  local owner, strip, _, root_index = nil, nil, nil, nil
+  if anchor then owner, strip, _, root_index = location_for_node(anchor.id) end
+  if owner ~= state then attach_root(state, state.current, leaf_id, nil, 0.5); return end
+  if not anchor.parent then attach_root(state, strip, leaf_id, root_index, 0.5); return end
+  local parent, leaf = node(anchor.parent), node(leaf_id)
+  local index = child_index(parent, anchor.id)
+  table.insert(parent.children, index, { node = leaf_id, weight = 1 })
+  leaf.parent = parent.id
+  -- The tab shown stays shown; focus, not insertion, decides what is active.
+  if parent.active >= index then parent.active = parent.active + 1 end
+  state.current = strip
 end
 
 -- Persistence -------------------------------------------------------------
@@ -251,7 +275,10 @@ end
 -- touching this code. Only what refers to this process (ids, parent links, the
 -- window and its tag) is left out or translated. Reading applies the same rule
 -- in reverse, then checks the fields it knows the meaning of.
-local RUNTIME_FIELDS = { id = true, parent = true, tag = true, kind = true, window = true, children = true, node = true }
+local RUNTIME_FIELDS = {
+  id = true, parent = true, tag = true, kind = true, window = true, children = true, node = true,
+  automatic = true, anchor = true, strip = true,
+}
 
 local function plain_fields(source)
   local out = {}
@@ -625,6 +652,10 @@ local function restore_saved(snapshot)
 end
 
 
+-- The window nearest `leaf_id` other than `excluded` ones; defined with the
+-- navigation helpers below.
+local nearest_window
+
 local function sync(snapshot)
   -- Tag ordinals are what persist across restarts (ids do not).
   model.tag_ordinal, model.tag_by_ordinal = {}, {}
@@ -650,16 +681,30 @@ local function sync(snapshot)
     for _, fact in ipairs(snapshot.windows or {}) do
       seen[fact.id], model.windows[fact.id] = true, fact
       local leaf = node(model.window_nodes[fact.id]) or new_leaf(fact.id)
-      leaf.state = leaf.state or classify(fact)
+      -- A window's place follows what it says of itself until something places
+      -- it otherwise: a parent or fixed size can arrive after it first appears.
+      local automatic = classify(fact)
+      if not leaf.state or leaf.state == leaf.automatic then leaf.state = automatic end
+      leaf.automatic = automatic
       leaf.tag = leaf.tag or fact.tag
       local state = tag_state(fact.tag)
       local root = containing_root(leaf.id)
       local owner = root and placed[root.id]
       if leaf.state == "tiled" and not owner then
-        local strip, index = current_insertion(state,
-          snapshot.tag.id == fact.tag and snapshot.tag.focused_window or nil)
-        attach_root(state, strip, leaf.id, index, 0.5)
-        placed[leaf.id] = true
+        -- The anchor is the window focused before this one appeared: a new
+        -- window is usually focused already, before it has a place.
+        if leaf.anchor == nil then
+          local focused = snapshot.tag.id == fact.tag and snapshot.tag.focused_window or nil
+          local focused_root = containing_root(focused and model.window_nodes[focused])
+          leaf.anchor = focused_root and placed[focused_root.id] and focused or state.last_focused or false
+        end
+        -- Tiled only by guess, it waits for its answer to a first proposal:
+        -- only then does a dialog without a parent say its size is fixed.
+        if fact.actual or (fact.state and fact.state ~= "unplaced") then
+          insert_new(state, leaf.id, leaf.anchor or nil)
+          leaf.anchor = nil
+          placed[leaf.id] = true
+        end
       elseif leaf.state ~= "tiled" and owner then
         detach(root.id)
         placed[root.id] = nil
@@ -667,7 +712,15 @@ local function sync(snapshot)
     end
     local stale = {}
     for window in pairs(model.windows) do if not seen[window] then stale[#stale + 1] = window end end
-    for _, window in ipairs(stale) do remove_window(window) end
+    for _, window in ipairs(stale) do
+      -- Focus that leaves with its window passes to the window nearest it.
+      local leaf = node(model.window_nodes[window])
+      local owner = leaf and leaf.tag and model.tags[leaf.tag]
+      if owner and owner.last_focused == window then
+        owner.last_focused = nearest_window(owner, leaf.id, { [window] = true })
+      end
+      remove_window(window)
+    end
   end
   for _, state in pairs(model.tags) do compact_strips(state) end
   local state, focused = tag_state(snapshot.tag.id), snapshot.tag.focused_window
@@ -784,6 +837,221 @@ local function neighbor(state, start_id, direction)
   local target_strip = state.strips[strip_index + step]
   local slot = target_strip and target_strip.roots[clamp(root_index, 1, #target_strip.roots)]
   return slot and active_leaf(slot.node), target_strip ~= nil, target_strip, root_index
+end
+-- The window focus passes to when `leaf_id` goes: the one taking its place
+-- (the next in its container, else those before it), else another from the
+-- container above, and so on up the tree; at the top, the column taking its
+-- place in the row, else the one before; then the nearest other rows.
+nearest_window = function(state, leaf_id, excluded)
+  local function usable(id)
+    local active = active_leaf(id)
+    if active and active.window and not excluded[active.window] then return active.window end
+    for _, leaf in ipairs(leaves(id)) do
+      if leaf.window and not excluded[leaf.window] then return leaf.window end
+    end
+  end
+  local function from(list, index)
+    for position = index + 1, #list do
+      local window = usable(list[position].node)
+      if window then return window end
+    end
+    for position = index - 1, 1, -1 do
+      local window = usable(list[position].node)
+      if window then return window end
+    end
+  end
+  local current = node(leaf_id)
+  while current and current.parent do
+    local parent = node(current.parent)
+    local window = parent and from(parent.children, child_index(parent, current.id) or 0)
+    if window then return window end
+    current = parent
+  end
+  local owner, strip, strip_index, root_index = nil, nil, nil, nil
+  if current then owner, strip, strip_index, root_index = root_location(current.id) end
+  if owner ~= state or not strip then return nil end
+  local window = from(strip.roots, root_index)
+  if window then return window end
+  for distance = 1, #state.strips do
+    for _, step in ipairs({ distance, -distance }) do
+      local other = state.strips[strip_index + step]
+      if other then
+        local nearest = math.min(root_index, #other.roots)
+        window = other.roots[nearest] and usable(other.roots[nearest].node) or from(other.roots, nearest)
+        if window then return window end
+      end
+    end
+  end
+end
+-- Dragging by the title bar ---------------------------------------------------
+-- A dragged tiled window follows the pointer while the others make room, as in
+-- a sortable list (`drag_reorder`); the cameras hold, panning near the edges.
+-- The right button cancels, putting everything back.
+-- A tile's window, inside its title bar and borders.
+local function content_rect(frame)
+  return {
+    x = frame.x + border_width,
+    y = frame.y + decoration_height + border_width,
+    width = math.max(1, frame.width - 2 * border_width),
+    height = math.max(1, frame.height - decoration_height - 2 * border_width),
+  }
+end
+-- `model.screens` holds where each tiled window's tile (title bar and borders
+-- included) rests on screen, as last laid out.
+local function inside(rect, x, y)
+  return x >= rect.x and x < rect.x + rect.width and y >= rect.y and y < rect.y + rect.height
+end
+local function container_horizontal(parent)
+  if parent then return parent.mode == "tabbed" or parent.axis == "horizontal" end
+  return main_axis == "horizontal"
+end
+-- Whether a container's children run against the screen axis they lie on.
+local function reversed(horizontal)
+  local main = horizontal == (main_axis == "horizontal")
+  return main and main_reverse or (not main and cross_reverse)
+end
+-- The pointer at (x, y) during a drag of `leaf`, over another tile. Its
+-- leading or trailing quarter along the rows puts the window beside that
+-- tile's column, there and then; its middle proposes stacking the two in that
+-- column, the window taking the half the pointer is in (`model.drag.group`),
+-- done on the drop. Over the window's own tile, or nothing, nothing changes;
+-- a move never leaves the pointer over a place that would undo it.
+local function drag_reorder(state, leaf, x, y)
+  local drag, screens = model.drag, model.screens or {}
+  local own = screens[leaf.window]
+  if not own or not drag then return end
+  if drag.group and model.drop_slot and inside(model.drop_slot, x, y) then return end
+  if inside(own, x, y) then drag.group = nil; return end
+  local over, rect
+  for window, candidate_rect in pairs(screens) do
+    local candidate = window ~= leaf.window and node(model.window_nodes[window])
+    if candidate and candidate.tag == leaf.tag and candidate.state == "tiled"
+      and inside(candidate_rect, x, y) then over, rect = candidate, candidate_rect; break end
+  end
+  if not over then drag.group = nil; return end
+  local along_x = main_axis == "horizontal"
+  local start, extent = along_x and rect.x or rect.y, along_x and rect.width or rect.height
+  local fraction = ((along_x and x or y) - start) / extent
+  if fraction > 0.25 and fraction < 0.75 then
+    local cross_start = along_x and rect.y or rect.x
+    local cross_extent = along_x and rect.height or rect.width
+    drag.group = { target = over.window, first = (along_x and y or x) < cross_start + cross_extent / 2 }
+    return
+  end
+  drag.group = nil
+  local after = (fraction >= 0.75) ~= main_reverse
+  if not leaf.parent then
+    local _, strip, _, from = root_location(leaf.id)
+    local _, over_strip, _, over_index = root_location(containing_root(over.id).id)
+    if strip and strip == over_strip then
+      local to = over_index + (after and 1 or 0)
+      if from < to then to = to - 1 end
+      if to ~= from then table.insert(strip.roots, to, table.remove(strip.roots, from)) end
+      return
+    end
+  end
+  local saved = detach(leaf.id)
+  if not saved then return end
+  -- Leaving a group can dissolve it: find `over`'s column afresh.
+  local _, strip, _, index = root_location(containing_root(over.id).id)
+  if strip then attach_root(state, strip, leaf.id, index + (after and 1 or 0), saved.width) end
+  compact_strips(state)
+end
+-- Drop `leaf` stacked with `target` in its column, first or second on screen.
+local function stack_with(state, leaf, target, first)
+  if not target or target == leaf then return end
+  if not detach(leaf.id) then return end
+  local axis = main_axis == "horizontal" and "vertical" or "horizontal"
+  local before = first ~= reversed(axis == "horizontal")
+  local parent = target.parent and node(target.parent)
+  if parent and parent.mode ~= "tabbed" and parent.axis == axis then
+    local index = child_index(parent, target.id) + (before and 0 or 1)
+    table.insert(parent.children, index, { node = leaf.id, weight = 1 })
+    leaf.parent = parent.id
+    parent.active = index
+  else
+    local group = new_group("split", axis)
+    replace_position(target.id, group.id)
+    target.parent, leaf.parent = group.id, group.id
+    group.children = before and { { node = leaf.id, weight = 1 }, { node = target.id, weight = 1 } }
+      or { { node = target.id, weight = 1 }, { node = leaf.id, weight = 1 } }
+    group.active = before and 1 or 2
+  end
+  compact_strips(state)
+end
+-- Move the dragged `leaf` to the next row `direction` (-1, 1) of its own, a
+-- new one past the last, under the pointer at `along` on the rows' axis.
+local function shift_row(state, leaf, direction, along)
+  local root = containing_root(leaf.id)
+  local _, strip, strip_index = root_location(root.id)
+  if not strip then return end
+  local destination = state.strips[strip_index + direction]
+  if not destination then
+    destination = new_strip()
+    table.insert(state.strips, direction > 0 and #state.strips + 1 or 1, destination)
+  end
+  local index = #destination.roots + 1
+  for position, metric in ipairs(destination.metrics or {}) do
+    if along < metric.start + metric.size / 2 then index = position; break end
+  end
+  local saved = detach(leaf.id)
+  if saved then attach_root(state, destination, leaf.id, index, saved.width) end
+  compact_strips(state)
+end
+-- Whether the pointer has now been held at an edge (`direction` not 0) long
+-- enough to act there, timing each edge (`key`) separately.
+local function dwelled(drag, key, direction, now)
+  local edge = drag[key]
+  if direction == 0 then drag[key] = nil; return false end
+  if not edge or edge.direction ~= direction then
+    drag[key] = { direction = direction, since = now, count = 0 }
+    return false
+  end
+  if now - edge.since < math.max(edge_repeat_min_ms, edge_dwell_ms * 0.75 ^ edge.count) then return false end
+  edge.since, edge.count = now, edge.count + 1
+  return true
+end
+-- The window `direction` (left, right, up, down) of `from` on screen: of the
+-- tiles lying that way, one sharing some of its extent across the motion, the
+-- nearest, then the one sharing most; failing any, the least out of line.
+-- Only tiles laid out on screen count, so a hidden tab is never chosen;
+-- and only on tag `tag` (default: `from`'s). Positions are global, so this
+-- also finds where focus enters a neighbouring monitor.
+local function toward(from, direction, tag)
+  local screens = model.screens or {}
+  local origin = screens[from.window]
+  if not origin then return nil end
+  local horizontal = direction == "left" or direction == "right"
+  local forward = direction == "right" or direction == "down"
+  local best, best_overlap, best_gap
+  for window, rect in pairs(screens) do
+    local candidate = window ~= from.window and node(model.window_nodes[window])
+    if candidate and candidate.tag == (tag or from.tag) and candidate.state == "tiled" then
+      local gap
+      if horizontal then
+        gap = forward and rect.x - (origin.x + origin.width) or origin.x - (rect.x + rect.width)
+      else
+        gap = forward and rect.y - (origin.y + origin.height) or origin.y - (rect.y + rect.height)
+      end
+      if gap > -inner_gap then
+        local overlap = horizontal
+          and math.min(origin.y + origin.height, rect.y + rect.height) - math.max(origin.y, rect.y)
+          or math.min(origin.x + origin.width, rect.x + rect.width) - math.max(origin.x, rect.x)
+        local better
+        if not best then
+          better = true
+        elseif (overlap > 0) ~= (best_overlap > 0) then
+          better = overlap > 0
+        elseif overlap > 0 then
+          better = gap < best_gap - 0.5 or (math.abs(gap - best_gap) <= 0.5 and overlap > best_overlap)
+        else
+          better = overlap > best_overlap or (overlap == best_overlap and gap < best_gap)
+        end
+        if better then best, best_overlap, best_gap = candidate, overlap, gap end
+      end
+    end
+  end
+  return best and best.window
 end
 local function swap_positions(first_id, second_id)
   if first_id == second_id or is_ancestor(first_id, second_id) or is_ancestor(second_id, first_id) then return end
@@ -945,6 +1213,128 @@ local function mutate_action(snapshot, request)
     set_focus(state, nil, snapshot)
     return { { name = "focus-window", window = window } }
   end
+  -- The host's report of a title-bar drag: the pointer's total motion since
+  -- the press, then "drop" on release.
+  -- `place-window <window> before|after|first|last <key>`: move a tiled
+  -- window to a place named by a projected item's key (`window:<id>`,
+  -- `node:<id>`, `strip:<id>`), as the bar does when a window is dragged in it.
+  if name == "place-window" then
+    local leaf = node(model.window_nodes[tonumber(request.args[1])])
+    local relation, key = request.args[2], request.args[3] or ""
+    if not leaf or leaf.state ~= "tiled" then return {} end
+    local kind, id = key:match("^(%a+):(%d+)$")
+    id = tonumber(id)
+    local target
+    if kind == "window" then target = node(model.window_nodes[id])
+    elseif kind == "node" then target = node(id)
+    elseif kind == "strip" then target = strip_by_id(state, id) end
+    if not target or target == leaf then return {} end
+    -- Taking the window out can dissolve the group it is placed against
+    -- (its own, left with one member): that member takes the group's place.
+    local parent = leaf.parent and node(leaf.parent)
+    local survivor
+    if parent and target == parent and #parent.children == 2 then
+      for _, child in ipairs(parent.children) do
+        if child.node ~= leaf.id then survivor = node(child.node) end
+      end
+    end
+    local saved = detach(leaf.id)
+    if not saved then return {} end
+    if kind ~= "strip" and not node(target.id) then
+      target = survivor
+      if relation == "first" then relation = "before" elseif relation == "last" then relation = "after" end
+    end
+    if not target then attach_root(state, state.current, leaf.id, nil, saved.width); return {} end
+    if kind == "strip" then
+      attach_root(state, target, leaf.id, relation == "first" and 1 or nil, saved.width)
+    elseif (relation == "first" or relation == "last") and target.kind == "group" then
+      local index = relation == "first" and 1 or #target.children + 1
+      table.insert(target.children, index, { node = leaf.id, weight = 1 })
+      leaf.parent = target.id
+    elseif target.parent then
+      local group = node(target.parent)
+      local index = child_index(group, target.id) + (relation == "after" and 1 or 0)
+      table.insert(group.children, index, { node = leaf.id, weight = 1 })
+      leaf.parent = group.id
+      if group.active >= index then group.active = group.active + 1 end
+    else
+      local _, strip, _, index = root_location(target.id)
+      if strip then attach_root(state, strip, leaf.id, index + (relation == "after" and 1 or 0), saved.width) end
+    end
+    compact_strips(state)
+    return {}
+  end
+  if name == "drag-window" then
+    -- `drag-window <window> <dx> <dy> move|drop|cancel [<x> <y>]`: the
+    -- pointer's motion since the press at (x, y) on the window's title bar.
+    local window = tonumber(request.args[1])
+    local dx, dy = tonumber(request.args[2]) or 0, tonumber(request.args[3]) or 0
+    local phase = request.args[4]
+    local leaf, fact = node(model.window_nodes[window]), model.windows[window]
+    if not leaf or not fact then model.drag = nil; return {} end
+    local drag = model.drag
+    if not drag or drag.window ~= window then
+      local tile = model.screens and model.screens[window]
+      local origin = tile and content_rect(tile)
+      local grab_x, grab_y = tonumber(request.args[5]), tonumber(request.args[6])
+      drag = {
+        window = window, floating = fact.floating and copy(fact.floating), origin = origin,
+        -- Everything as it was, for a cancel.
+        saved = copy(model),
+        pointer = origin and {
+          x = grab_x and origin.x - border_width + grab_x or origin.x + origin.width / 2,
+          y = grab_y and origin.y - border_width - decoration_height + grab_y or origin.y + origin.height / 2,
+        },
+      }
+      model.drag = drag
+    end
+    drag.dx, drag.dy = dx, dy
+    if phase == "cancel" then
+      local shift = leaf.drag_shift
+      model = drag.saved
+      model.synced_epoch = nil
+      local restored = node(model.window_nodes[window])
+      if restored and restored.state == "tiled" then restored.settle = shift end
+      if leaf.state == "floating" and drag.floating then
+        return { { name = "set-floating-geometry", window = window, geometry = drag.floating } }
+      end
+      return {}
+    end
+    local result, owner = {}, model.tags[leaf.tag]
+    if leaf.state == "floating" and drag.floating then
+      local geometry = copy(drag.floating)
+      geometry.x, geometry.y = geometry.x + dx, geometry.y + dy
+      result[1] = { name = "set-floating-geometry", window = window, geometry = geometry }
+    elseif leaf.state == "tiled" and drag.pointer and owner then
+      drag_reorder(owner, leaf, drag.pointer.x + dx, drag.pointer.y + dy)
+    end
+    if phase == "drop" then
+      if leaf.state == "tiled" and drag.group and owner then
+        stack_with(owner, leaf, node(model.window_nodes[drag.group.target]), drag.group.first)
+      end
+      leaf.settle = leaf.drag_shift
+      leaf.drag_shift, model.drag = nil, nil
+    end
+    return result
+  end
+  -- `pan-<direction>`: move the view a window (along the rows) or a row
+  -- (across them) that way on screen, and keep it there while focus stays
+  -- put; `recenter` brings it back to the focused window.
+  local pan = name:match("^pan%-(%a+)$")
+  if pan == "left" or pan == "right" or pan == "up" or pan == "down" then
+    local horizontal = pan == "left" or pan == "right"
+    local axis = horizontal == (main_axis == "horizontal") and "main" or "cross"
+    local forward = (pan == "right" or pan == "down") ~= (axis == "main" and main_reverse or axis == "cross" and cross_reverse)
+    state.pan, state.pinned = { axis = axis, step = forward and 1 or -1 }, true
+    return {}
+  end
+  if name == "recenter" then state.pinned, state.pan = nil, nil; return {} end
+  -- The host's report that the focused window went away on its own (the
+  -- client exited): focus passes to where it was, as on close-focused.
+  if name == "focus-successor" then
+    if snapshot.tag.focused_window then return {} end
+    return focus_output(snapshot, snapshot.output)
+  end
   if name == "focus-parent" then focus_parent(state, snapshot); return {} end
   if name == "focus-child" then focus_child(state, snapshot); return {} end
   if name == "close-focused" then
@@ -958,11 +1348,7 @@ local function mutate_action(snapshot, request)
     -- then a neighbouring column, else whatever this monitor would focus.
     local current = descriptor_node(target)
     local start = current and (current.kind == "window" and current or active_leaf(current.id))
-    local successor
-    for _, direction in ipairs(start and { "down", "up", "left", "right" } or {}) do
-      local adjacent = neighbor(state, start.id, direction)
-      if adjacent and adjacent.window and not closing[adjacent.window] then successor = adjacent.window; break end
-    end
+    local successor = start and nearest_window(state, start.id, closing)
     set_focus(state, nil, snapshot)
     if successor then
       result[#result + 1] = { name = "focus-window", window = successor }
@@ -1114,10 +1500,15 @@ local function mutate_action(snapshot, request)
     if start then adjacent, crossed, crossed_strip, crossed_index = neighbor(state, start.id, direction) end
     if verb == "focus" then
       set_focus(state, nil, snapshot)
-      if adjacent then return { { name = "focus-window", window = adjacent.window } } end
-      -- Past the edge of this monitor: continue onto the neighbouring one.
-      local toward = output_toward(snapshot, direction)
-      return toward and focus_output(snapshot, toward) or {}
+      local window = start and toward(start, direction)
+      if window then return { { name = "focus-window", window = window } } end
+      -- Past the last window this way: continue onto the neighbouring
+      -- monitor, at the window beside this one there.
+      local monitor = output_toward(snapshot, direction)
+      if not monitor then return {} end
+      local entering = start and toward(start, direction, monitor.active_tag)
+      if entering then return { { name = "focus-window", window = entering } } end
+      return focus_output(snapshot, monitor)
     end
     if not current then return {} end
     if crossed then
@@ -1211,12 +1602,18 @@ local function sample_motion(motion, now)
   if progress >= 1 then motion.from = motion.to; return motion.to, false end
   return motion.from + (motion.to - motion.from) * ease_out_cubic(progress), true
 end
-local function animate(owner, key, target, now)
+-- `delay`: a new target is started toward only this many milliseconds later.
+local function animate(owner, key, target, now, delay)
   local motion = owner[key]
   if not motion then motion = { from = target, to = target, started = now }; owner[key] = motion end
   local current = sample_motion(motion, now)
-  if target ~= motion.to then motion.from, motion.to, motion.started = current, target, now end
+  if target ~= motion.to then motion.from, motion.to, motion.started = current, target, now + (delay or 0) end
   return sample_motion(motion, now)
+end
+-- Put a camera at `value` at once: panning moves it a little every frame.
+local function place(owner, key, value, now)
+  owner[key] = { from = value, to = value, started = now }
+  return value
 end
 
 local function window_minimum(fact)
@@ -1271,19 +1668,37 @@ local function distribute(children, available, horizontal)
   end
   return sizes
 end
+-- A stack proposed while dragging, for this layout: a slot made for the
+-- dragged window beside `target`, the windows around it making room. Its
+-- `frame` is filled in as the tree is laid out.
+local stack_preview
 local function layout_node(root_id, rect, active, entries, z)
   local current = node(root_id)
   if not current then return z end
   if current.kind == "window" then
     local fact = model.windows[current.window]
     if not fact then return z end
+    local preview = stack_preview
+    if preview and current.window == preview.target and not preview.group then
+      -- Alone where it is: it gives up half its place to the slot.
+      local horizontal = preview.axis == "horizontal"
+      local available = horizontal and rect.width or rect.height
+      local gap = math.min(inner_gap, math.max(0, available))
+      local half = math.floor((available - gap) / 2)
+      local first = horizontal and { x = rect.x, y = rect.y, width = half, height = rect.height }
+        or { x = rect.x, y = rect.y, width = rect.width, height = half }
+      local second = horizontal
+        and { x = rect.x + half + gap, y = rect.y, width = available - half - gap, height = rect.height }
+        or { x = rect.x, y = rect.y + half + gap, width = rect.width, height = available - half - gap }
+      preview.frame, rect = preview.before and first or second, preview.before and second or first
+    end
     entries[#entries + 1] = {
       window = current.window, state = current.state, frame = rect,
       propose = {
         width = math.max(1, rect.width - 2 * border_width),
         height = math.max(1, rect.height - decoration_height - 2 * border_width),
       },
-      visible = active and shown(fact), z = z,
+      visible = active and shown(fact), shown = active, z = z,
     }
     return z + 1
   end
@@ -1296,15 +1711,27 @@ local function layout_node(root_id, rect, active, entries, z)
   local horizontal = current.axis == "horizontal"
   local available = horizontal and rect.width or rect.height
   local gap = math.min(inner_gap, math.max(0, available))
-  local sizes = distribute(current.children,
-    math.max(0, available - gap * math.max(0, #current.children - 1)), horizontal)
+  -- The proposed stack is this one: it makes room for one more.
+  local children = current.children
+  local preview = stack_preview
+  if preview and preview.group == current.id then
+    children = {}
+    for _, child in ipairs(current.children) do children[#children + 1] = child end
+    table.insert(children, clamp(preview.index, 1, #children + 1), { weight = 1, slot = true })
+  end
+  local sizes = distribute(children,
+    math.max(0, available - gap * math.max(0, #children - 1)), horizontal)
   local cursor = horizontal and rect.x or rect.y
-  for index, child in ipairs(current.children) do
+  for index, child in ipairs(children) do
     local extent = sizes[index]
     local child_rect = horizontal
       and { x = cursor, y = rect.y, width = extent, height = rect.height }
       or { x = rect.x, y = cursor, width = rect.width, height = extent }
-    z = layout_node(child.node, child_rect, active, entries, z)
+    if child.slot then
+      preview.frame = child_rect
+    else
+      z = layout_node(child.node, child_rect, active, entries, z)
+    end
     cursor = cursor + extent + gap
   end
   return z
@@ -1332,14 +1759,6 @@ local function screen_rect(target, usable, main_camera, cross_camera)
   local result = logical_rect(main, cross, main_size, cross_size)
   result.x, result.y = result.x + usable.x, result.y + usable.y
   return result
-end
-local function content_rect(frame)
-  return {
-    x = frame.x + border_width,
-    y = frame.y + decoration_height + border_width,
-    width = math.max(1, frame.width - 2 * border_width),
-    height = math.max(1, frame.height - decoration_height - 2 * border_width),
-  }
 end
 local function camera_target(current, metric, index, count, total, viewport)
   if not metric then return 0 end
@@ -1370,6 +1789,28 @@ end
 
 local function layout(snapshot)
   local state = sync(snapshot)
+  stack_preview = nil
+  do
+    local proposal = model.drag and model.drag.group
+    local target = proposal and node(model.window_nodes[proposal.target])
+    if target and target.tag == state.id and target.state == "tiled" then
+      local axis = main_axis == "horizontal" and "vertical" or "horizontal"
+      local before = proposal.first ~= reversed(axis == "horizontal")
+      local parent = target.parent and node(target.parent)
+      local stacked = parent and parent.mode ~= "tabbed" and parent.axis == axis
+      stack_preview = {
+        target = target.window, before = before, axis = axis,
+        group = stacked and parent.id or nil,
+        index = stacked and child_index(parent, target.id) + (before and 0 or 1) or nil,
+      }
+    end
+  end
+  local screens = model.screens or {}
+  model.screens = screens
+  for window in pairs(model.windows) do
+    local leaf = node(model.window_nodes[window])
+    if leaf and leaf.tag == state.id then screens[window] = nil end
+  end
   local usable, now = snapshot.output.usable, snapshot.clock.monotonic_ms
   assert(usable.width > 0 and usable.height > 0, "empty usable output")
   local viewport_main, viewport_cross = axis_extent(usable, "main"), axis_extent(usable, "cross")
@@ -1405,6 +1846,24 @@ local function layout(snapshot)
     cross_cursor = cross_cursor + strip_cross + inner_gap
   end
   local cross_total = cross_cursor - inner_gap + outer_gap
+  -- Windows waiting to be placed (see `sync`): hidden, proposed the size of a
+  -- new column so they can answer.
+  for window, fact in pairs(model.windows) do
+    local leaf = node(model.window_nodes[window])
+    if leaf and leaf.tag == state.id and leaf.state == "tiled" and not strip_of_root[leaf.id]
+      and not leaf.parent then
+      local size = math.max(1, math.floor(base_main * 0.5 + 0.5))
+      local frame = logical_rect(outer_gap, outer_gap, size, base_cross)
+      entries[#entries + 1] = {
+        window = window, state = "tiled", frame = frame, pending = true, visible = false, z = z,
+        propose = {
+          width = math.max(1, frame.width - 2 * border_width),
+          height = math.max(1, frame.height - decoration_height - 2 * border_width),
+        },
+      }
+      z = z + 1
+    end
+  end
   local focused_root = containing_root(snapshot.tag.focused_window
     and model.window_nodes[snapshot.tag.focused_window])
   local focused_strip, focused_strip_index
@@ -1413,28 +1872,125 @@ local function layout(snapshot)
     _, focused_strip, focused_strip_index = root_location(focused_root.id)
   end
   local active = false
-  for _, strip in ipairs(state.strips) do
-    local metric, metric_index
-    if strip == focused_strip then
-      for index, candidate in ipairs(strip.metrics) do
-        if candidate.node == focused_root.id then metric, metric_index = candidate, index end
+  -- The focused window moved within the layout (not focus moving to another
+  -- window): the camera follows a little later.
+  local focused_window = snapshot.tag.focused_window
+  local lag
+  if focused_window and state.camera_window == focused_window then
+    local leaf = node(model.window_nodes[focused_window])
+    for _, entry in ipairs(entries) do
+      if entry.window == focused_window and entry.state == "tiled" and leaf and leaf.frame_x and leaf.frame_y
+        and (leaf.frame_x.to ~= entry.frame.x or leaf.frame_y.to ~= entry.frame.y) then
+        lag = camera_lag_ms
       end
     end
-    local current = strip.camera and sample_motion(strip.camera, now) or 0
-    local target = strip == focused_strip
-      and camera_target(current, metric, metric_index or 0, #strip.metrics, strip.total, viewport_main)
-      or (strip.camera and strip.camera.to or 0)
-    local moving
-    strip.camera_current, moving = animate(strip, "camera", target, now)
-    active = active or moving
   end
+  -- Focus moving to another window ends a pan: the camera follows it again.
+  if state.camera_window ~= focused_window then state.pinned = nil end
+  state.camera_window = focused_window
+  -- One camera along the rows and one across them, for the whole tag: rows
+  -- scroll together.
+  local main_total = 0
+  for _, strip in ipairs(state.strips) do main_total = math.max(main_total, strip.total) end
+  local main_limit = math.max(0, main_total - viewport_main)
+  local main_current = state.camera and sample_motion(state.camera, now) or 0
   local cross_current = state.cross_camera and sample_motion(state.cross_camera, now) or 0
-  local cross_target = camera_target(cross_current,
-    focused_strip_index and strip_metrics[focused_strip_index] or nil,
-    focused_strip_index or 0, #state.strips, cross_total, viewport_cross)
-  local cross_moving
-  cross_current, cross_moving = animate(state, "cross_camera", cross_target, now)
-  active = active or cross_moving
+  local main_target = state.camera and state.camera.to or 0
+  local cross_target = state.cross_camera and state.cross_camera.to or 0
+  -- The camera along the rows, moved from `target` to bring the next window of
+  -- `strip` beyond the view `direction` (-1, 1) into it.
+  local function step_along(strip, target, direction)
+    local metrics, step = strip.metrics or {}, nil
+    if direction > 0 then
+      for index, metric in ipairs(metrics) do
+        if metric.start + metric.size > target + viewport_main - outer_gap + 1 then step = index; break end
+      end
+    else
+      for index = #metrics, 1, -1 do
+        if metrics[index].start < target + outer_gap - 1 then step = index; break end
+      end
+    end
+    return step and camera_target(target, metrics[step], step, #metrics, main_total, viewport_main) or target
+  end
+  -- A tiled window being dragged here: the cameras stop following focus. The
+  -- pointer held at an edge steps the view along the rows, or moves the
+  -- window to the next row; the camera across the rows keeps its row in view.
+  local drag = model.drag
+  local dragged = drag and drag.pointer and node(model.window_nodes[drag.window])
+  if not (dragged and dragged.tag == state.id and dragged.state == "tiled") then dragged = nil end
+  local pointer, shift_edge
+  if dragged then
+    pointer = { x = drag.pointer.x + (drag.dx or 0), y = drag.pointer.y + (drag.dy or 0) }
+    local along_x = main_axis == "horizontal"
+    local main_at = along_x and pointer.x - usable.x or pointer.y - usable.y
+    local cross_at = along_x and pointer.y - usable.y or pointer.x - usable.x
+    local main_moved = (along_x and drag.dx or drag.dy) or 0
+    local cross_moved = (along_x and drag.dy or drag.dx) or 0
+    -- Only towards an edge the drag has moved towards: a title bar is always
+    -- near the top, and grabbing one should not shift rows.
+    local function edge(at, extent, moved)
+      if moved < -8 and at < edge_zone then return -1 end
+      if moved > 8 and at > extent - edge_zone then return 1 end
+      return 0
+    end
+    local main_edge = edge(main_at, viewport_main, main_moved)
+    local cross_edge = edge(cross_at, viewport_cross, cross_moved)
+    shift_edge = cross_edge ~= 0 and cross_edge or nil
+    if main_reverse then main_edge = -main_edge end
+    if cross_reverse then cross_edge = -cross_edge end
+    if main_edge ~= 0 or cross_edge ~= 0 then active = true end
+    local root = containing_root(dragged.id)
+    local _, strip, strip_index = root_location(root.id)
+    if dwelled(drag, "main_edge", main_edge, now) and strip then
+      main_target = step_along(strip, main_target, main_edge)
+    end
+    if dwelled(drag, "cross_edge", cross_edge, now) then
+      local along = (main_reverse and viewport_main - main_at or main_at) + main_current
+      shift_row(state, dragged, cross_edge, along)
+      drag.group, active = nil, true
+      root = containing_root(dragged.id)
+      _, strip, strip_index = root_location(root.id)
+    end
+    if strip_index and strip_metrics[strip_index] then
+      cross_target = camera_target(cross_current, strip_metrics[strip_index],
+        strip_index, #state.strips, cross_total, viewport_cross)
+    end
+  elseif state.pinned then
+    -- Panned by hand: the cameras stay where they were put, stepping a
+    -- window along the rows or a row across them per request.
+    local pan = state.pan
+    state.pan = nil
+    local middle, middle_index = nil, nil
+    for index, metric in ipairs(strip_metrics) do
+      if cross_target + viewport_cross / 2 >= metric.start then middle, middle_index = state.strips[index], index end
+    end
+    if pan and pan.axis == "main" and middle then
+      main_target = step_along(middle, main_target, pan.step)
+    elseif pan and pan.axis == "cross" and middle_index then
+      local index = clamp(middle_index + pan.step, 1, #state.strips)
+      cross_target = camera_target(cross_target, strip_metrics[index], index, #state.strips, cross_total, viewport_cross)
+    end
+  else
+    if focused_strip then
+      local metric, metric_index
+      for index, candidate in ipairs(focused_strip.metrics) do
+        if candidate.node == focused_root.id then metric, metric_index = candidate, index end
+      end
+      main_target = camera_target(main_current, metric, metric_index or 0,
+        #focused_strip.metrics, main_total, viewport_main)
+    end
+    -- With nothing focused here (focus is on another monitor) the cameras
+    -- hold rather than snapping back to the first window.
+    if focused_strip_index then
+      cross_target = camera_target(cross_current, strip_metrics[focused_strip_index],
+        focused_strip_index, #state.strips, cross_total, viewport_cross)
+    end
+  end
+  local main_moving, cross_moving
+  main_current, main_moving = animate(state, "camera", clamp(main_target, 0, main_limit), now,
+    not dragged and lag or nil)
+  cross_current, cross_moving = animate(state, "cross_camera", cross_target, now, not dragged and lag or nil)
+  active = active or main_moving or cross_moving
 
   local fullscreen, fullscreen_serial = nil, -1
   for window, fact in pairs(model.windows) do
@@ -1457,22 +2013,70 @@ local function layout(snapshot)
     end
   end
   if fullscreen then for _, entry in ipairs(entries) do entry.visible = entry.window == fullscreen end end
+  -- The proposed stack's slot on screen, while the pointer is over it the
+  -- proposal stands (`drag_reorder`).
+  local drop_slot = stack_preview and stack_preview.frame
+    and screen_rect(stack_preview.frame, usable, main_current, cross_current)
+  model.drop_slot = drop_slot
+  -- Where each tile rests on screen, title bar and borders included, for
+  -- dragging and directional focus (a hidden tab has none): all of them
+  -- before any is placed, as the dragged window's size can depend on another's.
+  for _, entry in ipairs(entries) do
+    if entry.state == "tiled" and not entry.pending and entry.shown ~= false then
+      screens[entry.window] = screen_rect(entry.frame, usable, main_current, cross_current)
+    end
+  end
+  -- Strips a window has left since the last layout: they close up late.
+  local left = {}
+  for _, entry in ipairs(entries) do
+    local leaf = entry.state == "tiled" and node(model.window_nodes[entry.window])
+    local root = leaf and containing_root(leaf.id)
+    local strip = root and strip_of_root[root.id]
+    if strip and leaf.strip and leaf.strip ~= strip.id then left[leaf.strip] = true end
+  end
   for _, entry in ipairs(entries) do
     local fact = model.windows[entry.window] or {}
     local leaf = node(model.window_nodes[entry.window])
     local root = containing_root(model.window_nodes[entry.window])
     local strip = root and strip_of_root[root.id]
     local frame = entry.frame
-    if entry.state == "tiled" and leaf then
+    if entry.state == "tiled" and leaf and leaf.settle and not entry.pending then
+      -- Dropped: ease in from where the pointer left it.
+      local shift_x = (main_axis == "horizontal" and main_reverse or main_axis ~= "horizontal" and cross_reverse) and -1 or 1
+      local shift_y = (main_axis == "horizontal" and cross_reverse or main_axis ~= "horizontal" and main_reverse) and -1 or 1
+      leaf.frame_x = { from = frame.x + shift_x * leaf.settle.x, to = frame.x, started = now }
+      leaf.frame_y = { from = frame.y + shift_y * leaf.settle.y, to = frame.y, started = now }
+      leaf.settle = nil
+    end
+    if entry.state == "tiled" and leaf and not entry.pending then
       local moving_x, moving_y
+      local closing = strip and leaf.strip == strip.id and left[strip.id] and stagger_ms or nil
       frame = copy(frame)
-      frame.x, moving_x = animate(leaf, "frame_x", frame.x, now)
-      frame.y, moving_y = animate(leaf, "frame_y", frame.y, now)
+      frame.x, moving_x = animate(leaf, "frame_x", frame.x, now, closing)
+      frame.y, moving_y = animate(leaf, "frame_y", frame.y, now, closing)
       active = active or moving_x or moving_y
+      leaf.strip = strip and strip.id or leaf.strip
     end
     local target = entry.state == "tiled"
-      and screen_rect(content_rect(frame), usable, strip and strip.camera_current or 0, cross_current)
+      and screen_rect(content_rect(frame), usable, main_current, cross_current)
       or frame
+    if entry.state == "tiled" and not entry.pending then
+      local resting = screen_rect(content_rect(entry.frame), usable, main_current, cross_current)
+      if drag and drag.window == entry.window and drag.origin and leaf then
+        target = copy(resting)
+        target.x, target.y = drag.origin.x + drag.dx, drag.origin.y + drag.dy
+        leaf.drag_shift = { x = target.x - resting.x, y = target.y - resting.y }
+        entry.z = dragged_z
+        -- Over a proposed stack, it takes the size of its slot.
+        local half = drop_slot
+        if half then
+          entry.propose = {
+            width = math.max(1, half.width - 2 * border_width),
+            height = math.max(1, half.height - decoration_height - 2 * border_width),
+          }
+        end
+      end
+    end
     local actual = fact.actual or entry.propose or { width = target.width, height = target.height }
     entry.screen = {
       x = math.floor(target.x), y = math.floor(target.y),
@@ -1497,9 +2101,45 @@ local function layout(snapshot)
     entry.decoration_height = decoration_height
     entry.frame = nil
   end
+  -- A stepping camera carries other windows under a pointer that has not
+  -- moved; their places on screen are now this frame's.
+  if dragged and main_moving then drag_reorder(state, dragged, pointer.x, pointer.y) end
+  -- Marks a surface may draw (`placement = "mark"`), just under the dragged
+  -- window: `drop` where it lands if dropped now (its half of a proposed
+  -- stack, or its place); `shift` along an edge where holding it moves it to
+  -- the next row.
+  local marks
+  if dragged then
+    marks = {}
+    local function mark(name, rect)
+      if not rect then return end
+      marks[#marks + 1] = {
+        name = name, z = dragged_z - 1,
+        rect = {
+          x = math.floor(rect.x), y = math.floor(rect.y),
+          width = math.max(1, math.floor(rect.width)), height = math.max(1, math.floor(rect.height)),
+        },
+      }
+    end
+    mark("drop", drop_slot or screens[dragged.window])
+    if shift_edge then
+      local band = math.floor(edge_zone / 2)
+      local along_x = main_axis == "horizontal"
+      mark("shift", along_x
+        and { x = usable.x, y = shift_edge < 0 and usable.y or usable.y + usable.height - band, width = usable.width, height = band }
+        or { x = shift_edge < 0 and usable.x or usable.x + usable.width - band, y = usable.y, width = band, height = usable.height })
+    end
+  end
+  -- Sizes are whole pixels: halves and shares of odd sizes are not.
+  for _, entry in ipairs(entries) do
+    if entry.propose then
+      entry.propose.width = math.max(1, math.floor(entry.propose.width))
+      entry.propose.height = math.max(1, math.floor(entry.propose.height))
+    end
+  end
   return {
     epoch = snapshot.epoch, output = snapshot.output.id, tag = snapshot.tag.id,
-    entries = entries, needs_frame = active,
+    entries = entries, marks = marks, needs_frame = active,
   }
 end
 
@@ -1521,19 +2161,19 @@ local function mark_badges()
   end
   return nodes, windows, strips
 end
-local function append_item(items, style, text, focused, detail, window, width, action, overlay)
+local function append_item(items, style, text, focused, detail, window, width, action, overlay, key)
   items[#items + 1] = {
-    style = style, text = text or "", focused = focused == true,
+    key = key, style = style, text = text or "", focused = focused == true,
     detail = detail or "", window = window, width = width, action = action,
     args = action and window and { tostring(window) } or nil,
     overlay = overlay == true,
   }
 end
-local function append_open(items, label, selected, mark)
-  append_item(items, "group-open", label, selected, mark, nil, 3, nil, true)
+local function append_open(items, label, selected, mark, key)
+  append_item(items, "group-open", label, selected, mark, nil, 3, nil, true, key)
 end
-local function append_close(items)
-  append_item(items, "group-close", "", false, "", nil, 3, nil, true)
+local function append_close(items, key)
+  append_item(items, "group-close", "", false, "", nil, 3, nil, true, key)
 end
 local function project_node(items, id, focus, node_marks, window_marks)
   local current = node(id)
@@ -1541,41 +2181,32 @@ local function project_node(items, id, focus, node_marks, window_marks)
   if current.kind == "window" then
     append_item(items, "window", "",
       focus and focus.kind == "window" and focus.window == current.window,
-      window_marks[current.window], current.window, 148, "focus-window")
+      window_marks[current.window], current.window, 148, "focus-window", nil, "window:" .. current.window)
     return
   end
+  local key = "node:" .. current.id
   append_open(items,
     current.mode == "tabbed" and "t" or current.axis == "horizontal" and "h" or "v",
     focus and focus.kind == "node" and focus.id == current.id,
-    node_marks[current.id])
+    node_marks[current.id], key)
   for _, child in ipairs(current.children) do
     project_node(items, child.node, focus, node_marks, window_marks)
   end
-  append_close(items)
+  append_close(items, key)
 end
 local function project(snapshot)
   local state = sync(snapshot)
   local focus = focused_descriptor(state, snapshot)
   local node_marks, window_marks, strip_marks = mark_badges()
   local items = {}
-  local focused_root = containing_root(snapshot.tag.focused_window
-    and model.window_nodes[snapshot.tag.focused_window])
   for _, strip in ipairs(state.strips) do
     append_open(items, main_axis == "horizontal" and "h" or "v",
       focus and focus.kind == "strip" and focus.id == strip.id,
-      strip_marks[strip.id])
-    local inserted = false
+      strip_marks[strip.id], "strip:" .. strip.id)
     for _, slot in ipairs(strip.roots) do
       project_node(items, slot.node, focus, node_marks, window_marks)
-      if strip == state.current and focused_root and slot.node == focused_root.id then
-        append_item(items, "insertion", "", false, "", nil, 3, nil, true)
-        inserted = true
-      end
     end
-    if strip == state.current and not inserted then
-      append_item(items, "insertion", "", false, "", nil, 3, nil, true)
-    end
-    append_close(items)
+    append_close(items, "strip:" .. strip.id)
   end
   for _, wanted in ipairs({
     { state = "floating", label = "float" },

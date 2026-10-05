@@ -9,6 +9,7 @@
 //! here, once, and handed to every Lua state that needs them.
 
 const std = @import("std");
+const wm = @import("whirlpool-wm");
 const lua_vm = @import("lua_vm.zig");
 const binding_config = @import("config/bindings.zig");
 pub const modules = @import("modules.zig");
@@ -28,11 +29,21 @@ pub const SurfaceSpec = struct {
     provider: []u8,
     role: []u8,
     placement: []u8,
+    /// With placement "mark": the name of the layout marks it is drawn on.
+    /// Empty otherwise.
+    mark: []u8,
     /// Lua source that mounts the surface: requires its content module and
     /// calls it with its options.
     content: []u8,
     edge: []u8,
     height: u32 = 0,
+    /// For an all-outputs shell: its width, centred on the output (0: the
+    /// output's width), and its distance from `edge`. With height 0 it is
+    /// as tall as the output.
+    width: u32 = 0,
+    margin: u32 = 0,
+    /// Whether the pointer interacts with it (false: it passes through).
+    input: bool = true,
     exclusive_zone: u32 = 0,
     /// Where `content` finds modules (a `package.path`); borrowed from the
     /// owning `Config`.
@@ -41,6 +52,7 @@ pub const SurfaceSpec = struct {
     pub fn deinit(self: *SurfaceSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
         allocator.free(self.edge);
+        allocator.free(self.mark);
         allocator.free(self.placement);
         allocator.free(self.role);
         allocator.free(self.provider);
@@ -91,9 +103,35 @@ pub const Config = struct {
         self.* = undefined;
     }
 
+    /// The surface for `provider` and `role`, other than one drawn on marks.
+    /// The `provider` shell surfaces placed on every output, in the order
+    /// they were registered (later ones stack above earlier ones), at most
+    /// `out.len`.
+    pub fn outputShells(self: *const Config, provider: []const u8, out: []*const SurfaceSpec) []*const SurfaceSpec {
+        var count: usize = 0;
+        for (self.surfaces) |*candidate| {
+            if (count == out.len) break;
+            if (!std.mem.eql(u8, candidate.provider, provider) or !std.mem.eql(u8, candidate.role, "shell")) continue;
+            if (!std.mem.eql(u8, candidate.placement, "all-outputs")) continue;
+            out[count] = candidate;
+            count += 1;
+        }
+        return out[0..count];
+    }
+
     pub fn surface(self: *const Config, provider: []const u8, role: []const u8) ?*const SurfaceSpec {
         for (self.surfaces) |*candidate| {
+            if (candidate.mark.len != 0) continue;
             if (std.mem.eql(u8, candidate.provider, provider) and std.mem.eql(u8, candidate.role, role))
+                return candidate;
+        }
+        return null;
+    }
+
+    /// The `provider` surface drawn on layout marks named `mark`.
+    pub fn markSurface(self: *const Config, provider: []const u8, mark: []const u8) ?*const SurfaceSpec {
+        for (self.surfaces) |*candidate| {
+            if (std.mem.eql(u8, candidate.provider, provider) and std.mem.eql(u8, candidate.mark, mark))
                 return candidate;
         }
         return null;
@@ -140,7 +178,7 @@ pub fn loadSource(allocator: std.mem.Allocator, source: []const u8, module_path:
         \\assert(found and found:match("whirlpool[/\\]init%.lua$"),
         \\  "the whirlpool standard library is not on the module path: " .. package.path)
     , "=whirlpool.stdlib") catch return error.MissingStandardLibrary;
-    try vm.run(source, "=whirlpool.config");
+    try vm.runReporting(source, "=whirlpool.config");
     try vm.evalValue("return require('whirlpool')._build()", "=whirlpool.build");
     defer vm.setTop(0);
     if (vm.luaType(-1) != .table) return error.InvalidProgram;
@@ -294,9 +332,15 @@ fn parseSurfaces(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error![]SurfaceSp
         vm.rawGetInteger(-1, @intCast(initialized + 1));
         surfaces[initialized] = try parseSurface(allocator, vm);
         vm.setTop(2);
+        // One surface per provider and role, except that every output can
+        // have several shells (a bar, a popup): those are told apart by name.
+        const current = &surfaces[initialized];
+        const several = std.mem.eql(u8, current.role, "shell") and std.mem.eql(u8, current.placement, "all-outputs");
         for (surfaces[0..initialized]) |previous| {
-            if (std.mem.eql(u8, previous.provider, surfaces[initialized].provider) and
-                std.mem.eql(u8, previous.role, surfaces[initialized].role))
+            if (std.mem.eql(u8, previous.provider, current.provider) and
+                std.mem.eql(u8, previous.role, current.role) and
+                std.mem.eql(u8, previous.mark, current.mark) and
+                (!several or !std.mem.eql(u8, previous.placement, current.placement)))
                 return error.DuplicateSurface;
         }
     }
@@ -314,6 +358,11 @@ fn parseSurface(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!SurfaceSpec 
     errdefer allocator.free(role);
     const placement = try dupeField(allocator, vm, base, "placement", error.InvalidSurface);
     errdefer allocator.free(placement);
+    const mark = try dupeOptionalField(allocator, vm, base, "mark", "");
+    errdefer allocator.free(mark);
+    // A mark names where the surface goes, so only a mark surface has one.
+    if ((mark.len != 0) != std.mem.eql(u8, placement, "mark")) return error.InvalidSurface;
+    if (mark.len > wm.layout.Mark.Name.max_len) return error.InvalidSurface;
     const module = try dupeField(allocator, vm, base, "content", error.InvalidContent);
     defer allocator.free(module);
     const options = try dupeOptionalField(allocator, vm, base, "options", "{}");
@@ -324,16 +373,28 @@ fn parseSurface(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!SurfaceSpec 
     errdefer allocator.free(edge);
     if (content.len > MaxSurfaceSourceBytes) return error.InvalidContent;
     const height = try optionalU32Field(vm, base, "height");
+    const width = try optionalU32Field(vm, base, "width");
+    const margin = try optionalU32Field(vm, base, "margin");
     const exclusive_zone = try optionalU32Field(vm, base, "exclusive_zone");
+    vm.getField(-1, "input");
+    const input = if (vm.luaType(-1) == .nil) true else vm.boolean(-1) orelse {
+        vm.setTop(base);
+        return error.InvalidSurface;
+    };
+    vm.setTop(base);
     if (!std.mem.eql(u8, edge, "top") and !std.mem.eql(u8, edge, "bottom")) return error.InvalidSurface;
     return .{
         .name = name,
         .provider = provider,
         .role = role,
         .placement = placement,
+        .mark = mark,
         .content = content,
         .edge = edge,
         .height = height,
+        .width = width,
+        .margin = margin,
+        .input = input,
         .exclusive_zone = exclusive_zone,
     };
 }
@@ -408,6 +469,46 @@ test "the example configuration loads" {
     var config = try loadSource(std.testing.allocator, source, try std.testing.allocator.dupe(u8, modules.source_tree_path));
     defer config.deinit();
     try std.testing.expect(config.bindings.len > 50);
-    try std.testing.expect(config.surface("river", "shell") != null);
+    try std.testing.expectEqualStrings("all-outputs", config.surface("river", "shell").?.placement);
     try std.testing.expect(config.surface("river", "decoration") != null);
+    try std.testing.expect(config.markSurface("river", "drop") != null);
+}
+
+test "a surface drawn on marks sits beside the shell, and a mark means placement \"mark\"" {
+    const allocator = std.testing.allocator;
+    var config = try loadSource(allocator,
+        \\local wp = require("whirlpool")
+        \\wp.layout("lib.tiles")
+        \\wp.surface("bar", { provider = "river", role = "shell", placement = "all-outputs", content = "lib.bar" })
+        \\wp.surface("drop", { provider = "river", role = "shell", placement = "mark", mark = "drop", content = "lib.drop" })
+    , try allocator.dupe(u8, modules.source_tree_path));
+    defer config.deinit();
+    try std.testing.expectEqualStrings("bar", config.surface("river", "shell").?.name);
+    try std.testing.expectEqualStrings("drop", config.markSurface("river", "drop").?.name);
+    try std.testing.expectEqual(@as(?*const SurfaceSpec, null), config.markSurface("river", "other"));
+
+    try expectRefused(
+        \\local wp = require("whirlpool")
+        \\wp.layout("lib.tiles")
+        \\wp.surface("drop", { provider = "river", role = "shell", placement = "all-outputs", mark = "drop", content = "lib.drop" })
+    );
+    try expectRefused(
+        \\local wp = require("whirlpool")
+        \\wp.layout("lib.tiles")
+        \\wp.surface("drop", { provider = "river", role = "shell", placement = "mark", content = "lib.drop" })
+    );
+}
+
+fn expectRefused(source: []const u8) !void {
+    const allocator = std.testing.allocator;
+    // `loadSource` owns the module path only once it succeeds.
+    const module_path = try allocator.dupe(u8, modules.source_tree_path);
+    if (loadSource(allocator, source, module_path)) |loaded| {
+        var config = loaded;
+        config.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        allocator.free(module_path);
+        try std.testing.expectEqual(error.InvalidSurface, err);
+    }
 }

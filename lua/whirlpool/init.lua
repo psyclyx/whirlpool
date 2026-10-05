@@ -37,6 +37,9 @@ end
 function whirlpool.spawn(...) return whirlpool.action("spawn", ...) end
 function whirlpool.enter_mode(mode) return whirlpool.action("enter-mode", mode) end
 function whirlpool.layout_action(name, ...) return whirlpool.action("layout", name, ...) end
+-- For a pointer binding (key `pointer:left`, `pointer:middle`, `pointer:right`):
+-- drag the window under the pointer, the layout action `name` told the motion.
+function whirlpool.pointer_operation(name, ...) return whirlpool.action("pointer-operation", name, ...) end
 
 -- Bindings -----------------------------------------------------------------
 
@@ -70,11 +73,19 @@ end
 local surface_fields = {
   provider = "string", role = "string", placement = "string", content = "string",
   edge = "string", height = "number", exclusive_zone = "number", options = "table",
+  mark = "string", width = "number", margin = "number", input = "boolean",
 }
 
 -- Register a surface under `name`, replacing any surface of that name. `spec`:
 --   provider, role, placement   where and how it is shown (host-defined)
+--   mark                        with placement "mark": drawn wherever the
+--                               layout puts a mark of this name, sized to it
 --   edge, height, exclusive_zone
+--   width, margin, input        a River shell on every output: as wide as
+--                               `width` (default the output's), centred,
+--                               `margin` from `edge`; `input = false` lets
+--                               the pointer pass through. An output can have
+--                               several, stacked in the order registered.
 --   content                     module name, e.g. "lib.bar"
 --   options                     plain data handed to the content module
 -- A nil spec removes the surface.
@@ -99,14 +110,20 @@ end
 
 -- Services every surface already receives; a source cannot take their names.
 local reserved_services = { desktop = true, frame = true, ["surface-role"] = true, decoration = true, pointer = true }
-local source_kinds = { cpu = true, memory = true, network = true, disks = true, audio = true, battery = true, command = true }
+local source_kinds = {
+  cpu = true, memory = true, network = true, disks = true, sensors = true, gpu = true,
+  audio = true, battery = true, command = true,
+}
 
 -- Measure something periodically under `name`; surfaces receive it as the
 -- service of that name (`whirlpool.surface.on(name, fn)`), as timestamped
 -- series. `spec`:
---   kind     cpu, memory, network, disks, audio, battery, or command
---            (default: the name)
---   every    milliseconds between samples (default 1000)
+--   kind     cpu, memory, network, disks, sensors (temperatures), gpu
+--            (NVIDIA, via nvidia-smi), audio, battery, or command (default:
+--            the name)
+--   every    milliseconds between samples (default 1000); audio does not
+--            poll, but reads the volume when PulseAudio/PipeWire says it
+--            changed
 --   keep     milliseconds of history to keep (default 30000)
 --   command  for kind = "command": the program and its arguments; its trimmed
 --            output arrives as `text`

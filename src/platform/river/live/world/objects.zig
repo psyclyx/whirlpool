@@ -56,7 +56,10 @@ pub const OutputRecord = struct {
 };
 
 pub const LayerFocus = enum { exclusive, non_exclusive, none };
-pub const PointerOperationKind = enum { move, resize };
+/// `move` and `resize` answer a client's request and act on the window
+/// natively. A `reported` operation leaves the window alone: its motion goes
+/// to a layout action, which decides what it means.
+pub const PointerOperationKind = enum { move, resize, reported };
 pub const PointerOperation = struct {
     window: types.WindowId,
     kind: PointerOperationKind,
@@ -64,12 +67,51 @@ pub const PointerOperation = struct {
     last_delta: types.Point = .{ .x = 0, .y = 0 },
     start_pending: bool = true,
     end_pending: bool = false,
+    /// For `reported`: the layout action told of it, the arguments it is
+    /// told after the motion, and whether there is motion, a release or a
+    /// cancellation it has not been told of yet.
+    action: ActionName = .{},
+    args: [max_reported_args]ActionName = undefined,
+    arg_count: u8 = 0,
+    unreported: bool = false,
+    cancelled: bool = false,
+
+    pub const max_reported_args = 4;
+};
+pub const ActionName = struct {
+    bytes: [max_len]u8 = undefined,
+    len: u8 = 0,
+
+    pub const max_len = 64;
+
+    pub fn init(name: []const u8) !ActionName {
+        if (name.len == 0 or name.len > max_len) return error.InvalidActionName;
+        var result = ActionName{ .len = @intCast(name.len) };
+        @memcpy(result.bytes[0..name.len], name);
+        return result;
+    }
+
+    pub fn slice(self: *const ActionName) []const u8 {
+        return self.bytes[0..self.len];
+    }
 };
 pub const SeatRecord = struct {
     layer_focus: LayerFocus = .none,
     applied_window_focus: ?wm.WindowId = null,
     focus_needs_reassert: bool = false,
     operation: ?PointerOperation = null,
+    /// The window under the pointer, and where the pointer is (global).
+    hovered: ?types.WindowId = null,
+    pointer: ?types.Point = null,
+    /// A binding that, enabled while a reported operation runs, cancels it.
+    cancel_binding: ?types.PointerBindingId = null,
+    cancel_enabled: bool = false,
+
+    /// Whether the cancel binding should be enabled now.
+    pub fn cancellable(self: *const SeatRecord) bool {
+        const operation = self.operation orelse return false;
+        return operation.kind == .reported and !operation.end_pending;
+    }
 };
 
 pub const Counts = struct {
@@ -154,6 +196,20 @@ pub const Registry = struct {
         errdefer _ = self.window_order.pop();
         advanceId(&self.next_window);
         return id;
+    }
+
+    /// A shell surface's node that render plans place among the windows (a
+    /// mark surface's). Its id comes from the window id space, so it is never
+    /// a window's node.
+    pub fn bindShellNode(self: *Registry, proxy: types.ProxyRef) !types.NodeId {
+        const node = types.NodeId.init(try peekId(self.next_window));
+        try self.maps.nodes.bind(proxy, node);
+        advanceId(&self.next_window);
+        return node;
+    }
+
+    pub fn unbindShellNode(self: *Registry, proxy: types.ProxyRef) !types.NodeId {
+        return self.maps.nodes.unbindProxy(proxy) catch return error.UnknownNode;
     }
 
     pub fn bindOutput(self: *Registry, proxy: types.ProxyRef) !types.OutputId {

@@ -16,13 +16,20 @@
 --   press(event)        a button pressed over it
 --   scroll(event)       wheel motion over it (event.dx, event.dy)
 --   hover(inside, event) the pointer entered (true) or left (false) it
+--   drag(phase, event)  the left button pressed over it and moved a few
+--                       pixels while held: "start", then "move" as it moves,
+--                       then "drop" on release (or "cancel" if the pointer
+--                       leaves). A drag is never also a click.
 
 local Pointer = {}
 Pointer.__index = Pointer
 
 function Pointer.new()
-  return setmetatable({ regions = {}, inside = {}, pressed = nil, x = nil, y = nil }, Pointer)
+  return setmetatable({ regions = {}, inside = {}, pressed = nil, dragging = nil, x = nil, y = nil }, Pointer)
 end
+
+-- How far the pointer moves, button held, before a press becomes a drag.
+local drag_threshold = 4
 
 -- Handle `node`'s pointer events with `handlers`, replacing any it had; nil
 -- stops handling them.
@@ -64,9 +71,28 @@ end
 
 function Pointer:handle(event)
   if event.type == "leave" then
-    self.x, self.y, self.pressed = nil, nil, nil
+    local drag = self.dragging
+    if drag and drag.started and self.regions[drag.node] then self.regions[drag.node].drag("cancel", event) end
+    self.x, self.y, self.pressed, self.dragging = nil, nil, nil, nil
   else
     self.x, self.y = event.x, event.y
+  end
+  -- A press on a region that drags becomes a drag once it moves far enough.
+  local drag = self.dragging
+  if drag and event.type == "motion" then
+    if not drag.started and (math.abs(event.x - drag.x) > drag_threshold or math.abs(event.y - drag.y) > drag_threshold) then
+      drag.started = true
+      self.pressed = nil
+      self.regions[drag.node].drag("start", event)
+    end
+    if drag.started then self.regions[drag.node].drag("move", event); return end
+  end
+  if drag and event.type == "button" and not event.pressed then
+    self.dragging = nil
+    if drag.started then
+      self.regions[drag.node].drag("drop", event)
+      return
+    end
   end
   local hits = self:hits(self.x, self.y)
 
@@ -91,6 +117,8 @@ function Pointer:handle(event)
       local target = self:target(hits, "press")
       if target then self.regions[target].press(event) end
       self.pressed = self:target(hits, "click")
+      local draggable = event.button == Pointer.LEFT and self:target(hits, "drag")
+      if draggable then self.dragging = { node = draggable, x = event.x, y = event.y } end
     else
       local target = self:target(hits, "click")
       if target and target == self.pressed then self.regions[target].click(event) end

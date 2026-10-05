@@ -247,6 +247,10 @@ pub const Services = struct {
         const actions = try keybindings.takeActions();
         defer self.allocator.free(actions);
         for (actions) |action| try host.queueConfiguredAction(action);
+        if (keybindings.takePointerRelease()) {
+            host.adapter.releaseReportedPointerOperations();
+            host.requestManage();
+        }
         if (keybindings.hasPendingModeChange()) host.requestManage();
     }
 
@@ -262,11 +266,23 @@ pub const Services = struct {
     }
 
     /// Return one configured surface borrowed from the owned config.
+    /// Every output's River shells, in stacking order, at most `out.len`.
+    pub fn outputShells(self: *const Services, out: []*const script.config.SurfaceSpec) []*const script.config.SurfaceSpec {
+        const config = if (self.config) |*value| value else return out[0..0];
+        return config.outputShells("river", out);
+    }
+
     pub fn surface(self: *const Services, placement: []const u8, role: []const u8) ?*const script.config.SurfaceSpec {
         std.debug.assert(placement.len > 0);
         std.debug.assert(role.len > 0);
         const config = if (self.config) |*value| value else return null;
         return config.surface(placement, role);
+    }
+
+    /// The River surface drawn on layout marks named `mark`, if configured.
+    pub fn markSurface(self: *const Services, mark: []const u8) ?*const script.config.SurfaceSpec {
+        const config = if (self.config) |*value| value else return null;
+        return config.markSurface("river", mark);
     }
 
     fn onSeat(raw: ?*anyopaque, seat: *wayland.client.river.SeatV1) !void {

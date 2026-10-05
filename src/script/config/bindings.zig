@@ -22,12 +22,16 @@ pub const LayoutAction = struct {
 
 pub const Action = union(enum) {
     layout: LayoutAction,
+    /// From a pointer binding: hand the pointer to River until the button is
+    /// released, telling the layout action of the motion as the window under
+    /// the pointer is dragged (see `surface.act("pointer-operation", ...)`).
+    pointer_operation: LayoutAction,
     enter_mode: []u8,
     spawn: [][]u8,
 
     pub fn deinit(self: *Action, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .layout => |*value| value.deinit(allocator),
+            .layout, .pointer_operation => |*value| value.deinit(allocator),
             .enter_mode => |mode| allocator.free(mode),
             .spawn => |args| {
                 for (args) |arg| allocator.free(arg);
@@ -41,9 +45,12 @@ pub const Action = union(enum) {
 pub const Binding = struct {
     key: []u8,
     mode: []u8,
+    /// A key's, or 0 for a pointer button (`button`, from `pointer:left`,
+    /// `pointer:middle`, `pointer:right`).
     keysym: u32,
     modifiers: u32,
     action: Action,
+    button: u32 = 0,
 
     pub fn deinit(self: *Binding, allocator: std.mem.Allocator) void {
         self.action.deinit(allocator);
@@ -84,6 +91,7 @@ pub fn parse(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error![]Binding {
         for (result[0..initialized]) |previous| {
             if (std.mem.eql(u8, previous.mode, result[initialized].mode) and
                 previous.keysym == result[initialized].keysym and
+                previous.button == result[initialized].button and
                 previous.modifiers == result[initialized].modifiers)
                 return error.DuplicateBinding;
         }
@@ -100,7 +108,8 @@ fn parseOne(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!Binding {
     const key = try allocator.dupe(u8, key_name);
     errdefer allocator.free(key);
     vm.setTop(base);
-    const keysym = keyToKeysym(key) orelse return error.InvalidKey;
+    const button = pointerButton(key);
+    const keysym = if (button != null) 0 else keyToKeysym(key) orelse return error.InvalidKey;
 
     vm.getField(-1, "mode");
     const mode_name = if (vm.luaType(-1) == .nil) default_mode else vm.string(-1) orelse return error.InvalidMode;
@@ -124,10 +133,11 @@ fn parseOne(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!Binding {
     vm.setTop(base);
 
     vm.getField(-1, "action");
-    const action = try parseAction(allocator, vm);
+    var action = try parseAction(allocator, vm);
     vm.setTop(base);
     errdefer action.deinit(allocator);
-    return .{ .key = key, .mode = mode, .keysym = keysym, .modifiers = modifiers, .action = action };
+    if (action == .pointer_operation and button == null) return error.InvalidAction;
+    return .{ .key = key, .mode = mode, .keysym = keysym, .modifiers = modifiers, .action = action, .button = button orelse 0 };
 }
 
 fn parseAction(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!Action {
@@ -148,6 +158,8 @@ fn parseAction(allocator: std.mem.Allocator, vm: *lua_vm.Vm) Error!Action {
         return .{ .enter_mode = try parseSingleStringArgument(allocator, vm, base, count) };
     if (std.mem.eql(u8, name, "layout"))
         return .{ .layout = try parseLayoutAction(allocator, vm, base, count) };
+    if (std.mem.eql(u8, name, "pointer-operation"))
+        return .{ .pointer_operation = try parseLayoutAction(allocator, vm, base, count) };
     return error.InvalidAction;
 }
 
@@ -209,6 +221,16 @@ fn modifierBits(name: []const u8) ?u32 {
     if (std.mem.eql(u8, name, "mod5")) return 128;
     if (std.mem.eql(u8, name, "none")) return 0;
     return null;
+}
+
+/// linux/input-event-codes.h buttons, for keys `pointer:<name>`.
+fn pointerButton(key: []const u8) ?u32 {
+    const prefix = "pointer:";
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    const buttons = std.StaticStringMap(u32).initComptime(.{
+        .{ "left", 0x110 }, .{ "right", 0x111 }, .{ "middle", 0x112 },
+    });
+    return buttons.get(key[prefix.len..]);
 }
 
 fn keyToKeysym(key: []const u8) ?u32 {
@@ -294,4 +316,28 @@ test "the same chord may have distinct actions in one-shot modes" {
     }
     try std.testing.expectEqual(bindings[1].keysym, bindings[2].keysym);
     try std.testing.expect(!std.mem.eql(u8, bindings[1].mode, bindings[2].mode));
+}
+
+test "pointer buttons bind like keys, and only they start pointer operations" {
+    var vm = try lua_vm.Vm.init(true);
+    defer vm.deinit();
+    try vm.evalValue(
+        "return {{ key = 'pointer:left', modifiers = {'super'}, " ++
+            "action = { name = 'pointer-operation', args = {'drag-window'} } }}",
+        "=pointer-bindings-test",
+    );
+    const bindings = try parse(std.testing.allocator, &vm);
+    defer {
+        for (bindings) |*binding| binding.deinit(std.testing.allocator);
+        std.testing.allocator.free(bindings);
+    }
+    try std.testing.expectEqual(@as(u32, 0x110), bindings[0].button);
+    try std.testing.expectEqual(@as(u32, 0), bindings[0].keysym);
+    try std.testing.expectEqualStrings("drag-window", bindings[0].action.pointer_operation.name);
+
+    try vm.evalValue(
+        "return {{ key = 'd', action = { name = 'pointer-operation', args = {'drag-window'} } }}",
+        "=pointer-operation-on-key-test",
+    );
+    try std.testing.expectError(error.InvalidAction, parse(std.testing.allocator, &vm));
 }

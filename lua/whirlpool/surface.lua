@@ -23,6 +23,10 @@ end
 
 -- Ask the host to do something, e.g. `surface.act("layout", "focus-window", id)`
 -- or `surface.act("spawn", "foot")`. Arguments are strings (numbers convert).
+-- A decoration, from the press of a button held on it, may ask for
+-- `surface.act("pointer-operation", "drag-window", args...)`: River takes the
+-- pointer until release, and the layout action is told the motion, then
+-- `args` (the right button cancels).
 -- The host decides what each name means; unknown ones are ignored.
 function surface.act(name, ...)
   whirlpool_native_act(name, ...)

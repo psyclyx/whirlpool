@@ -104,10 +104,12 @@ pub fn onSeat(self: anytype, seat: *wayland.client.river.SeatV1, event: wayland.
     const id = self.objects.maps.seats.idFor(proxy) orelse return error.UnknownSeat;
     switch (event) {
         .removed => _ = try self.removeSeatRef(proxy),
-        .wl_seat, .pointer_leave, .pointer_position => {},
+        .wl_seat => {},
+        .pointer_leave => self.objects.seats.getPtr(id).?.hovered = null,
+        .pointer_position => |value| self.objects.seats.getPtr(id).?.pointer = .{ .x = value.x, .y = value.y },
         .op_delta => |value| try updatePointerOperation(self, id, .{ .x = value.dx, .y = value.dy }),
         .op_release => markPointerOperationReleased(self, id),
-        .pointer_enter => |value| _ = try requiredWindow(self, value.window),
+        .pointer_enter => |value| self.objects.seats.getPtr(id).?.hovered = try requiredWindow(self, value.window),
         .window_interaction => |value| try self.stageManageFact(.{ .seat_window_interaction = .{
             .seat = id,
             .window = try requiredWindow(self, value.window),
@@ -126,6 +128,12 @@ fn updatePointerOperation(self: anytype, seat: types.SeatId, total: types.Point)
     const seat_record = self.objects.seats.getPtr(seat) orelse return error.UnknownSeat;
     if (seat_record.operation == null) return;
     const operation = &seat_record.operation.?;
+    // Reported once per manage cycle, as the total so far, not every motion.
+    if (operation.kind == .reported) {
+        operation.last_delta = total;
+        operation.unreported = true;
+        return;
+    }
     const delta = types.Point{
         .x = try std.math.sub(i32, total.x, operation.last_delta.x),
         .y = try std.math.sub(i32, total.y, operation.last_delta.y),
@@ -143,7 +151,10 @@ fn updatePointerOperation(self: anytype, seat: types.SeatId, total: types.Point)
 
 fn markPointerOperationReleased(self: anytype, seat: types.SeatId) void {
     const record = self.objects.seats.getPtr(seat) orelse return;
-    if (record.operation) |*operation| operation.end_pending = true;
+    if (record.operation) |*operation| {
+        operation.end_pending = true;
+        if (operation.kind == .reported) operation.unreported = true;
+    }
 }
 
 pub fn onPointerBinding(self: anytype, binding: *wayland.client.river.PointerBindingV1, event: wayland.client.river.PointerBindingV1.Event) !void {

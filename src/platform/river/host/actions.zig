@@ -24,6 +24,12 @@ pub const Layout = struct {
     finish: ?*const fn (?*anyopaque, bool) anyerror!void = null,
 };
 
+/// Start a reported pointer operation on the window under the pointer.
+pub const PointerOperation = struct {
+    context: ?*anyopaque = null,
+    run: *const fn (?*anyopaque, []const u8, []const []const u8) anyerror!void,
+};
+
 pub fn append(
     config: *const script.config.Config,
     action_indices: []const usize,
@@ -31,6 +37,7 @@ pub fn append(
     intents: *script.IntentBatch,
     spawn: ?Spawn,
     layout: ?Layout,
+    pointer: ?PointerOperation,
 ) !void {
     var runner = Runner{
         .config = config,
@@ -38,6 +45,7 @@ pub fn append(
         .intents = intents,
         .spawn = spawn,
         .layout = layout,
+        .pointer = pointer,
         .focus_output = focusedOutput(snapshot),
     };
     try runner.appendAll(action_indices);
@@ -49,6 +57,7 @@ const Runner = struct {
     intents: *script.IntentBatch,
     spawn: ?Spawn,
     layout: ?Layout,
+    pointer: ?PointerOperation = null,
     focus_output: ?wm.OutputId,
 
     fn appendAll(self: *Runner, indices: []const usize) !void {
@@ -62,6 +71,10 @@ const Runner = struct {
         switch (action) {
             .layout => |value| if (self.focus_output) |output| if (self.layout) |hook|
                 try hook.run(hook.context, self.snapshot, output, value.name, value.args, self.intents),
+            .pointer_operation => |value| if (self.pointer) |hook| {
+                const args: []const []const u8 = @ptrCast(value.args);
+                try hook.run(hook.context, value.name, args);
+            },
             .enter_mode => {},
             .spawn => |args| try self.spawnCommand(args),
         }

@@ -12,6 +12,8 @@ const river_layer_shell = LayerShell;
 const ListenerCallbacks = @import("listeners.zig").Callbacks(Manager);
 
 pub const ShellPosition = struct { x: i32, y: i32 };
+/// Shells per output (a bar, a popup, ...).
+pub const max_output_shells = 4;
 pub const DecorationPosition = struct { x: i32, y: i32 };
 
 pub const State = enum { claimed, managing, rendering, stopping, finished, unavailable, destroyed };
@@ -25,6 +27,12 @@ pub const OutputShellRole = struct {
     retirement_requested: bool = false,
     /// The position last sent to River, so an unchanged one is not sent again.
     last_position: ?ShellPosition = null,
+    /// Drawn on a layout mark: render plans position and stack its node among
+    /// the windows, so `placeOutputShellRoles` leaves it alone.
+    mark: bool = false,
+    /// Which of the output's shells this is (the configuration's order),
+    /// for its placement; higher ones stack above lower ones.
+    slot: u8 = 0,
 };
 
 /// A decoration role is one ownership unit.  The manager owns both the
@@ -133,6 +141,7 @@ pub const Manager = struct {
         self: *Manager,
         compositor: *wayland.client.wl.Compositor,
         output: *wayland.client.river.OutputV1,
+        slot: u8,
     ) !usize {
         const surface = try compositor.createSurface();
         errdefer surface.destroy();
@@ -145,6 +154,7 @@ pub const Manager = struct {
             .surface = surface,
             .shell_surface = shell,
             .node = node,
+            .slot = slot,
         });
         self.shell_surfaces.append(self.allocator, shell) catch {
             _ = self.output_shell_roles.pop();
@@ -171,6 +181,17 @@ pub const Manager = struct {
             return err;
         };
         return self.output_shell_roles.items.len - 1;
+    }
+
+    /// `createOutputShellRole` for a surface drawn on a layout mark on `output`.
+    pub fn createMarkShellRole(
+        self: *Manager,
+        compositor: *wayland.client.wl.Compositor,
+        output: *wayland.client.river.OutputV1,
+    ) !usize {
+        const index = try self.createOutputShellRole(compositor, output, 0);
+        self.output_shell_roles.items[index].mark = true;
+        return index;
     }
 
     /// Mark a role for deferred teardown. The role proxy and wl_surface remain
@@ -206,18 +227,22 @@ pub const Manager = struct {
     pub fn placeOutputShellRoles(
         self: *Manager,
         context: ?*anyopaque,
-        resolve: *const fn (?*anyopaque, *wayland.client.river.OutputV1) ?ShellPosition,
+        resolve: *const fn (?*anyopaque, *wayland.client.river.OutputV1, u8) ?ShellPosition,
         refresh: bool,
     ) void {
-        for (self.output_shell_roles.items) |*role| {
-            if (role.retirement_requested) continue;
-            if (resolve(context, role.output)) |position| {
-                if (refresh or !std.meta.eql(role.last_position, position)) {
-                    role.node.setPosition(position.x, position.y);
-                    role.last_position = position;
+        // Lower slots first, so each later one is placed on top of them.
+        var slot: u8 = 0;
+        while (slot < max_output_shells) : (slot += 1) {
+            for (self.output_shell_roles.items) |*role| {
+                if (role.retirement_requested or role.mark or role.slot != slot) continue;
+                if (resolve(context, role.output, role.slot)) |position| {
+                    if (refresh or !std.meta.eql(role.last_position, position)) {
+                        role.node.setPosition(position.x, position.y);
+                        role.last_position = position;
+                    }
                 }
+                role.node.placeTop();
             }
-            role.node.placeTop();
         }
     }
 

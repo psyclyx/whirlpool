@@ -136,11 +136,23 @@ const UpdateSet = struct {
 
 const SlotState = enum { free, rendering, ready, prepared, armed, submitted };
 
+fn unionRect(a: ?graphics.skia.Rect, b: ?graphics.skia.Rect) ?graphics.skia.Rect {
+    const first = a orelse return b;
+    const second = b orelse return first;
+    const x0 = @min(first.x, second.x);
+    const y0 = @min(first.y, second.y);
+    const x1 = @max(first.x + first.width, second.x + second.width);
+    const y1 = @max(first.y + first.height, second.y + second.height);
+    return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
+}
+
 const Slot = struct {
     allocation: dmabuf.Buffer,
     image: dmabuf.VulkanImage,
     wl_buffer: ?*wayland_dmabuf.Buffer = null,
     state: SlotState = .free,
+    /// Where the frame in this slot draws anything (null: nowhere).
+    content: ?graphics.skia.Rect = null,
 
     fn deinit(self: *Slot, abandon: bool) void {
         if (!abandon) std.debug.assert(self.state == .free or self.state == .ready);
@@ -175,6 +187,18 @@ const RolePresenter = struct {
     desired: UpdateSet = .{},
     desired_revision: u64 = 0,
     frame_ms: ?f64 = null,
+    /// An icon drawn while it was loading is ready: draw again, even if
+    /// nothing else changed.
+    icons_ready: bool = false,
+    /// What the last committed frame drew (see `damage`); before any commit
+    /// nothing is known, and the first damages the whole surface.
+    committed_content: ?graphics.skia.Rect = null,
+    committed_any: bool = false,
+    /// Whether the surface shows a buffer. A frame that draws nothing is
+    /// committed as no buffer at all (see `present`), so a hidden bar or a
+    /// popup at rest is not composited over everything below it, and a
+    /// fullscreen window under it can be scanned out directly.
+    mapped: bool = false,
     frame_callback: ?*wayland.client.wl.Callback = null,
     worker_active: bool = false,
     worker_error: ?anyerror = null,
@@ -189,6 +213,9 @@ const RolePresenter = struct {
     ready_requires_sync: bool = false,
     generation: u64 = 0,
     token: u64 = 0,
+    /// The surface this role draws, when not the one its kind of role draws
+    /// (a surface drawn on layout marks is a shell role).
+    descriptor: ?*const script.config.SurfaceSpec = null,
 
     fn init(self: *RolePresenter) !void {
         const role_name = switch (self.role) {
@@ -293,7 +320,7 @@ const RolePresenter = struct {
     }
 
     fn workerMain(self: *RolePresenter) void {
-        const descriptor = switch (self.role) {
+        const descriptor = self.descriptor orelse switch (self.role) {
             .shell => self.owner.surface,
             .decoration => self.owner.decoration_surface orelse {
                 self.failWorker(error.MissingDecorationSurface);
@@ -320,6 +347,7 @@ const RolePresenter = struct {
         };
         if (self.composition) |*composition| composition.setTextMetrics(renderer.textMetrics());
         if (self.composition) |*composition| composition.setViewport(.{ .width = self.extent.width, .height = self.extent.height });
+        renderer.setIconWake(.{ .context = self, .run = iconsReady });
         self.owner.gpu_mutex.unlock(self.owner.io);
         // Tearing down a Skia context flushes and waits on the Vulkan queue
         // every role shares, and queue access must not race another role's
@@ -342,13 +370,15 @@ const RolePresenter = struct {
             const requires_sync = requests.requiresSync();
             const frame_ms = self.frame_ms;
             self.frame_ms = null;
+            const icons_ready = self.icons_ready;
+            self.icons_ready = false;
             const revision = self.desired_revision;
             const slot_index = self.freeSlot() orelse unreachable;
             self.slots[slot_index].state = .rendering;
             self.worker_active = true;
             self.unlock();
 
-            const rendered = self.render(&renderer, slot_index, &requests, frame_ms);
+            const rendered = self.render(&renderer, slot_index, &requests, frame_ms, icons_ready);
             requests.deinit();
             self.collectActions();
 
@@ -381,6 +411,15 @@ const RolePresenter = struct {
             if (idle_tick) std.Io.sleep(self.owner.io, .fromMilliseconds(idle_tick_ms), .awake) catch {};
             self.owner.notifyWake();
         }
+    }
+
+    /// The renderer's icon wake (icon loader thread).
+    fn iconsReady(raw: ?*anyopaque) callconv(.c) void {
+        const self: *RolePresenter = @ptrCast(@alignCast(raw orelse return));
+        self.lock();
+        self.icons_ready = true;
+        self.changed.signal(self.owner.io);
+        self.unlock();
     }
 
     /// Move the program's requested actions to the outbox (worker thread).
@@ -448,6 +487,7 @@ const RolePresenter = struct {
         slot_index: usize,
         updates: *UpdateSet,
         frame_ms: ?f64,
+        icons_ready: bool,
     ) !bool {
         const composition = &(self.composition orelse return error.CompositionUnavailable);
         const frame_only = updates.isEmpty();
@@ -460,7 +500,7 @@ const RolePresenter = struct {
         // A clock tick that changed nothing draws nothing: no lowering, no GPU
         // work, no commit. Most ticks are like this, because plots move in
         // whole-pixel steps and unchanged properties do not dirty their nodes.
-        if (frame_only and frame_ms != null and !composition.isDirty()) return false;
+        if (frame_only and !icons_ready and frame_ms != null and !composition.isDirty()) return false;
         var frame = try composition.lower(.{
             .width = self.extent.width,
             .height = self.extent.height,
@@ -470,6 +510,18 @@ const RolePresenter = struct {
         defer self.owner.gpu_mutex.unlock(self.owner.io);
         try renderer.begin(self.slots[slot_index].image.skiaTarget(), .{ 0, 0, 0, 0 });
         renderer.drawList(frame.drawList());
+        self.slots[slot_index].content = frame.drawList().bounds(@floatFromInt(self.extent.width), @floatFromInt(self.extent.height));
+        // Nothing to show on a surface that shows nothing: no commit at all,
+        // unless state changed. A state update may be part of a River
+        // transaction that waits for this surface's commit, so it commits
+        // even if that only says, again, that there is no buffer.
+        if (frame_only and self.slots[slot_index].content == null and self.committed_any and !self.mapped) {
+            try renderer.end(
+                @intCast(dmabuf.vk.VK_IMAGE_LAYOUT_GENERAL),
+                @intCast(dmabuf.vk.VK_QUEUE_FAMILY_FOREIGN_EXT),
+            );
+            return false;
+        }
         try renderer.end(
             @intCast(dmabuf.vk.VK_IMAGE_LAYOUT_GENERAL),
             @intCast(dmabuf.vk.VK_QUEUE_FAMILY_FOREIGN_EXT),
@@ -536,19 +588,14 @@ const RolePresenter = struct {
 
     fn commit(raw: *anyopaque) void {
         const self = from(raw);
-        self.ensureFrameCallback() catch |err|
-            std.log.warn("failed to request shell frame callback: {s}", .{@errorName(err)});
         self.lock();
         std.debug.assert(self.status == .armed);
         const index = self.ready_slot.?;
         self.unlock();
         const slot = &self.slots[index];
-        self.surface.attach(slot.wl_buffer.?.proxy, 0, 0);
-        self.surface.damageBuffer(0, 0, @intCast(self.extent.width), @intCast(self.extent.height));
-        slot.wl_buffer.?.markAttached();
-        self.surface.commit();
+        const attached = self.present(slot);
         self.lock();
-        slot.state = .submitted;
+        slot.state = if (attached) .submitted else .free;
         self.ready_slot = null;
         self.ready_requires_sync = false;
         self.status = .submitted;
@@ -556,6 +603,57 @@ const RolePresenter = struct {
         const first = self.token == 1;
         self.unlock();
         if (first and self.role == .shell) std.log.info("River shell surface committed its first frame", .{});
+    }
+
+    /// Commit `slot`'s frame: its buffer, or, when it draws nothing, no buffer
+    /// (unmapping the surface). Only a mapped surface waits for a frame
+    /// callback; the compositor sends none to one it does not show, so an
+    /// unmapped one is ticked by the host's loop instead. Returns whether the
+    /// slot's buffer went to the compositor.
+    fn present(self: *RolePresenter, slot: *Slot) bool {
+        if (slot.content == null) {
+            self.cancelFrameCallback();
+            self.surface.attach(null, 0, 0);
+            self.surface.commit();
+            self.mapped = false;
+            self.committed_any = true;
+            self.committed_content = null;
+            return false;
+        }
+        self.ensureFrameCallback() catch |err|
+            std.log.warn("failed to request shell frame callback: {s}", .{@errorName(err)});
+        self.surface.attach(slot.wl_buffer.?.proxy, 0, 0);
+        // Newly mapped, the whole surface is new to the compositor.
+        if (!self.mapped) self.committed_any = false;
+        self.damage(slot.content);
+        slot.wl_buffer.?.markAttached();
+        self.surface.commit();
+        self.mapped = true;
+        return true;
+    }
+
+    /// Tell the compositor what the buffer about to be committed changes: what
+    /// it draws, and what the previous one drew, since outside both every
+    /// frame is clear. A full-output shell surface whose content is a bar
+    /// then costs the compositor a bar's worth of blending per frame, not a
+    /// whole output's. The first commit damages everything.
+    fn damage(self: *RolePresenter, content: ?graphics.skia.Rect) void {
+        const whole = graphics.skia.Rect{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(self.extent.width),
+            .height = @floatFromInt(self.extent.height),
+        };
+        const previous = if (self.committed_any) self.committed_content else whole;
+        self.committed_any = true;
+        self.committed_content = content;
+        const area = unionRect(previous, content) orelse return;
+        self.surface.damageBuffer(
+            @intFromFloat(area.x),
+            @intFromFloat(area.y),
+            @intFromFloat(area.width),
+            @intFromFloat(area.height),
+        );
     }
 
     /// Commit a frame-only shell update without manufacturing a River
@@ -578,16 +676,12 @@ const RolePresenter = struct {
         }
         self.unlock();
 
-        try self.ensureFrameCallback();
         const slot = &self.slots[index];
-        self.surface.attach(slot.wl_buffer.?.proxy, 0, 0);
-        self.surface.damageBuffer(0, 0, @intCast(self.extent.width), @intCast(self.extent.height));
-        slot.wl_buffer.?.markAttached();
-        self.surface.commit();
+        const attached = self.present(slot);
 
         self.lock();
         std.debug.assert(self.ready_slot == index and self.status == .ready);
-        slot.state = .submitted;
+        slot.state = if (attached) .submitted else .free;
         self.ready_slot = null;
         self.ready_requires_sync = false;
         self.status = .submitted;
@@ -681,7 +775,7 @@ const RolePresenter = struct {
         return false;
     }
     fn canRender(self: *RolePresenter) bool {
-        if ((self.pending.isEmpty() and self.frame_ms == null) or self.ready_slot != null) return false;
+        if ((self.pending.isEmpty() and self.frame_ms == null and !self.icons_ready) or self.ready_slot != null) return false;
         if (self.status == .prepared or self.status == .armed) return false;
         return self.freeSlot() != null;
     }
@@ -743,6 +837,8 @@ pub const Runtime = struct {
     wake: ?Wake = null,
     roles: std.ArrayList(RoleRecord) = .empty,
     created_product: ?*RolePresenter = null,
+    /// The surface the role being created draws, if not its kind's.
+    creating_descriptor: ?*const script.config.SurfaceSpec = null,
     abandoning: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, client: *client_api.Client, queue: Queue, surface: *const script.config.SurfaceSpec, decoration_surface: ?*const script.config.SurfaceSpec) !*Runtime {
@@ -776,6 +872,7 @@ pub const Runtime = struct {
         self.wake = null;
         self.roles = .empty;
         self.created_product = null;
+        self.creating_descriptor = null;
         self.abandoning = false;
         try self.roles.ensureTotalCapacity(allocator, 256);
         errdefer self.roles.deinit(allocator);
@@ -821,6 +918,14 @@ pub const Runtime = struct {
 
     pub fn clearWake(self: *Runtime) void {
         self.wake = null;
+    }
+
+    /// `createRole`, drawing `descriptor` rather than the surface its kind of
+    /// role draws.
+    pub fn createRoleFor(self: *Runtime, role: SurfaceRole, surface: *wayland.client.wl.Surface, extent: Extent, descriptor: *const script.config.SurfaceSpec) !void {
+        self.creating_descriptor = descriptor;
+        defer self.creating_descriptor = null;
+        return self.createRole(role, surface, extent);
     }
 
     pub fn createRole(self: *Runtime, role: SurfaceRole, surface: *wayland.client.wl.Surface, extent: Extent) !void {
@@ -945,7 +1050,7 @@ fn createRoleProduct(raw: ?*anyopaque, info: Registry.CreateInfo) !Registry.Pres
     const owner: *Runtime = @ptrCast(@alignCast(raw orelse return error.MissingRuntime));
     const product = try owner.allocator.create(RolePresenter);
     errdefer owner.allocator.destroy(product);
-    product.* = .{ .owner = owner, .role = info.role, .surface = info.surface, .extent = info.extent };
+    product.* = .{ .owner = owner, .role = info.role, .surface = info.surface, .extent = info.extent, .descriptor = owner.creating_descriptor };
     try product.init();
     owner.created_product = product;
     return .{ .context = product, .vtable = &RolePresenter.vtable };

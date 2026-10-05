@@ -35,15 +35,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, config_path: ?[]const u8, s
         manager.abandon();
 
     var presentation: presentation_app.Bridge = undefined;
+    var shell_specs: [presentation_app.max_output_shells]*const presentation_app.SurfaceSpec = undefined;
     const role_hooks = try presentation.init(
         allocator,
         io,
         client,
         &host_runtime,
-        services.surface("river", "shell"),
+        services.outputShells(&shell_specs),
         services.surface("river", "decoration"),
         services.sources(),
         .{ .context = services.spawner().context, .run = services.spawner().run },
+        .{ .context = @ptrCast(&services), .find = findMarkSurface },
     );
     var presentation_live = true;
     defer if (presentation_live) presentation.deinit() catch |err| std.log.err("River graphics cleanup failed: {s}", .{@errorName(err)});
@@ -98,6 +100,10 @@ const AfterDispatch = struct {
     services: *configured.Services,
     presentation: *presentation_app.Bridge,
 
+    fn reconcileMarks(self: *@This()) !void {
+        return reconcileMarksWith(self.runtime, self.roles, self.services);
+    }
+
     fn run(raw: ?*anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidContext));
         try self.services.drainActions(self.runtime);
@@ -116,6 +122,7 @@ const AfterDispatch = struct {
         };
         try self.presentation.pollReleases();
         try self.roles.reconcile();
+        try self.reconcileMarks();
         try self.presentation.present();
         self.services.persist(self.runtime);
         // Presentation can queue a newly completed asynchronous frame after
@@ -127,6 +134,28 @@ const AfterDispatch = struct {
         };
     }
 };
+
+/// Give every layout mark in the current frames that has a configured
+/// surface a River shell surface; a new one is positioned by the next render.
+fn reconcileMarksWith(runtime: *river_host_runtime.Runtime, roles: *river_role_lifecycle.Runtime, services: *const configured.Services) !void {
+    var desired: [16]river_role_lifecycle.DesiredMark = undefined;
+    var count: usize = 0;
+    if (runtime.frames) |*frames| for (frames.frames()) |frame| for (frame.plans.render.marks.items) |mark| {
+        if (services.markSurface(mark.name.slice()) == null or count == desired.len) continue;
+        desired[count] = .{
+            .output = frame.output,
+            .name = mark.name,
+            .extent = .{ .width = @intCast(mark.rect.width), .height = @intCast(mark.rect.height) },
+        };
+        count += 1;
+    };
+    if (try roles.reconcileMarks(desired[0..count])) runtime.requestManage();
+}
+
+fn findMarkSurface(raw: ?*anyopaque, name: []const u8) ?*const presentation_app.SurfaceSpec {
+    const services: *const configured.Services = @ptrCast(@alignCast(raw orelse return null));
+    return services.markSurface(name);
+}
 
 fn bindCompositor(client: *wayland_client.Client) !*wayland.client.wl.Compositor {
     const globals = try client.enumerateGlobals();
